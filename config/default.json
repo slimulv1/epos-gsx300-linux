@@ -5,6 +5,14 @@
     "usb_vid": "1395",
     "usb_pid": "0098"
   },
+  "mode": "stereo",
+  "led_probe": {
+    "vendor_blue": 1,
+    "vendor_red": 2,
+    "primary_blue": null,
+    "primary_red": null,
+    "use_report": "vendor"
+  },
   "audio": {
     "eq": {
       "enabled": false,

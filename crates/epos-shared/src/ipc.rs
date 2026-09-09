@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::config::AudioConfig;
+use crate::config::{AudioConfig, AudioMode};
 use crate::device::DeviceInfo;
 
 /// IPC request from GUI → Daemon
@@ -18,6 +18,14 @@ pub enum Request {
     SetNoiseGate { enabled: bool, threshold_db: f32 },
     SetVoiceEnhancer { mode: String, custom_bands: Option<Vec<crate::EqBand>> },
     SetMicGain { gain: u32 },
+
+    // Audio mode / LED
+    /// Get current audio mode (stereo/7.1)
+    GetMode,
+    /// Set audio mode — automatically changes LED ring color
+    SetMode { mode: AudioMode },
+    /// Toggle between stereo and 7.1 (for smart button)
+    ToggleMode,
 
     // Profiles
     GetProfiles,
@@ -43,9 +51,11 @@ pub enum Response {
         device_connected: bool,
         eq_active: bool,
         active_profile: String,
+        mode: AudioMode,
     },
     Device(Option<DeviceInfo>),
     Eq(AudioConfig),
+    Mode(AudioMode),
     Profiles(Vec<crate::Profile>),
     Error { message: String },
 }
@@ -57,4 +67,5 @@ pub enum Event {
     DeviceConnected { alsa_card: u8, name: String },
     DeviceDisconnected,
     ProfileChanged { name: String },
+    ModeChanged { mode: AudioMode },
 }

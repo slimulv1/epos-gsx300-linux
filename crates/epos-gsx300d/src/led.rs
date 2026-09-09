@@ -1,0 +1,200 @@
+//! EPOS GSX 300 LED Ring Control via USB HID
+//!
+//! The GSX 300 has an LED ring around the volume dial:
+//!   - Blue  = Stereo (2.0)
+//!   - Red   = Surround (7.1)
+//!
+//! HID Report Descriptor (120 bytes):
+//!   Vendor Collection (0xFFFF, page 0xFF13):
+//!     Report ID 0x02 Output (1B): 2 LED bits (usages 0x05/0x06) + 6 pad
+//!   Consumer Collection (0x0C):
+//!     Report ID 0x04 Output (38B): Primary host→device command
+//!     Report ID 0x06 Output (36B): Secondary host→device command
+//!
+//! Protocol is not publicly documented. This module uses the vendor Report ID 2
+//! as the simplest LED control path. Values are configurable in config.json
+//! under `led_probe` for easy adjustment once the real protocol is decoded.
+
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use tracing::{debug, info};
+
+use epos_shared::config::AudioMode;
+use epos_shared::led::{LedProbeConfig, LedReportPath};
+
+/// HID Output report buffer size (must match device max)
+const HID_OUTPUT_SIZE: usize = 64;
+
+/// Report IDs for EPOS GSX 300
+const REPORT_ID_VENDOR_LED: u8 = 0x02;
+const REPORT_ID_PRIMARY_CMD: u8 = 0x04;
+
+/// LED controller for EPOS GSX 300
+pub struct LedController {
+    _hidraw_path: PathBuf,
+    file: Option<File>,
+    probe_config: LedProbeConfig,
+    current_mode: Option<AudioMode>,
+}
+
+impl LedController {
+    /// Create a new LED controller. Searches for GSX 300 hidraw device.
+    pub fn new(probe_config: LedProbeConfig) -> Result<Self> {
+        let hidraw_path = Self::find_hidraw()?;
+        info!("Found GSX 300 at {}", hidraw_path.display());
+
+        let file = OpenOptions::new()
+            .write(true)
+            .read(true)
+            .open(&hidraw_path)
+            .context("Failed to open hidraw device")?;
+
+        Ok(Self {
+            _hidraw_path: hidraw_path,
+            file: Some(file),
+            probe_config,
+            current_mode: None,
+        })
+    }
+
+    /// Reopen the device (e.g. after USB reconnect)
+    #[allow(dead_code)]
+    pub fn reopen(&mut self) -> Result<()> {
+        self.file = None;
+        self._hidraw_path = Self::find_hidraw()?;
+        let file = OpenOptions::new()
+            .write(true)
+            .read(true)
+            .open(&self._hidraw_path)
+            .context("Failed to reopen hidraw device")?;
+        self.file = Some(file);
+        self.current_mode = None;
+        Ok(())
+    }
+
+    /// Set the LED color based on audio mode
+    pub fn set_mode(&mut self, mode: AudioMode) -> Result<()> {
+        if self.current_mode == Some(mode) {
+            return Ok(()); // no change needed
+        }
+
+        let probe_config = self.probe_config.clone();
+        let file = self
+            .file
+            .as_mut()
+            .context("LED device not open")?;
+
+        match probe_config.use_report {
+            LedReportPath::Vendor => {
+                let byte = match mode {
+                    AudioMode::Stereo => probe_config.vendor_blue,
+                    AudioMode::Surround71 => probe_config.vendor_red,
+                };
+                write_vendor_report(file, byte)?;
+                debug!(
+                    "LED: Report ID 0x{:02X} → 0x{:02X} ({})",
+                    REPORT_ID_VENDOR_LED,
+                    byte,
+                    mode.display_name()
+                );
+            }
+            LedReportPath::Primary => {
+                let payload = match mode {
+                    AudioMode::Stereo => probe_config
+                        .primary_blue
+                        .as_deref()
+                        .context("No primary_blue payload configured")?,
+                    AudioMode::Surround71 => probe_config
+                        .primary_red
+                        .as_deref()
+                        .context("No primary_red payload configured")?,
+                };
+                write_primary_report(file, payload)?;
+                debug!(
+                    "LED: Report ID 0x{:02X} → {} bytes ({})",
+                    REPORT_ID_PRIMARY_CMD,
+                    payload.len(),
+                    mode.display_name()
+                );
+            }
+        }
+
+        self.current_mode = Some(mode);
+        info!("LED ring set to {} for {}", match mode {
+            AudioMode::Stereo => "blue",
+            AudioMode::Surround71 => "red",
+        }, mode.display_name());
+        Ok(())
+    }
+
+    /// Find the hidraw device for GSX 300
+    fn find_hidraw() -> Result<PathBuf> {
+        let hidraw_dir = Path::new("/sys/class/hidraw");
+        if !hidraw_dir.exists() {
+            anyhow::bail!("/sys/class/hidraw not found");
+        }
+
+        for entry in std::fs::read_dir(hidraw_dir).context("Failed to list /sys/class/hidraw")? {
+            let entry = entry?;
+            let uevent_path = entry.path().join("device/uevent");
+            if let Ok(content) = std::fs::read_to_string(&uevent_path) {
+                if content.contains("00001395") && content.contains("00000098") {
+                    let name = entry.file_name();
+                    return Ok(PathBuf::from(format!("/dev/{}", name.to_string_lossy())));
+                }
+            }
+        }
+        anyhow::bail!("GSX 300 not found in /sys/class/hidraw")
+    }
+
+    /// Check if the hidraw device is accessible
+    #[allow(dead_code)]
+    pub fn is_accessible(&self) -> bool {
+        self.file.is_some()
+    }
+
+    #[allow(dead_code)]
+    pub fn current_mode(&self) -> Option<AudioMode> {
+        self.current_mode
+    }
+}
+
+/// Write vendor Report ID 0x02 (1-byte output)
+fn write_vendor_report(file: &mut File, byte: u8) -> Result<()> {
+    let mut packet = vec![0u8; HID_OUTPUT_SIZE];
+    packet[0] = REPORT_ID_VENDOR_LED;
+    packet[1] = byte;
+    file.write_all(&packet)
+        .context("Failed to write vendor LED report")?;
+    file.flush().ok();
+    Ok(())
+}
+
+/// Write consumer Report ID 0x04 (38-byte output, padded to 64)
+fn write_primary_report(file: &mut File, payload: &[u8]) -> Result<()> {
+    let mut packet = vec![0u8; HID_OUTPUT_SIZE];
+    packet[0] = REPORT_ID_PRIMARY_CMD;
+    let len = payload.len().min(HID_OUTPUT_SIZE - 1);
+    packet[1..=len].copy_from_slice(&payload[..len]);
+    file.write_all(&packet)
+        .context("Failed to write primary LED report")?;
+    file.flush().ok();
+    Ok(())
+}
+
+impl Drop for LedController {
+    fn drop(&mut self) {
+        // Try to reset LED to default (blue/stereo) on shutdown
+        if let Some(ref mut file) = self.file {
+            let byte = self.probe_config.vendor_blue;
+            let mut packet = vec![0u8; HID_OUTPUT_SIZE];
+            packet[0] = REPORT_ID_VENDOR_LED;
+            packet[1] = byte;
+            let _ = file.write_all(&packet);
+            let _ = file.flush();
+        }
+    }
+}

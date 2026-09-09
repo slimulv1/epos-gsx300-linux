@@ -1,11 +1,39 @@
 use serde::{Deserialize, Serialize};
 
+use crate::led::LedProbeConfig;
+
+/// Audio output mode — controls LED ring color
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioMode {
+    /// Stereo 2.0 — LED ring blue
+    #[default]
+    Stereo,
+    /// Virtual surround 7.1 — LED ring red
+    Surround71,
+}
+
+impl AudioMode {
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::Stereo => "Stereo (2.0)",
+            Self::Surround71 => "Surround (7.1)",
+        }
+    }
+}
+
 /// Root configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub version: u32,
     pub device: DeviceConfig,
     pub audio: AudioConfig,
+    /// Audio output mode (stereo vs 7.1) — controls LED ring color
+    #[serde(default)]
+    pub mode: AudioMode,
+    /// LED probe config (HID report bytes for LED control — adjust after hardware testing)
+    #[serde(default)]
+    pub led_probe: Option<LedProbeConfig>,
     pub profiles: Vec<Profile>,
     pub active_profile: String,
     pub smart_button: SmartButtonConfig,
@@ -103,6 +131,8 @@ impl Default for Config {
                 usb_pid: "0098".into(),
             },
             audio: AudioConfig::default(),
+            mode: AudioMode::Stereo,
+            led_probe: None,
             profiles: vec![
                 Profile::flat(),
                 Profile::music(),

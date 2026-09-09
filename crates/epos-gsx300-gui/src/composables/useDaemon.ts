@@ -35,11 +35,14 @@ export interface Profile {
   created_at: string;
 }
 
+export type AudioMode = "stereo" | "surround71";
+
 export interface DeviceStatus {
   daemon_version: string;
   device_connected: boolean;
   eq_active: boolean;
   active_profile: string;
+  mode: AudioMode;
 }
 
 // ─── State ──────────────────────────────────────────────────
@@ -48,6 +51,7 @@ const connected = ref(false);
 const status = ref<DeviceStatus | null>(null);
 const audio = ref<AudioConfig | null>(null);
 const profiles = ref<Profile[]>([]);
+const mode = ref<AudioMode>("stereo");
 
 // ─── IPC Layer ──────────────────────────────────────────────
 
@@ -119,8 +123,13 @@ function mockResponse(request: Record<string, unknown>): DaemonResponse {
           device_connected: true,
           eq_active: false,
           active_profile: "Flat",
+          mode: "stereo",
         },
       };
+    case "GetMode":
+      return { type: "Mode", payload: "stereo" };
+    case "ToggleMode":
+      return { type: "Mode", payload: "surround71" };
     case "GetEq":
       return {
         type: "Eq",
@@ -243,6 +252,32 @@ export function useDaemon() {
     }
   }
 
+  async function fetchMode() {
+    const res = await sendRequest({ type: "GetMode" });
+    if (res?.type === "Mode") {
+      mode.value = res.payload as AudioMode;
+    }
+  }
+
+  async function setMode(newMode: AudioMode) {
+    const res = await sendRequest({
+      type: "SetMode",
+      payload: { mode: newMode },
+    });
+    if (res?.type === "Ok") {
+      mode.value = newMode;
+      if (status.value) status.value.mode = newMode;
+    }
+  }
+
+  async function toggleMode() {
+    const res = await sendRequest({ type: "ToggleMode" });
+    if (res?.type === "Mode") {
+      mode.value = res.payload as AudioMode;
+      if (status.value) status.value.mode = res.payload as AudioMode;
+    }
+  }
+
   /**
    * Auto-poll daemon status every 3 seconds.
    * Call once from App.vue setup.
@@ -251,6 +286,7 @@ export function useDaemon() {
     fetchStatus();
     fetchAudio();
     fetchProfiles();
+    fetchMode();
     setInterval(() => {
       fetchStatus();
     }, 3000);
@@ -261,9 +297,13 @@ export function useDaemon() {
     status,
     audio,
     profiles,
+    mode,
     fetchStatus,
     fetchAudio,
     fetchProfiles,
+    fetchMode,
+    setMode,
+    toggleMode,
     setEqBands,
     setSidetone,
     setNoiseGate,

@@ -5,16 +5,19 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::RwLock;
 use tracing::{info, error, warn};
 use epos_shared::Config;
+use epos_shared::config::AudioMode;
 use epos_shared::ipc::{Request, Response};
 use crate::audio::AudioPipeline;
 use crate::config;
 use crate::devices;
+use crate::led::LedController;
 
 use anyhow::Result;
 
 pub struct IpcState {
     pub config: Config,
     pub audio: AudioPipeline,
+    pub led: Option<LedController>,
 }
 
 pub async fn run_server(state: Arc<RwLock<IpcState>>) -> Result<()> {
@@ -104,6 +107,7 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
                 device_connected: device.is_some(),
                 eq_active: state.config.audio.eq.enabled,
                 active_profile: state.config.active_profile.clone(),
+                mode: state.config.mode,
             }
         }
         Request::GetDevice => {
@@ -165,6 +169,47 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
                 warn!("Failed to apply mic gain: {}", e);
             }
             Response::Ok
+        }
+
+        // --- Audio Mode / LED ---
+        Request::GetMode => Response::Mode(state.config.mode),
+        Request::SetMode { mode } => {
+            state.config.mode = mode;
+            if let Err(e) = config::save(&state.config) {
+                warn!("Failed to save config: {}", e);
+            }
+            // Update LED color
+            if let Some(ref mut led) = state.led {
+                if let Err(e) = led.set_mode(mode) {
+                    warn!("Failed to set LED mode: {}", e);
+                }
+            }
+            info!("Audio mode changed to {} (LED: {})", mode.display_name(), match mode {
+                AudioMode::Stereo => "blue",
+                AudioMode::Surround71 => "red",
+            });
+            Response::Ok
+        }
+        Request::ToggleMode => {
+            let new_mode = match state.config.mode {
+                AudioMode::Stereo => AudioMode::Surround71,
+                AudioMode::Surround71 => AudioMode::Stereo,
+            };
+            state.config.mode = new_mode;
+            if let Err(e) = config::save(&state.config) {
+                warn!("Failed to save config: {}", e);
+            }
+            // Update LED color
+            if let Some(ref mut led) = state.led {
+                if let Err(e) = led.set_mode(new_mode) {
+                    warn!("Failed to toggle LED mode: {}", e);
+                }
+            }
+            info!("Audio mode toggled to {} (LED: {})", new_mode.display_name(), match new_mode {
+                AudioMode::Stereo => "blue",
+                AudioMode::Surround71 => "red",
+            });
+            Response::Mode(new_mode)
         }
 
         // --- Profiles ---

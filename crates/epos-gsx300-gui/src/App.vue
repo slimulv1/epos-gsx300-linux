@@ -8,7 +8,7 @@ import MicSettings from "./components/MicSettings.vue";
 import DeviceInfo from "./components/DeviceInfo.vue";
 import { useDaemon, type EqBand } from "./composables/useDaemon";
 
-const { connected, status, audio, profiles, fetchStatus, fetchAudio, fetchProfiles, setActiveProfile, setEqBands, setSidetone, setMicGain } = useDaemon();
+const { connected, status, audio, profiles, mode, fetchStatus, fetchAudio, fetchProfiles, toggleMode, setActiveProfile, setEqBands, setSidetone, setMicGain } = useDaemon();
 
 const activeTab = ref<"playback" | "mic" | "settings">("playback");
 
@@ -48,6 +48,10 @@ function onMicGainUpdate(gain: number) {
         <h1>EPOS GSX 300</h1>
       </div>
       <div class="header-right">
+        <button class="mode-toggle" :class="mode" @click="toggleMode" :title="mode === 'stereo' ? 'Stereo (2.0) — LED blue' : 'Surround (7.1) — LED red'">
+          <span class="led-ring" :class="mode" />
+          <span>{{ mode === "stereo" ? "Stereo" : "7.1" }}</span>
+        </button>
         <span :class="['status-dot', connected ? 'connected' : 'disconnected']" />
         <span class="status-text">{{ connected ? "Connected" : "Disconnected" }}</span>
       </div>
@@ -207,6 +211,45 @@ body {
 .status-text {
   font-size: 12px;
   color: #888;
+}
+
+.mode-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: #1e1e2e;
+  border: 1px solid #2a2a3a;
+  border-radius: 20px;
+  color: #ccc;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.mode-toggle:hover {
+  background: #2a2a3a;
+  border-color: #3a3a4a;
+}
+
+/* LED ring indicator — mirrors real GSX 300 LED */
+.led-ring {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid #333;
+  position: relative;
+}
+
+.led-ring.stereo {
+  background: #2090ff;
+  box-shadow: 0 0 10px #2090ffaa, inset 0 0 4px #8ecbff;
+}
+
+.led-ring.surround71 {
+  background: #ff3030;
+  box-shadow: 0 0 10px #ff3030aa, inset 0 0 4px #ff9e9e;
 }
 
 .tabs {

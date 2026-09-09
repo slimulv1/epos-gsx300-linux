@@ -3,6 +3,7 @@ mod config;
 mod devices;
 mod hid;
 mod ipc;
+mod led;
 
 use anyhow::Result;
 use std::sync::Arc;
@@ -10,6 +11,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 use crate::audio::AudioPipeline;
 use crate::ipc::IpcState;
+use crate::led::LedController;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -50,10 +52,31 @@ async fn main() -> Result<()> {
     // Initialize HID handler
     let _hid_handler = hid::HidHandler::new();
 
+    // Initialize LED controller
+    let led_config = config.led_probe.clone().unwrap_or_default();
+    let mut led = match LedController::new(led_config) {
+        Ok(c) => {
+            info!("LED controller initialized");
+            Some(c)
+        }
+        Err(e) => {
+            warn!("LED controller unavailable: {} (LED control disabled)", e);
+            None
+        }
+    };
+
+    // Apply initial LED state from config
+    if let Some(ref mut led_ctrl) = led {
+        if let Err(e) = led_ctrl.set_mode(config.mode) {
+            warn!("Failed to set initial LED mode: {}", e);
+        }
+    }
+
     // Create shared state
     let state = Arc::new(RwLock::new(IpcState {
         config: config.clone(),
         audio,
+        led,
     }));
 
     // Start device hotplug watcher (background task)
