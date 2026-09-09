@@ -1,0 +1,27 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Node (GUI frontend)
+node_modules/
+dist/
+.vite/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.deb
+*.rpm
+*.AppImage
+*.pkg.tar.zst
+
+# Tauri
+crates/epos-gsx300-gui/src-tauri/target/

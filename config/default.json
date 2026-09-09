@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "device": {
+    "auto_detect": true,
+    "usb_vid": "1395",
+    "usb_pid": "0098"
+  },
+  "audio": {
+    "eq": {
+      "enabled": false,
+      "bands": [
+        {"freq": 64, "gain_db": 0.0, "q": 1.0},
+        {"freq": 125, "gain_db": 0.0, "q": 1.0},
+        {"freq": 250, "gain_db": 0.0, "q": 1.0},
+        {"freq": 500, "gain_db": 0.0, "q": 1.0},
+        {"freq": 1000, "gain_db": 0.0, "q": 1.0},
+        {"freq": 2000, "gain_db": 0.0, "q": 1.0},
+        {"freq": 4000, "gain_db": 0.0, "q": 1.0},
+        {"freq": 8000, "gain_db": 0.0, "q": 1.0},
+        {"freq": 16000, "gain_db": 0.0, "q": 1.0}
+      ]
+    },
+    "sidetone": {
+      "enabled": false,
+      "level": 0.0
+    },
+    "noise_gate": {
+      "enabled": false,
+      "threshold_db": -30.0
+    },
+    "voice_enhancer": {
+      "mode": "off",
+      "custom_bands": null
+    },
+    "mic_gain": 80
+  },
+  "profiles": [
+    {"name": "Flat", "audio": {"eq": {"enabled": false, "bands": []}, "sidetone": {"enabled": false, "level": 0.0}, "noise_gate": {"enabled": false, "threshold_db": -30.0}, "voice_enhancer": {"mode": "off", "custom_bands": null}, "mic_gain": 80}, "created_at": "2026-09-09"}
+  ],
+  "active_profile": "Flat",
+  "smart_button": {
+    "action": "cycle_preset"
+  }
+}

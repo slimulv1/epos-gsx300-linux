@@ -1,0 +1,4 @@
+# EPOS GSX 300 — grant access to audio group (no root needed)
+SUBSYSTEM=="usb", ATTR{idVendor}=="1395", ATTR{idProduct}=="0098", MODE="0664", GROUP="audio"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1395", ATTRS{idProduct}=="0098", MODE="0664", GROUP="audio"
+SUBSYSTEM=="input", ATTRS{idVendor}=="1395", ATTRS{idProduct}=="0098", MODE="0664", GROUP="audio"
