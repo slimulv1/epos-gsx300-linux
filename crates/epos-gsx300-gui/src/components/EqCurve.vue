@@ -111,8 +111,23 @@ function draw() {
   });
 }
 
-function onPointerDown(e: PointerEvent, index: number) {
-  dragging.value = index;
+function onPointerDown(e: PointerEvent) {
+  if (!canvas.value) return;
+  const rect = canvas.value.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const w = canvas.value.width;
+  // Find nearest band dot
+  let closest = 0;
+  let minDist = Infinity;
+  props.bands.forEach((band, i) => {
+    const bx = freqToX(band.freq, w);
+    const dist = Math.abs(x - bx);
+    if (dist < minDist) {
+      minDist = dist;
+      closest = i;
+    }
+  });
+  dragging.value = closest;
   (e.target as HTMLElement).setPointerCapture(e.pointerId);
 }
 
@@ -161,6 +176,7 @@ onMounted(() => {
   <div class="eq-curve">
     <canvas
       ref="canvas"
+      @pointerdown="onPointerDown"
       @pointermove="onPointerMove"
       @pointerup="onPointerUp"
     />

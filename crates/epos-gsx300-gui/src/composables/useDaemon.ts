@@ -1,6 +1,7 @@
 import { ref } from "vue";
 
-const SOCKET_PATH = "/run/user/1000/epos-gsx300d.sock";
+const SOCKET_PATH = "/run/user/1000/epos-gsx300d.sock"; // TODO: connect to daemon
+void SOCKET_PATH;
 
 export interface EqBand {
   freq: number;

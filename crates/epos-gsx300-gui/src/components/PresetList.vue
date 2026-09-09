@@ -6,6 +6,7 @@ defineProps<{
 
 const emit = defineEmits<{
   select: [name: string];
+  add: [];
 }>();
 </script>
 
