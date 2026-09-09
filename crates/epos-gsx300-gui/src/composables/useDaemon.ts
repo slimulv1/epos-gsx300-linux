@@ -1,7 +1,16 @@
 import { ref } from "vue";
 
-const SOCKET_PATH = "/run/user/1000/epos-gsx300d.sock"; // TODO: connect to daemon
-void SOCKET_PATH;
+// Tauri invoke — loaded dynamically so we can fall back to mock in browser dev mode
+let tauriInvoke: ((cmd: string, args?: Record<string, unknown>) => Promise<any>) | null = null;
+try {
+  // @tauri-apps/api is available in Tauri runtime; may throw in plain browser
+  const mod = await import("@tauri-apps/api/core");
+  tauriInvoke = mod.invoke;
+} catch {
+  // Running outside Tauri (e.g. plain `vite dev`)
+}
+
+// ─── Types (mirror Rust IPC structs) ────────────────────────
 
 export interface EqBand {
   freq: number;
@@ -33,26 +42,75 @@ export interface DeviceStatus {
   active_profile: string;
 }
 
+// ─── State ──────────────────────────────────────────────────
+
 const connected = ref(false);
 const status = ref<DeviceStatus | null>(null);
 const audio = ref<AudioConfig | null>(null);
 const profiles = ref<Profile[]>([]);
 
-async function sendRequest(request: any): Promise<any> {
-  // For now, return mock data since daemon may not be running
-  // In production, this would use Tauri IPC or Unix socket
-  try {
-    // Tauri invoke would go here
-    // For development, return mock data
-    return mockResponse(request);
-  } catch (e) {
-    console.error("Daemon connection failed:", e);
-    return null;
-  }
+// ─── IPC Layer ──────────────────────────────────────────────
+
+/**
+ * Response shape from daemon: { type: "Status", payload: {...} }
+ * Matches Rust serde(tag = "type", content = "payload")
+ */
+interface DaemonResponse {
+  type: string;
+  payload: any;
 }
 
-function mockResponse(request: any): any {
-  switch (request.type) {
+let useMock = false;
+
+/**
+ * Try connecting to the daemon via a small HTTP bridge,
+ * or fall back to Tauri invoke, or mock.
+ *
+ * In production (Tauri app): use invoke("daemon_request", { request })
+ * In dev (npm run dev): try localhost, fall back to mock
+ */
+async function sendRequest(
+  request: Record<string, unknown>
+): Promise<DaemonResponse | null> {
+  if (useMock) return mockResponse(request);
+
+  // Try Tauri invoke first (works in Tauri dev & production)
+  if (tauriInvoke) {
+    try {
+      const jsonRequest = JSON.stringify(request);
+      const jsonResponse: string = await tauriInvoke("daemon_request", {
+        request: jsonRequest,
+      });
+      return JSON.parse(jsonResponse) as DaemonResponse;
+    } catch {
+      // Tauri invoke failed → fall through to HTTP/mock
+    }
+  }
+
+  // Not in Tauri runtime → try HTTP bridge
+  try {
+    const resp = await fetch("http://127.0.0.1:9898/ipc", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(request),
+    });
+    if (resp.ok) {
+      return (await resp.json()) as DaemonResponse;
+    }
+  } catch {
+    // No HTTP bridge either → mock mode
+  }
+
+  console.warn("Daemon not reachable, switching to mock mode");
+  useMock = true;
+  return mockResponse(request);
+}
+
+// ─── Mock Data (dev mode fallback) ─────────────────────────
+
+function mockResponse(request: Record<string, unknown>): DaemonResponse {
+  const type = request.type as string;
+  switch (type) {
     case "GetStatus":
       return {
         type: "Status",
@@ -67,10 +125,7 @@ function mockResponse(request: any): any {
       return {
         type: "Eq",
         payload: {
-          eq: {
-            enabled: false,
-            bands: defaultBands(),
-          },
+          eq: { enabled: false, bands: defaultBands() },
           sidetone: { enabled: false, level: 0 },
           noise_gate: { enabled: false, threshold_db: -30 },
           voice_enhancer: { mode: "off", custom_bands: null },
@@ -105,6 +160,8 @@ function defaultBands(): EqBand[] {
     { freq: 16000, gain_db: 0, q: 1 },
   ];
 }
+
+// ─── Composable ─────────────────────────────────────────────
 
 export function useDaemon() {
   async function fetchStatus() {
@@ -157,6 +214,15 @@ export function useDaemon() {
     });
   }
 
+  async function setVoiceEnhancer(mode: string, customBands?: EqBand[]) {
+    if (!audio.value) return;
+    audio.value.voice_enhancer = { mode, custom_bands: customBands || null };
+    await sendRequest({
+      type: "SetVoiceEnhancer",
+      payload: { mode, custom_bands: customBands || null },
+    });
+  }
+
   async function setMicGain(gain: number) {
     if (!audio.value) return;
     audio.value.mic_gain = gain;
@@ -167,11 +233,27 @@ export function useDaemon() {
   }
 
   async function setActiveProfile(name: string) {
-    await sendRequest({
+    const res = await sendRequest({
       type: "SetActiveProfile",
       payload: { name },
     });
-    status.value!.active_profile = name;
+    if (res?.type === "Ok" && status.value) {
+      status.value.active_profile = name;
+      await fetchAudio();
+    }
+  }
+
+  /**
+   * Auto-poll daemon status every 3 seconds.
+   * Call once from App.vue setup.
+   */
+  function startPolling() {
+    fetchStatus();
+    fetchAudio();
+    fetchProfiles();
+    setInterval(() => {
+      fetchStatus();
+    }, 3000);
   }
 
   return {
@@ -185,7 +267,9 @@ export function useDaemon() {
     setEqBands,
     setSidetone,
     setNoiseGate,
+    setVoiceEnhancer,
     setMicGain,
     setActiveProfile,
+    startPolling,
   };
 }

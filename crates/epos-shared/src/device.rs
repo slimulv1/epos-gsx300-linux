@@ -18,6 +18,21 @@ pub struct DeviceInfo {
     pub firmware_version: Option<String>,
 }
 
+impl Default for DeviceInfo {
+    fn default() -> Self {
+        Self {
+            usb_bus: 0,
+            usb_addr: 0,
+            alsa_card: 0,
+            pipewire_sink: String::new(),
+            pipewire_source: String::new(),
+            hidraw: None,
+            input_event: None,
+            firmware_version: None,
+        }
+    }
+}
+
 impl DeviceInfo {
     pub fn is_epos_gs300(vid: u16, pid: u16) -> bool {
         vid == VENDOR_ID && pid == PRODUCT_ID
