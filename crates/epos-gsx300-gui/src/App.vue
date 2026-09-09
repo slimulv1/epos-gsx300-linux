@@ -6,9 +6,9 @@ import SidetoneSlider from "./components/SidetoneSlider.vue";
 import VoiceEnhancer from "./components/VoiceEnhancer.vue";
 import MicSettings from "./components/MicSettings.vue";
 import DeviceInfo from "./components/DeviceInfo.vue";
-import { useDaemon } from "./composables/useDaemon";
+import { useDaemon, type EqBand } from "./composables/useDaemon";
 
-const { connected, status, audio, profiles, fetchStatus, fetchAudio, fetchProfiles, setActiveProfile } = useDaemon();
+const { connected, status, audio, profiles, fetchStatus, fetchAudio, fetchProfiles, setActiveProfile, setEqBands, setSidetone, setMicGain } = useDaemon();
 
 const activeTab = ref<"playback" | "mic" | "settings">("playback");
 
@@ -17,6 +17,23 @@ onMounted(async () => {
   await fetchAudio();
   await fetchProfiles();
 });
+
+function onEqUpdate(bands: EqBand[]) {
+  setEqBands(bands);
+}
+
+function onSidetoneUpdate(enabled: boolean, level: number) {
+  setSidetone(enabled, level);
+}
+
+function onVoiceUpdate(mode: string) {
+  // TODO: send to daemon
+  console.log("Voice mode:", mode);
+}
+
+function onMicGainUpdate(gain: number) {
+  setMicGain(gain);
+}
 </script>
 
 <template>
@@ -119,31 +136,6 @@ onMounted(async () => {
     </main>
   </div>
 </template>
-
-<script lang="ts">
-import { defineComponent } from "vue";
-
-export default defineComponent({
-  methods: {
-    onEqUpdate(bands: any[]) {
-      const { setEqBands } = useDaemon();
-      setEqBands(bands);
-    },
-    onSidetoneUpdate(enabled: boolean, level: number) {
-      const { setSidetone } = useDaemon();
-      setSidetone(enabled, level);
-    },
-    onVoiceUpdate(mode: string) {
-      // TODO: send to daemon
-      console.log("Voice mode:", mode);
-    },
-    onMicGainUpdate(gain: number) {
-      const { setMicGain } = useDaemon();
-      setMicGain(gain);
-    },
-  },
-});
-</script>
 
 <style>
 * {

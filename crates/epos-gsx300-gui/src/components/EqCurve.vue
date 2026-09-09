@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from "vue";
+import { ref, onMounted, watch } from "vue";
 
 interface EqBand {
   freq: number;
@@ -45,7 +45,6 @@ function draw() {
 
   const w = c.width;
   const h = c.height;
-  const dpr = window.devicePixelRatio || 1;
 
   ctx.clearRect(0, 0, w, h);
 
@@ -120,7 +119,6 @@ function onPointerDown(e: PointerEvent, index: number) {
 function onPointerMove(e: PointerEvent) {
   if (dragging.value === null || !canvas.value) return;
   const rect = canvas.value.getBoundingClientRect();
-  const x = e.clientX - rect.left;
   const y = e.clientY - rect.top;
   const h = canvas.value.height;
 
@@ -134,6 +132,19 @@ function onPointerMove(e: PointerEvent) {
 function onPointerUp() {
   dragging.value = null;
 }
+
+function onBandChange(index: number, value: number) {
+  const newBands = [...props.bands];
+  newBands[index] = { ...newBands[index], gain_db: value };
+  emit("update", newBands);
+  draw();
+}
+
+watch(
+  () => props.bands,
+  () => { draw(); },
+  { deep: true }
+);
 
 onMounted(() => {
   if (canvas.value) {
@@ -173,29 +184,6 @@ onMounted(() => {
     </div>
   </div>
 </template>
-
-<script lang="ts">
-import { defineComponent } from "vue";
-
-export default defineComponent({
-  methods: {
-    onBandChange(index: number, value: number) {
-      const newBands = [...this.bands];
-      newBands[index] = { ...newBands[index], gain_db: value };
-      this.$emit("update", newBands);
-      this.draw();
-    },
-  },
-  watch: {
-    bands: {
-      handler() {
-        this.draw();
-      },
-      deep: true,
-    },
-  },
-});
-</script>
 
 <style scoped>
 .eq-curve {
