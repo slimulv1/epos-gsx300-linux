@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
-use tracing::{info, warn};
+use std::path::PathBuf;
+use tracing::info;
 use epos_shared::Config;
 
 /// Returns the config directory path (~/.config/epos-gsx300/)
@@ -51,14 +51,5 @@ pub fn save(config: &Config) -> Result<()> {
         .with_context(|| "Failed to atomically replace config file")?;
 
     info!("Config saved to {}", path.display());
-    Ok(())
-}
-
-/// Watch config file for external changes (hot-reload)
-#[allow(dead_code)]
-pub fn watch_config(config_dir: &Path) -> Result<()> {
-    // Placeholder for notify-based file watcher
-    // Will be implemented with inotify/notify crate
-    warn!("Config file watcher not yet implemented for {}", config_dir.display());
     Ok(())
 }

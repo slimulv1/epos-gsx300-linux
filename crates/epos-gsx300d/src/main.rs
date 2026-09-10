@@ -213,6 +213,12 @@ async fn main() -> Result<()> {
         device_hotplug_loop(state_clone).await;
     });
 
+    // Start config watcher — hot-reload external config edits (background task)
+    let state_clone = state.clone();
+    let _config_handle = tokio::spawn(async move {
+        config_watch_loop(state_clone).await;
+    });
+
     // Graceful shutdown: SIGTERM/SIGINT → reset LED to blue, then exit.
     // (Drop impls do NOT run on signal kill, so we handle it explicitly.)
     {
@@ -290,5 +296,80 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
         }
 
         was_connected = is_connected;
+    }
+}
+
+/// Background task: watch config file for external edits and hot-apply them.
+///
+/// Polls the config file mtime every 2s. When it changes, reloads and applies:
+/// - audio changes  → update_config + apply_full (EQ / voice / noise / sidetone / mic gain)
+/// - mode changes   → re-sync LED ring
+/// - anything else  (e.g. smart button action) → just update in-memory config
+///
+/// The daemon's own atomic `save()` writes are skipped via content comparison,
+/// so we only react to edits made *outside* the daemon.
+async fn config_watch_loop(state: Arc<RwLock<IpcState>>) {
+    let path = config::config_path();
+    let mut last_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        if mtime == last_mtime {
+            continue;
+        }
+        last_mtime = mtime;
+
+        let new_config = match config::load() {
+            Ok(c) => c,
+            Err(e) => {
+                // File may be mid-write or malformed; keep current config.
+                warn!("Config reload failed, keeping current config: {}", e);
+                continue;
+            }
+        };
+
+        let mut st = state.write().await;
+
+        // Skip if the change was the daemon's own atomic write (content identical).
+        let same_content = serde_json::to_value(&st.config)
+            .ok()
+            .zip(serde_json::to_value(&new_config).ok())
+            .map(|(a, b)| a == b)
+            .unwrap_or(false);
+        if same_content {
+            continue;
+        }
+
+        let audio_changed = serde_json::to_value(&st.config.audio)
+            .ok()
+            .zip(serde_json::to_value(&new_config.audio).ok())
+            .map(|(a, b)| a != b)
+            .unwrap_or(true);
+        let mode_changed = st.config.mode != new_config.mode;
+
+        st.config = new_config;
+
+        if audio_changed {
+            let audio_cfg = st.config.audio.clone();
+            st.audio.update_config(&audio_cfg);
+            if let Err(e) = st.audio.apply_full().await {
+                warn!("Failed to apply reloaded audio config: {}", e);
+            }
+            info!("Config hot-reload: audio settings applied");
+        }
+        if mode_changed {
+            let desired_mode = st.config.mode;
+            if let Some(ref mut led) = st.led {
+                if let Err(e) = led.set_mode(desired_mode) {
+                    warn!("Failed to sync LED after config reload: {}", e);
+                }
+            }
+            info!("Config hot-reload: LED synced to {:?}", desired_mode);
+        }
+        if !audio_changed && !mode_changed {
+            info!("Config hot-reload: non-audio settings updated");
+        }
     }
 }
