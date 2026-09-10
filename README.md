@@ -12,7 +12,8 @@ EQ, sidetone, noise gate, voice enhancer, and audio control for the EPOS GSX 300
 - Voice enhancer (Warm / Clear)
 - Noise gate
 - Mic gain control
-- Smart button remapping
+- **LED ring control** — blue = stereo / red = 7.1, synced with mode
+- **Smart button** — physical dial click toggles mode + LED (long-press too)
 - Dark UI with gaming aesthetic
 
 ## Architecture
@@ -32,14 +33,34 @@ epos-gsx300-gui           Tauri 2.x (Rust + Vue 3) — config GUI
 ## Install
 
 ```bash
-# Arch Linux (AUR)
-yay -S epos-gsx300-linux-git
-
 # From source
 git clone --recurse-submodules https://github.com/slimulv1/epos-gsx300-linux.git
 cd epos-gsx300-linux
 cargo build --release
+
+# One-time udev rule (needs root, REQUIRED for device access):
+sudo ./scripts/install.sh --udev
+
+# Install daemon as a systemd user service:
+./scripts/install.sh
 ```
+
+<details>
+<summary><code>scripts/install.sh</code> options</summary>
+
+| Option        | What it does                                              |
+| ------------- | --------------------------------------------------------- |
+| (none)        | Install binary to `~/.local/bin`, enable systemd user service |
+| `--udev`      | Install udev rule (sudo) — grants `audio` group access    |
+| `--system`    | Install to `/usr/local/bin` + systemd user service        |
+| `--uninstall` | Remove binary, service, config                            |
+
+</details>
+
+> The GSX 300 is a USB audio class device: no kernel module is needed.
+> The udev rule gives members of the `audio` group read/write on the
+> device's hidraw interface, which the daemon uses to control the LED
+> ring and read the smart button / volume dial.
 
 ## Usage
 

@@ -195,6 +195,17 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
                 if let Err(e) = st.audio.apply_full().await {
                     warn!("Failed to apply audio config on connect: {}", e);
                 }
+                // Re-open LED hidraw (device may have re-enumerated) and sync mode
+                let desired_mode = st.config.mode;
+                if let Some(ref mut led) = st.led {
+                    if let Err(e) = led.reopen() {
+                        warn!("Failed to reopen LED device: {}", e);
+                    }
+                    if let Err(e) = led.set_mode(desired_mode) {
+                        warn!("Failed to sync LED on connect: {}", e);
+                    }
+                    info!("LED re-synced to {:?} after reconnect", desired_mode);
+                }
             }
         } else if !is_connected && was_connected {
             info!("EPOS GSX 300 disconnected");
