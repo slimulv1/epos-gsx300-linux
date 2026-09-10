@@ -76,10 +76,13 @@ impl LedController {
     }
 
     /// Set the LED color based on audio mode
+    ///
+    /// Note: always writes, even when the cached mode matches the target.
+    /// The device LED state can drift from what we last set (e.g. the smart
+    /// button toggles the LED on-device while a HID readback event is lost),
+    /// so skipping identical writes can leave the physical LED out of sync
+    /// with the daemon/web UI.
     pub fn set_mode(&mut self, mode: AudioMode) -> Result<()> {
-        if self.current_mode == Some(mode) {
-            return Ok(()); // no change needed
-        }
 
         let probe_config = self.probe_config.clone();
         let file = self

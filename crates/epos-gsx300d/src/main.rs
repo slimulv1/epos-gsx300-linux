@@ -104,11 +104,15 @@ async fn main() -> Result<()> {
 
                     match action {
                         SmartButtonAction::ToggleMode => {
+                            // The device toggles its own physical state when the
+                            // button is pressed, then reports the NEW state via
+                            // ModeChanged. Trust the readback absolutely — never
+                            // double-toggle, or daemon and hardware drift apart by
+                            // one step every press (web shows N while LED shows ~N).
                             let new_mode = match pressed_mode {
-                                Some(m) if m != st.config.mode => m,
-                                // Device said "already in this mode" (debounce quirk)
-                                // or it was a long press → toggle explicitly.
-                                _ => match st.config.mode {
+                                Some(m) => m,
+                                // Long press carries no mode byte → toggle explicitly.
+                                None => match st.config.mode {
                                     AudioMode::Stereo => AudioMode::Surround71,
                                     AudioMode::Surround71 => AudioMode::Stereo,
                                 },
@@ -217,6 +221,19 @@ async fn main() -> Result<()> {
     let state_clone = state.clone();
     let _config_handle = tokio::spawn(async move {
         config_watch_loop(state_clone).await;
+    });
+
+    // Start LED heartbeat — re-assert the config mode on the physical LED ring
+    // every 2s. The GSX 300's smart button toggles the device's *own* LED state
+    // and sends an input readback; if that readback is swallowed (device
+    // debounce quirk), the daemon never learns about the hardware change and
+    // config (what the web GUI shows) drifts apart from the physical LED.
+    // Re-asserting every 2s forces the LED back into agreement with config, so
+    // the web GUI and the physical LED can never stay desynced for more than
+    // one heartbeat interval.
+    let state_clone = state.clone();
+    let _led_heartbeat_handle = tokio::spawn(async move {
+        led_heartbeat_loop(state_clone).await;
     });
 
     // Graceful shutdown: SIGTERM/SIGINT → reset LED to blue, then exit.
@@ -370,6 +387,33 @@ async fn config_watch_loop(state: Arc<RwLock<IpcState>>) {
         }
         if !audio_changed && !mode_changed {
             info!("Config hot-reload: non-audio settings updated");
+        }
+    }
+}
+
+/// Background task: periodically re-assert the physical LED ring color from the
+/// current config mode.
+///
+/// The GSX 300's smart button toggles the device's *own* LED state and then
+/// reports the new state as an input readback. If the readback is swallowed by
+/// the device's debounce quirk, the daemon never learns the hardware state, so
+/// config (which the web GUI renders) and the physical LED can drift apart by
+/// one step per missed readback.
+///
+/// This loop keeps the LED converged on config: every interval it writes the
+/// configured mode to the ring, overriding any state the device assumed on its
+/// own. The web GUI reads config, so after at most one interval, what the GUI
+/// shows == what the LED physically displays.
+async fn led_heartbeat_loop(state: Arc<RwLock<IpcState>>) {
+    let interval = tokio::time::Duration::from_secs(2);
+    loop {
+        tokio::time::sleep(interval).await;
+        let mut st = state.write().await;
+        let desired = st.config.mode;
+        if let Some(ref mut led) = st.led {
+            if let Err(e) = led.set_mode(desired) {
+                warn!("LED heartbeat: failed to re-assert {:?}: {}", desired, e);
+            }
         }
     }
 }
