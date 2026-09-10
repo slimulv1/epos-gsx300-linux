@@ -35,6 +35,11 @@ impl AudioPipeline {
         self.device = Some(device.clone());
     }
 
+    /// Sync latest config into the pipeline before applying filters
+    pub fn update_config(&mut self, config: &AudioConfig) {
+        self.config = config.clone();
+    }
+
     /// Apply all audio settings to the device
     pub async fn apply_full(&mut self) -> Result<()> {
         self.apply_mic_gain().await?;
@@ -98,15 +103,16 @@ impl AudioPipeline {
 
     // ─── 9-Band EQ ────────────────────────────────────────────
     //
-    // PipeWire EQ strategy: Write a WirePlumber SPA filter config that applies
-    // parametric EQ on the EPOS sink node. Each band = a biquad peaking EQ filter.
+    // PipeWire EQ strategy: Write a filter-chain module config that
+    // applies parametric EQ on the EPOS sink node. Uses PipeWire's
+    // built-in bq_peaking filters (Audio EQ Cookbook) with Freq/Q/Gain.
     //
-    // The filter config is written to:
-    //   ~/.config/wireplumber/wireplumber.conf.d/90-epos-eq.conf
+    // The config is written to:
+    //   ~/.config/pipewire/pipewire.conf.d/50-epos-eq.conf
     //
-    // WirePlumber hot-reloads .conf.d/ files automatically.
+    // Loaded by the main pipewire instance; requires a pipewire restart.
 
-    pub async fn apply_eq(&self) -> Result<()> {
+    pub async fn apply_eq(&mut self) -> Result<()> {
         let Some(ref device) = self.device else {
             debug!("No device, skipping EQ");
             return Ok(());
@@ -119,16 +125,16 @@ impl AudioPipeline {
         let filter_conf = generate_eq_filter_conf(&self.config.eq.bands, device);
         let conf_dir = dirs::config_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
-            .join("wireplumber")
-            .join("wireplumber.conf.d");
-        let conf_path = conf_dir.join("90-epos-eq.conf");
+            .join("pipewire")
+            .join("pipewire.conf.d");
+        let conf_path = conf_dir.join("50-epos-eq.conf");
 
         std::fs::create_dir_all(&conf_dir)?;
         std::fs::write(&conf_path, &filter_conf)?;
         info!("EQ filter config written to {}", conf_path.display());
 
-        // Tell WirePlumber to reload (if running)
-        reload_wireplumber().await;
+        // PipeWire needs a restart to load the new filter-chain module
+        reload_pipewire().await;
 
         Ok(())
     }
@@ -136,14 +142,14 @@ impl AudioPipeline {
     pub async fn remove_eq(&self) -> Result<()> {
         let conf_path = dirs::config_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
-            .join("wireplumber")
-            .join("wireplumber.conf.d")
-            .join("90-epos-eq.conf");
+            .join("pipewire")
+            .join("pipewire.conf.d")
+            .join("50-epos-eq.conf");
 
         if conf_path.exists() {
             std::fs::remove_file(&conf_path)?;
             info!("EQ filter config removed");
-            reload_wireplumber().await;
+            reload_pipewire().await;
         }
         Ok(())
     }
@@ -217,33 +223,47 @@ impl AudioPipeline {
 
         let conf_dir = dirs::config_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
-            .join("wireplumber")
-            .join("wireplumber.conf.d");
-        let conf_path = conf_dir.join("91-epos-noisegate.conf");
+            .join("pipewire")
+            .join("pipewire.conf.d");
+        let conf_path = conf_dir.join("93-epos-noisegate.conf");
 
         if self.config.noise_gate.enabled {
-            let threshold = self.config.noise_gate.threshold_db;
             let filter_conf = format!(
-                r#"# EPOS GSX 300 noise gate (rnnoise)
+                r#"# EPOS GSX 300 noise gate (rnnoise via LADSPA filter-chain)
 # Applied to capture node: {source}
-monitor.els = [
-  {{
-    name = libwireplumber-module-rnnoise
-    type = filter
-    args = {{
-      audio.position = [ MONO ]
-      capture.props = {{
-        node.name = "epos-noisegate-capture"
-        media.class = "Audio/Sink"
-        audio.position = [ MONO ]
-      }}
-      playback.props = {{
-        node.name = "epos-noisegate-playback"
-        media.class = "Audio/Source"
-        audio.position = [ MONO ]
-      }}
+# Requires librnnoise_ladspa.so in LADSPA_PATH (e.g. ~/.local/lib/ladspa)
+context.modules = [
+    {{
+        name = libpipewire-module-filter-chain
+        flags = [ nofail ]
+        args = {{
+            node.description = "EPOS GSX 300 Noise Gate"
+            media.name       = "EPOS GSX 300 Noise Gate"
+            filter.graph = {{
+                nodes = [
+                    {{
+                        type   = ladspa
+                        name   = rnnoise
+                        plugin = "librnnoise_ladspa"
+                        label  = noise_suppressor_stereo
+                        control = {{
+                            "VAD Threshold (%)" 50.0
+                        }}
+                    }}
+                ]
+            }}
+            audio.position = [ FL FR ]
+            capture.props = {{
+                node.name   = "epos-noisegate-capture"
+                target.object = "{source}"
+                node.passive = true
+            }}
+            playback.props = {{
+                node.name   = "epos-noisegate-output"
+                media.class = Audio/Source
+            }}
+        }}
     }}
-  }}
 ]
 "#,
                 source = device.pipewire_source
@@ -251,13 +271,13 @@ monitor.els = [
 
             std::fs::create_dir_all(&conf_dir)?;
             std::fs::write(&conf_path, &filter_conf)?;
-            info!("Noise gate filter config written (threshold: {}dB)", threshold);
+            info!("Noise gate filter written (rnnoise, capture: {})", device.pipewire_source);
         } else if conf_path.exists() {
             std::fs::remove_file(&conf_path)?;
             info!("Noise gate filter config removed");
         }
 
-        reload_wireplumber().await;
+        reload_pipewire().await;
         Ok(())
     }
 
@@ -266,13 +286,18 @@ monitor.els = [
     // Voice enhancer = EQ on the capture (mic) stream.
     // Warm = boost low frequencies (200-500 Hz)
     // Clear = boost presence (2k-6k Hz)
+    //
+    // Uses a PipeWire filter-chain source module (libpipewire-module-filter-chain)
+    // written to ~/.config/pipewire/pipewire.conf.d/51-epos-voice-enhancer.conf
 
-    pub async fn apply_voice_enhancer(&self) -> Result<()> {
+    pub async fn apply_voice_enhancer(&mut self) -> Result<()> {
         let conf_dir = dirs::config_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
-            .join("wireplumber")
-            .join("wireplumber.conf.d");
-        let conf_path = conf_dir.join("92-epos-voice-enhancer.conf");
+            .join("pipewire")
+            .join("pipewire.conf.d");
+        let conf_path = conf_dir.join("51-epos-voice-enhancer.conf");
+
+        let device_source = self.device.as_ref().map(|d| d.pipewire_source.clone());
 
         let filter_conf = match self.config.voice_enhancer.mode {
             VoiceMode::Off => {
@@ -280,12 +305,12 @@ monitor.els = [
                     std::fs::remove_file(&conf_path)?;
                     info!("Voice enhancer disabled, config removed");
                 }
-                reload_wireplumber().await;
+                reload_pipewire().await;
                 return Ok(());
             }
             VoiceMode::Warm => {
                 // Boost low-mid frequencies for warmth
-                generate_voice_eq_conf("warm", &[
+                generate_voice_eq_conf("warm", device_source.as_deref(), &[
                     (200, 4.0, 0.8),
                     (350, 3.0, 1.0),
                     (500, 2.0, 1.0),
@@ -295,7 +320,7 @@ monitor.els = [
             }
             VoiceMode::Clear => {
                 // Boost presence and clarity
-                generate_voice_eq_conf("clear", &[
+                generate_voice_eq_conf("clear", device_source.as_deref(), &[
                     (200, -2.0, 1.0),
                     (500, -1.0, 1.0),
                     (2500, 3.0, 1.0),
@@ -308,12 +333,12 @@ monitor.els = [
                     let band_data: Vec<(u32, f32, f32)> = bands.iter()
                         .map(|b| (b.freq, b.gain_db, b.q))
                         .collect();
-                    generate_voice_eq_conf("custom", &band_data)
+                    generate_voice_eq_conf("custom", device_source.as_deref(), &band_data)
                 } else {
                     if conf_path.exists() {
                         std::fs::remove_file(&conf_path)?;
                     }
-                    reload_wireplumber().await;
+                    reload_pipewire().await;
                     return Ok(());
                 }
             }
@@ -323,7 +348,7 @@ monitor.els = [
         std::fs::write(&conf_path, &filter_conf)?;
         info!("Voice enhancer filter written ({:?})", self.config.voice_enhancer.mode);
 
-        reload_wireplumber().await;
+        reload_pipewire().await;
         Ok(())
     }
 }
@@ -340,47 +365,45 @@ impl Drop for AudioPipeline {
 
 // ─── Config Generators ────────────────────────────────────────
 
-/// Generate WirePlumber parametric EQ filter config for the EPOS sink.
-/// Each band = a biquad peaking EQ filter in SPA format.
+/// Generate PipeWire filter-chain config for the EPOS sink (playback EQ).
+/// Uses PipeWire's built-in bq_peaking filters with Freq/Q/Gain controls.
 fn generate_eq_filter_conf(bands: &[epos_shared::config::EqBand], device: &DeviceInfo) -> String {
-    let mut spa_filters = String::new();
+    let mut nodes = String::new();
+    let mut links = String::new();
+    let mut prev: Option<String> = None;
+    let mut active = 0usize;
 
     for (i, band) in bands.iter().enumerate() {
         // Only add band if gain != 0
         if band.gain_db.abs() < 0.1 {
             continue;
         }
-
-        // Parametric peaking EQ biquad coefficients (SPA format)
-        // Convert freq + gain_db + Q → biquad coefficients a0, a1, a2, b0, b1, b2
-        let (b0, b1, b2, a0, a1, a2) = peaking_eq_coefficients(
-            band.freq as f64,
-            band.gain_db as f64,
-            band.q as f64,
-            48000.0, // GSX 300 is always 48kHz
-        );
-
-        spa_filters.push_str(&format!(
+        let name = format!("eq_band_{i}");
+        nodes.push_str(&format!(
             r#"
-  biquad{i}: {{
-    type = "Biquad"
-    name = "epos-eq-band{i}"
-    b0 = {b0:.10e}
-    b1 = {b1:.10e}
-    b2 = {b2:.10e}
-    a0 = {a0:.10e}
-    a1 = {a1:.10e}
-    a2 = {a2:.10e}
-  }}
-"#,
-            i = i,
-            b0 = b0, b1 = b1, b2 = b2,
-            a0 = a0, a1 = a1, a2 = a2,
+                    {{
+                        type  = builtin
+                        name  = "{name}"
+                        label = bq_peaking
+                        control = {{ "Freq" = {freq} "Q" = {q} "Gain" = {gain} }}
+                    }}"#,
+            freq = band.freq as u32,
+            q = band.q,
+            gain = band.gain_db,
         ));
+        if let Some(p) = prev.take() {
+            links.push_str(&format!(
+                r#"
+                    {{ output = "{p}:Out" input = "{name}:In" }}"#,
+                p = p, name = name
+            ));
+        }
+        prev = Some(name);
+        active += 1;
     }
 
     // If all bands are flat, return empty config
-    if spa_filters.is_empty() {
+    if active == 0 {
         return format!(
             "# EPOS GSX 300 EQ — all bands flat, no processing needed\n# Device: {}\n",
             device.pipewire_sink
@@ -388,91 +411,133 @@ fn generate_eq_filter_conf(bands: &[epos_shared::config::EqBand], device: &Devic
     }
 
     format!(
-        r#"# EPOS GSX 300 parametric EQ — 9-band
+        r#"# EPOS GSX 300 parametric EQ — 9-band (PipeWire filter-chain)
 # Auto-generated by epos-gsx300d
 # Device: {sink}
 # Bands: {bands}
 
-monitor.els = [{filters}
+context.modules = [
+    {{
+        name = libpipewire-module-filter-chain
+        args = {{
+            node.description = "EPOS GSX 300 EQ"
+            media.name       = "EPOS GSX 300 EQ"
+            filter.graph = {{
+                nodes = [{nodes}
+                ]
+                links = [{links}
+                ]
+            }}
+            audio.channels = 2
+            audio.position = [ FL FR ]
+            capture.props = {{
+                node.name   = "epos-eq-input"
+                media.class = Audio/Sink
+                audio.position = [ FL FR ]
+            }}
+            playback.props = {{
+                node.name   = "epos-eq-output"
+                target.object = "{sink}"
+                node.passive = true
+            }}
+        }}
+    }}
 ]
 "#,
         sink = device.pipewire_sink,
-        bands = bands.len(),
-        filters = spa_filters,
+        bands = active,
+        nodes = nodes,
+        links = links,
     )
 }
 
-/// Generate voice enhancer EQ filter config (capture stream)
-fn generate_voice_eq_conf(mode_name: &str, bands: &[(u32, f32, f32)]) -> String {
-    let mut spa_filters = String::new();
+/// Generate voice enhancer EQ filter config (capture stream / mic).
+/// PipeWire filter-chain source: captures from the EPOS mic source,
+/// applies bq_peaking filters, exposes a virtual Audio/Source.
+fn generate_voice_eq_conf(mode_name: &str, device_source: Option<&str>, bands: &[(u32, f32, f32)]) -> String {
+    let mut nodes = String::new();
+    let mut links = String::new();
+    let mut prev: Option<String> = None;
 
     for (i, &(freq, gain, q)) in bands.iter().enumerate() {
         if gain.abs() < 0.1 {
             continue;
         }
-
-        let (b0, b1, b2, a0, a1, a2) = peaking_eq_coefficients(
-            freq as f64,
-            gain as f64,
-            q as f64,
-            48000.0,
-        );
-
-        spa_filters.push_str(&format!(
+        let name = format!("voice_band_{i}");
+        nodes.push_str(&format!(
             r#"
-  biquad{idx}: {{
-    type = "Biquad"
-    name = "voice-{mode}-band{idx}"
-    b0 = {b0:.10e}
-    b1 = {b1:.10e}
-    b2 = {b2:.10e}
-    a0 = {a0:.10e}
-    a1 = {a1:.10e}
-    a2 = {a2:.10e}
-  }}
-"#,
-            idx = i, mode = mode_name,
-            b0 = b0, b1 = b1, b2 = b2,
-            a0 = a0, a1 = a1, a2 = a2,
+                    {{
+                        type  = builtin
+                        name  = "{name}"
+                        label = bq_peaking
+                        control = {{ "Freq" = {freq} "Q" = {q} "Gain" = {gain} }}
+                    }}"#,
+            freq = freq, q = q, gain = gain,
         ));
+        if let Some(p) = prev.take() {
+            links.push_str(&format!(
+                r#"
+                    {{ output = "{p}:Out" input = "{name}:In" }}"#,
+                p = p, name = name
+            ));
+        }
+        prev = Some(name);
+        
     }
 
+    let target = device_source
+        .map(|s| format!(r#"                target.object = "{s}""#))
+        .unwrap_or_default();
+
     format!(
-        r#"# EPOS GSX 300 voice enhancer ({mode})
+        r#"# EPOS GSX 300 voice enhancer ({mode}) — PipeWire filter-chain
 # Auto-generated by epos-gsx300d
 # Applied to capture stream
 
-monitor.els = [{filters}
+context.modules = [
+    {{
+        name = libpipewire-module-filter-chain
+        args = {{
+            node.description = "EPOS GSX 300 Voice Enhancer ({mode})"
+            media.name       = "EPOS GSX 300 Voice Enhancer ({mode})"
+            filter.graph = {{
+                nodes = [{nodes}
+                ]
+                links = [{links}
+                ]
+            }}
+            audio.channels = 2
+            audio.position = [ FL FR ]
+            capture.props = {{
+                node.name   = "epos-voice-capture"
+{target}
+                node.passive = true
+            }}
+            playback.props = {{
+                node.name   = "epos-voice-output"
+                media.class = Audio/Source
+            }}
+        }}
+    }}
 ]
 "#,
         mode = mode_name,
-        filters = spa_filters,
+        nodes = nodes,
+        links = links,
+        target = target,
     )
 }
 
-/// Peaking EQ biquad coefficient calculation.
-/// Based on Audio EQ Cookbook (Robert Bristow-Johnson).
-fn peaking_eq_coefficients(freq: f64, gain_db: f64, q: f64, sample_rate: f64) -> (f64, f64, f64, f64, f64, f64) {
-    let a = 10f64.powf(gain_db / 40.0);
-    let w0 = 2.0 * std::f64::consts::PI * freq / sample_rate;
-    let alpha = w0.sin() / (2.0 * q);
-
-    let b0 = 1.0 + alpha * a;
-    let b1 = -2.0 * w0.cos();
-    let b2 = 1.0 - alpha * a;
-    let a0 = 1.0 + alpha / a;
-    let a1 = -2.0 * w0.cos();
-    let a2 = 1.0 - alpha / a;
-
-    (b0, b1, b2, a0, a1, a2)
-}
-
-/// Reload WirePlumber by signaling it to re-read configs.
-/// WirePlumber watches .conf.d/ via inotify and reloads automatically.
-/// This is a best-effort nudge.
-async fn reload_wireplumber() {
-    // WirePlumber auto-reloads on file changes in .conf.d/
-    // No explicit signal needed if inotify is active.
-    // As a fallback, we can send SIGHUP to wp if running.
-    debug!("WirePlumber will auto-reload config changes via inotify");
+/// Reload PipeWire so filter-chain module configs take effect.
+/// Restarts the user pipewire service (fast — <1s) to load new .conf.d files.
+async fn reload_pipewire() {
+    let status = tokio::process::Command::new("systemctl")
+        .args(["--user", "restart", "pipewire"])
+        .status()
+        .await;
+    match status {
+        Ok(s) if s.success() => info!("PipeWire restarted to apply filter configs"),
+        Ok(s) => warn!("PipeWire restart returned status {:?}", s.code()),
+        Err(e) => warn!("Failed to restart pipewire: {}", e),
+    }
 }

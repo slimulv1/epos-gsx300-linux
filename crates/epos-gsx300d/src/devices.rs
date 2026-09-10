@@ -106,9 +106,52 @@ fn find_alsa_card(_vid: u16, _pid: u16) -> Option<u8> {
 }
 
 fn find_pipewire_nodes(_card: u8) -> (String, String) {
-    // Construct expected PipeWire node names
-    let sink = format!("alsa_output.usb-*:*.analog-stereo");
-    let source = format!("alsa_input.usb-*:*.mono-fallback");
+    // Resolve the real PipeWire node names for this device by querying pw-dump.
+    // Falls back to wildcard patterns if pw-dump is unavailable.
+    let dump = std::process::Command::new("pw-dump")
+        .output()
+        .ok()
+        .and_then(|o| (o.status.success()).then(|| String::from_utf8_lossy(&o.stdout).into_owned()));
+
+    let mut sink = "alsa_output.usb-*:*.analog-stereo".to_string();
+    let mut source = "alsa_input.usb-*:*.mono-fallback".to_string();
+
+    if let Some(dump) = dump {
+        // Find nodes whose description mentions EPOS GSX 300
+        let mut in_node = false;
+        let mut props: Vec<(String, String)> = Vec::new();
+        for line in dump.lines() {
+            let t = line.trim();
+            if t.contains("PipeWire:Interface:Node") {
+                in_node = true;
+                props.clear();
+                continue;
+            }
+            if in_node {
+                if t == "}" || t == "}" || t.starts_with(']') {
+                    // node object boundary — evaluate collected props
+                    let desc = props.iter().find(|(k, _)| k == "node.description");
+                    let name = props.iter().find(|(k, _)| k == "node.name");
+                    if let (Some((_, d)), Some((_, n))) = (desc, name) {
+                        if d.contains("EPOS GSX 300") {
+                            if n.contains("output") && n.contains("analog-stereo") {
+                                sink = n.clone();
+                            } else if n.contains("input") && n.contains("mono-fallback") {
+                                source = n.clone();
+                            }
+                        }
+                    }
+                    in_node = false;
+                } else if let Some(eq) = t.find(':') {
+                    // JSON format: "key": "value"  or  "key": value
+                    let k = t[..eq].trim().trim_matches('"').to_string();
+                    let v = t[eq + 1..].trim().trim_matches(',').trim_matches('"').to_string();
+                    props.push((k, v));
+                }
+            }
+        }
+    }
+
     (sink, source)
 }
 

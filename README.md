@@ -6,11 +6,11 @@ EQ, sidetone, noise gate, voice enhancer, and audio control for the EPOS GSX 300
 
 ## Features
 
-- 9-band parametric EQ with draggable curve
+- 9-band parametric EQ with draggable curve (real-time PipeWire filter-chain)
 - Preset system (Flat, Music, Movie, eSport + custom)
 - Sidetone (mic monitoring)
 - Voice enhancer (Warm / Clear)
-- Noise gate
+- Noise gate (rnnoise, real-time neural noise suppression)
 - Mic gain control
 - **LED ring control** — blue = stereo / red = 7.1, synced with mode
 - **Smart button** — physical dial click toggles mode + LED (long-press too)
@@ -71,6 +71,33 @@ systemctl --user enable --now epos-gsx300d
 # Launch GUI
 epos-gsx300-gui
 ```
+
+## DSP / Noise Gate setup
+
+EQ and Voice Enhancer use PipeWire's built-in `filter-chain` module —
+nothing extra to install.
+
+Noise gate needs the rnnoise LADSPA plugin (neural noise suppression):
+
+```bash
+# 1. Grab the prebuilt LADSPA wrapper (no root needed):
+#    werman/noise-suppression-for-voice → releases → linux-rnnoise.zip
+mkdir -p ~/.local/lib/ladspa
+unzip linux-rnnoise.zip -d /tmp/rnnoise
+cp /tmp/rnnoise/linux-rnnoise/ladspa/librnnoise_ladspa.so ~/.local/lib/ladspa/
+
+# 2. Tell PipeWire where to find it (user-level, no root):
+mkdir -p ~/.config/systemd/user/pipewire.service.d
+cp systemd/pipewire-ladspa.conf ~/.config/systemd/user/pipewire.service.d/ladspa.conf
+# (edit the path inside if your username differs)
+
+# 3. Reload
+systemctl --user daemon-reload
+systemctl --user restart pipewire
+```
+
+Verify: `pw-cli ls Node | grep epos-` should show `epos-noisegate-*`
+alongside `epos-eq-*` and `epos-voice-*` filter nodes.
 
 ## Tech Stack
 

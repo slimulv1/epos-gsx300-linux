@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::RwLock;
 use tracing::{info, error, warn};
 use epos_shared::Config;
@@ -119,6 +119,7 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
         Request::GetEq => Response::Eq(state.config.audio.clone()),
         Request::SetEq { eq } => {
             state.config.audio.eq = eq.eq;
+            state.audio.update_config(&state.config.audio);
             if let Err(e) = state.audio.apply_eq().await {
                 warn!("Failed to apply EQ: {}", e);
             }
@@ -129,6 +130,7 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
         Request::SetSidetone { enabled, level } => {
             state.config.audio.sidetone.enabled = enabled;
             state.config.audio.sidetone.level = level;
+            state.audio.update_config(&state.config.audio);
             if let Err(e) = state.audio.apply_sidetone().await {
                 warn!("Failed to apply sidetone: {}", e);
             }
@@ -139,6 +141,7 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
         Request::SetNoiseGate { enabled, threshold_db } => {
             state.config.audio.noise_gate.enabled = enabled;
             state.config.audio.noise_gate.threshold_db = threshold_db;
+            state.audio.update_config(&state.config.audio);
             if let Err(e) = state.audio.apply_noise_gate().await {
                 warn!("Failed to apply noise gate: {}", e);
             }
@@ -156,6 +159,7 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
             };
             state.config.audio.voice_enhancer.mode = voice_mode;
             state.config.audio.voice_enhancer.custom_bands = custom_bands;
+            state.audio.update_config(&state.config.audio);
             if let Err(e) = state.audio.apply_voice_enhancer().await {
                 warn!("Failed to apply voice enhancer: {}", e);
             }
@@ -295,4 +299,162 @@ fn chrono_now() -> String {
         .unwrap_or_default()
         .as_secs();
     format!("{}", secs)
+}
+
+// ─── HTTP bridge (development GUI: vite dev server → daemon) ──
+//
+// Serves POST /ipc on 127.0.0.1:9898, translating JSON requests to the
+// same handler the Unix socket uses. Includes CORS headers so the Vue
+// dev server (localhost:5173) can reach it from a browser.
+
+pub async fn run_http_bridge(state: Arc<RwLock<IpcState>>) -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:9898").await?;
+    info!("HTTP bridge listening on http://127.0.0.1:9898/ipc");
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, _addr)) => {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_http_client(stream, state).await {
+                        error!("HTTP handler error: {}", e);
+                    }
+                });
+            }
+            Err(e) => {
+                error!("HTTP accept error: {}", e);
+            }
+        }
+    }
+}
+
+async fn handle_http_client(
+    mut stream: TcpStream,
+    state: Arc<RwLock<IpcState>>,
+) -> Result<()> {
+    // Read request head (until \r\n\r\n) — cap at 8 KiB to avoid abuse.
+    let mut head = Vec::new();
+    let mut buf = [0u8; 1024];
+    let mut content_length: Option<usize> = None;
+
+    loop {
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        head.extend_from_slice(&buf[..n]);
+        if let Some(pos) = find_subslice(&head, b"\r\n\r\n") {
+            let header_block = &head[..pos];
+            // Parse Content-Length
+            for line in header_block.split(|&b| b == b'\n') {
+                let line_str = String::from_utf8_lossy(line).trim().to_string();
+                if let Some(v) = line_str
+                    .to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                {
+                    content_length = v.trim().parse::<usize>().ok();
+                }
+            }
+            // Now read the body (already partially in head)
+            let body = Vec::from(&head[pos + 4..]);
+            let mut body = body;
+            if let Some(cl) = content_length {
+                while body.len() < cl {
+                    let n = stream.read(&mut buf).await?;
+                    if n == 0 {
+                        break;
+                    }
+                    body.extend_from_slice(&buf[..n]);
+                }
+                body.truncate(cl);
+            }
+            return process_http_body(stream, body, state).await;
+        }
+        if head.len() > 8192 {
+            // Malformed / oversized request
+            let _ = stream.write_all(
+                b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            ).await;
+            return Ok(());
+        }
+    }
+
+    // Connection closed without full request — nothing to do.
+    Ok(())
+}
+
+async fn process_http_body(
+    mut stream: TcpStream,
+    body: Vec<u8>,
+    state: Arc<RwLock<IpcState>>,
+) -> Result<()> {
+    let body_str = String::from_utf8_lossy(&body);
+
+    // CORS preflight (OPTIONS)
+    // We can't easily read the method here after body parsing, so handle
+    // POST bodies only; preflight sent without body is answered below.
+    if body_str.trim().is_empty() {
+        let resp = "HTTP/1.1 200 OK\r\n\
+                    Access-Control-Allow-Origin: *\r\n\
+                    Access-Control-Allow-Methods: POST, OPTIONS\r\n\
+                    Access-Control-Allow-Headers: Content-Type\r\n\
+                    Access-Control-Max-Age: 86400\r\n\
+                    Connection: close\r\n\
+                    Content-Length: 0\r\n\r\n";
+        stream.write_all(resp.as_bytes()).await?;
+        return Ok(());
+    }
+
+    let request: Request = match serde_json::from_str(&body_str) {
+        Ok(r) => r,
+        Err(e) => {
+            let resp_body = format!(
+                "{{\"type\":\"Error\",\"payload\":{{\"message\":\"Invalid request: {}\"}}}}",
+                e
+            );
+            let resp = format!(
+                "HTTP/1.1 400 Bad Request\r\n\
+                 Access-Control-Allow-Origin: *\r\n\
+                 Content-Type: application/json\r\n\
+                 Connection: close\r\n\
+                 Content-Length: {}\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            stream.write_all(resp.as_bytes()).await?;
+            return Ok(());
+        }
+    };
+
+    let response = {
+        let mut st = state.write().await;
+        handle_request(request, &mut st).await
+    };
+
+    // Persist config after mutations (same rule as Unix socket)
+    if matches!(response, Response::Ok) {
+        let st = state.read().await;
+        if let Err(e) = config::save(&st.config) {
+            warn!("Failed to save config (http): {}", e);
+        }
+    }
+
+    let json = serde_json::to_string(&response)?;
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Content-Type: application/json\r\n\
+         Connection: close\r\n\
+         Content-Length: {}\r\n\r\n{}",
+        json.len(),
+        json
+    );
+    stream.write_all(resp.as_bytes()).await?;
+    Ok(())
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|w| w == needle)
 }

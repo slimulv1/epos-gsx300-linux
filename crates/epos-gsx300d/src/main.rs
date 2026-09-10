@@ -169,9 +169,12 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Start IPC server (blocking — runs forever)
+    // Run Unix socket IPC server and HTTP bridge (web dev GUI) in parallel
     info!("Daemon ready, starting IPC server...");
-    ipc::run_server(state).await?;
+    let (_, _) = tokio::join!(
+        ipc::run_server(state.clone()),
+        ipc::run_http_bridge(state),
+    );
 
     Ok(())
 }

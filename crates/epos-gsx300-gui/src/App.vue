@@ -8,7 +8,7 @@ import MicSettings from "./components/MicSettings.vue";
 import DeviceInfo from "./components/DeviceInfo.vue";
 import { useDaemon, type EqBand } from "./composables/useDaemon";
 
-const { connected, status, audio, profiles, mode, fetchStatus, fetchAudio, fetchProfiles, toggleMode, setActiveProfile, setEqBands, setSidetone, setMicGain } = useDaemon();
+const { connected, status, audio, profiles, mode, fetchStatus, fetchAudio, fetchProfiles, toggleMode, setActiveProfile, setEqBands, setSidetone, setNoiseGate, setVoiceEnhancer, setMicGain, startPolling } = useDaemon();
 
 const activeTab = ref<"playback" | "mic" | "settings">("playback");
 
@@ -16,6 +16,7 @@ onMounted(async () => {
   await fetchStatus();
   await fetchAudio();
   await fetchProfiles();
+  startPolling();
 });
 
 function onEqUpdate(bands: EqBand[]) {
@@ -27,8 +28,11 @@ function onSidetoneUpdate(enabled: boolean, level: number) {
 }
 
 function onVoiceUpdate(mode: string) {
-  // TODO: send to daemon
-  console.log("Voice mode:", mode);
+  setVoiceEnhancer(mode);
+}
+
+function onNoiseGateUpdate(enabled: boolean, thresholdDb: number) {
+  setNoiseGate(enabled, thresholdDb);
 }
 
 function onMicGainUpdate(gain: number) {
@@ -130,7 +134,7 @@ function onMicGainUpdate(gain: number) {
 
       <!-- Microphone Tab -->
       <div v-if="activeTab === 'mic'" class="tab-content">
-        <MicSettings v-if="audio" :config="audio" @update:micGain="onMicGainUpdate" />
+        <MicSettings v-if="audio" :config="audio" @update:micGain="onMicGainUpdate" @update:noiseGate="onNoiseGateUpdate" />
       </div>
 
       <!-- Settings Tab -->

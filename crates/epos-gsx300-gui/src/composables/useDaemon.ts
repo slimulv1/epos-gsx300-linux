@@ -71,7 +71,10 @@ let useMock = false;
  * or fall back to Tauri invoke, or mock.
  *
  * In production (Tauri app): use invoke("daemon_request", { request })
- * In dev (npm run dev): try localhost, fall back to mock
+ * In dev (npm run dev): try HTTP bridge on 127.0.0.1:9898, fall back to mock
+ *
+ * The HTTP bridge is retried on every call (not sticky) so the GUI picks
+ * the daemon up as soon as it becomes reachable.
  */
 async function sendRequest(
   request: Record<string, unknown>
@@ -98,19 +101,23 @@ async function sendRequest(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(request),
     });
+    // A 400 from the bridge still carries a parsed Error response
     if (resp.ok) {
       return (await resp.json()) as DaemonResponse;
     }
+    const errBody = await resp.json().catch(() => null);
+    if (errBody) return errBody as DaemonResponse;
   } catch {
-    // No HTTP bridge either → mock mode
+    // Bridge not reachable → mock for this call only
   }
 
-  console.warn("Daemon not reachable, switching to mock mode");
-  useMock = true;
   return mockResponse(request);
 }
 
 // ─── Mock Data (dev mode fallback) ─────────────────────────
+
+// Module-level mock state so ToggleMode flips the value (mirrors daemon behavior)
+let mockMode: AudioMode = "stereo";
 
 function mockResponse(request: Record<string, unknown>): DaemonResponse {
   const type = request.type as string;
@@ -123,13 +130,19 @@ function mockResponse(request: Record<string, unknown>): DaemonResponse {
           device_connected: true,
           eq_active: false,
           active_profile: "Flat",
-          mode: "stereo",
+          mode: mockMode,
         },
       };
     case "GetMode":
-      return { type: "Mode", payload: "stereo" };
+      return { type: "Mode", payload: mockMode };
     case "ToggleMode":
-      return { type: "Mode", payload: "surround71" };
+      mockMode = mockMode === "stereo" ? "surround71" : "stereo";
+      return { type: "Mode", payload: mockMode };
+    case "SetMode": {
+      const req = request as { type: string; payload: { mode: AudioMode } };
+      if (req.payload?.mode) mockMode = req.payload.mode;
+      return { type: "Ok", payload: null };
+    }
     case "GetEq":
       return {
         type: "Eq",
@@ -178,6 +191,7 @@ export function useDaemon() {
     if (res?.type === "Status") {
       status.value = res.payload;
       connected.value = true;
+      if (res.payload.mode) mode.value = res.payload.mode as AudioMode;
     }
   }
 
@@ -286,9 +300,10 @@ export function useDaemon() {
     fetchStatus();
     fetchAudio();
     fetchProfiles();
-    fetchMode();
     setInterval(() => {
       fetchStatus();
+      fetchAudio();
+      fetchMode();
     }, 3000);
   }
 

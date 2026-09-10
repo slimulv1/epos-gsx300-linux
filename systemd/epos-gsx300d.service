@@ -1,12 +1,12 @@
 [Unit]
 Description=EPOS GSX 300 Audio Daemon
 After=pipewire.service wireplumber.service graphical-session.target
-Requires=wireplumber.service
+Wants=wireplumber.service
 PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/epos-gsx300d
+ExecStart=/home/magnus/.local/bin/epos-gsx300d
 Restart=on-failure
 RestartSec=5
 Environment=RUST_LOG=info
