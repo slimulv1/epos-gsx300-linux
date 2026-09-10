@@ -7,6 +7,7 @@ defineProps<{
 const emit = defineEmits<{
   select: [name: string];
   add: [];
+  delete: [name: string];
 }>();
 </script>
 
@@ -19,6 +20,14 @@ const emit = defineEmits<{
       @click="emit('select', profile.name)"
     >
       {{ profile.name }}
+      <span
+        v-if="profile.name !== 'Flat'"
+        class="preset-del"
+        title="Delete preset"
+        @click.stop="emit('delete', profile.name)"
+      >
+        ×
+      </span>
     </button>
     <button class="preset-btn add" @click="$emit('add')">
       +
@@ -58,5 +67,16 @@ const emit = defineEmits<{
 .preset-btn.add {
   font-size: 16px;
   padding: 8px 12px;
+}
+
+.preset-del {
+  margin-left: 8px;
+  color: #ff6b6b;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.preset-del:hover {
+  color: #ff4444;
 }
 </style>

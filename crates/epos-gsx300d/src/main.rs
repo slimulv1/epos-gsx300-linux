@@ -6,6 +6,7 @@ mod ipc;
 mod led;
 
 use anyhow::Result;
+use epos_shared::config::SmartButtonAction;
 use epos_shared::config::AudioMode;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -85,42 +86,113 @@ async fn main() -> Result<()> {
         led,
     }));
 
-    // Background task: handle smart button presses (mode sync)
+    // Background task: handle smart button presses (mode sync) according to
+    // the configured SmartButtonAction (default: toggle stereo ⇄ 7.1).
     let s = state.clone();
     tokio::spawn(async move {
         while let Some(evt) = hid_rx.recv().await {
             match evt {
-                HidEvent::ModeChanged(mode) => {
+                HidEvent::ModeChanged(_) | HidEvent::LongPress => {
                     let mut st = s.write().await;
-                    if st.config.mode == mode {
-                        continue; // already in this mode — nothing to do
-                    }
-                    info!("Smart button: mode → {:?} (LED sync)", mode);
-                    st.config.mode = mode;
-                    if let Err(e) = config::save(&st.config) {
-                        warn!("Failed to save config: {}", e);
-                    }
-                    if let Some(ref mut led) = st.led {
-                        if let Err(e) = led.set_mode(mode) {
-                            warn!("Failed to set LED after smart button: {}", e);
-                        }
-                    }
-                }
-                HidEvent::LongPress => {
-                    // Long-press cycles mode (stereo ⇄ 7.1), same as a click.
-                    let mut st = s.write().await;
-                    let new_mode = match st.config.mode {
-                        AudioMode::Stereo => AudioMode::Surround71,
-                        AudioMode::Surround71 => AudioMode::Stereo,
+                    // LongPress carries no mode — derive from current config.
+                    let pressed_mode = match evt {
+                        HidEvent::ModeChanged(m) => Some(m),
+                        _ => None,
                     };
-                    info!("Smart button long press: mode → {:?}", new_mode);
-                    st.config.mode = new_mode;
-                    if let Err(e) = config::save(&st.config) {
-                        warn!("Failed to save config: {}", e);
-                    }
-                    if let Some(ref mut led) = st.led {
-                        if let Err(e) = led.set_mode(new_mode) {
-                            warn!("Failed to set LED after long press: {}", e);
+                    let action = st.config.smart_button.action.clone();
+                    info!("Smart button pressed (action: {:?})", action);
+
+                    match action {
+                        SmartButtonAction::ToggleMode => {
+                            let new_mode = match pressed_mode {
+                                Some(m) if m != st.config.mode => m,
+                                // Device said "already in this mode" (debounce quirk)
+                                // or it was a long press → toggle explicitly.
+                                _ => match st.config.mode {
+                                    AudioMode::Stereo => AudioMode::Surround71,
+                                    AudioMode::Surround71 => AudioMode::Stereo,
+                                },
+                            };
+                            st.config.mode = new_mode;
+                            if let Err(e) = config::save(&st.config) {
+                                warn!("Failed to save config: {}", e);
+                            }
+                            if let Some(ref mut led) = st.led {
+                                if let Err(e) = led.set_mode(new_mode) {
+                                    warn!("Failed to set LED after smart button: {}", e);
+                                }
+                            }
+                            info!("Smart button: mode → {:?} (LED sync)", new_mode);
+                        }
+                        SmartButtonAction::ToggleEq => {
+                            let enabled = !st.config.audio.eq.enabled;
+                            st.config.audio.eq.enabled = enabled;
+                            let audio_cfg = st.config.audio.clone();
+                            st.audio.update_config(&audio_cfg);
+                            if let Err(e) = st.audio.apply_eq().await {
+                                warn!("Failed to toggle EQ: {}", e);
+                            }
+                            if let Err(e) = config::save(&st.config) {
+                                warn!("Failed to save config: {}", e);
+                            }
+                            info!("Smart button: EQ {}", if enabled { "ON" } else { "OFF" });
+                        }
+                        SmartButtonAction::CyclePreset => {
+                            let names: Vec<String> =
+                                st.config.profiles.iter().map(|p| p.name.clone()).collect();
+                            let next = if names.is_empty() {
+                                None
+                            } else {
+                                let idx = names
+                                    .iter()
+                                    .position(|n| *n == st.config.active_profile)
+                                    .unwrap_or(usize::MAX);
+                                let next_idx = (idx + 1) % names.len();
+                                Some(names[next_idx].clone())
+                            };
+                            if let Some(name) = next {
+                                if let Some(profile) =
+                                    st.config.profiles.iter().find(|p| p.name == name)
+                                {
+                                    st.config.audio = profile.audio.clone();
+                                    st.config.active_profile = name.clone();
+                                    let audio_cfg = st.config.audio.clone();
+                                    st.audio.update_config(&audio_cfg);
+                                    if let Err(e) = st.audio.apply_full().await {
+                                        warn!("Failed to apply profile: {}", e);
+                                    }
+                                    if let Err(e) = config::save(&st.config) {
+                                        warn!("Failed to save config: {}", e);
+                                    }
+                                    info!("Smart button: profile → {}", name);
+                                }
+                            }
+                        }
+                        SmartButtonAction::ToggleSidetone => {
+                            let enabled = !st.config.audio.sidetone.enabled;
+                            st.config.audio.sidetone.enabled = enabled;
+                            let audio_cfg = st.config.audio.clone();
+                            st.audio.update_config(&audio_cfg);
+                            if let Err(e) = st.audio.apply_sidetone().await {
+                                warn!("Failed to toggle sidetone: {}", e);
+                            }
+                            if let Err(e) = config::save(&st.config) {
+                                warn!("Failed to save config: {}", e);
+                            }
+                            info!("Smart button: sidetone {}", if enabled { "ON" } else { "OFF" });
+                        }
+                        SmartButtonAction::ToggleNoiseGate => {
+                            let enabled = !st.config.audio.noise_gate.enabled;
+                            st.config.audio.noise_gate.enabled = enabled;
+                            let audio_cfg = st.config.audio.clone();
+                            st.audio.update_config(&audio_cfg);
+                            if let Err(e) = st.audio.apply_noise_gate().await {
+                                warn!("Failed to toggle noise gate: {}", e);
+                            }
+                            if let Err(e) = config::save(&st.config) {
+                                warn!("Failed to save config: {}", e);
+                            }
+                            info!("Smart button: noise gate {}", if enabled { "ON" } else { "OFF" });
                         }
                     }
                 }

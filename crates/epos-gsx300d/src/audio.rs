@@ -228,6 +228,9 @@ impl AudioPipeline {
         let conf_path = conf_dir.join("93-epos-noisegate.conf");
 
         if self.config.noise_gate.enabled {
+            // Map threshold_db (-60..0) → VAD Threshold % (50..100):
+            // lower dB threshold = more aggressive suppression.
+            let vad_threshold = 50.0 + ((-self.config.noise_gate.threshold_db).clamp(0.0, 60.0) / 60.0) * 50.0;
             let filter_conf = format!(
                 r#"# EPOS GSX 300 noise gate (rnnoise via LADSPA filter-chain)
 # Applied to capture node: {source}
@@ -247,7 +250,7 @@ context.modules = [
                         plugin = "librnnoise_ladspa"
                         label  = noise_suppressor_stereo
                         control = {{
-                            "VAD Threshold (%)" 50.0
+                            "VAD Threshold (%)" {vad_threshold:.1}
                         }}
                     }}
                 ]

@@ -9,11 +9,11 @@ EQ, sidetone, noise gate, voice enhancer, and audio control for the EPOS GSX 300
 - 9-band parametric EQ with draggable curve (real-time PipeWire filter-chain)
 - Preset system (Flat, Music, Movie, eSport + custom)
 - Sidetone (mic monitoring)
-- Voice enhancer (Warm / Clear)
-- Noise gate (rnnoise, real-time neural noise suppression)
+- Voice enhancer (Warm / Clear / **Custom** — custom bands built from current EQ)
+- Noise gate (rnnoise, real-time neural noise suppression, threshold-tunable)
 - Mic gain control
 - **LED ring control** — blue = stereo / red = 7.1, synced with mode
-- **Smart button** — physical dial click toggles mode + LED (long-press too)
+- **Configurable smart button** — physical dial click (or long-press) dispatches one of 5 actions: toggle mode (default), toggle EQ, cycle presets, toggle sidetone, toggle noise gate — set via Settings tab
 - Dark UI with gaming aesthetic
 
 ## Architecture

@@ -37,12 +37,24 @@ export interface Profile {
 
 export type AudioMode = "stereo" | "surround71";
 
+export interface DeviceInfo {
+  usb_bus: number;
+  usb_addr: number;
+  alsa_card: number;
+  pipewire_sink: string;
+  pipewire_source: string;
+  hidraw: string | null;
+  input_event: string | null;
+  firmware_version: string | null;
+}
+
 export interface DeviceStatus {
   daemon_version: string;
   device_connected: boolean;
   eq_active: boolean;
   active_profile: string;
   mode: AudioMode;
+  smart_button_action?: string;
 }
 
 // ─── State ──────────────────────────────────────────────────
@@ -52,6 +64,7 @@ const status = ref<DeviceStatus | null>(null);
 const audio = ref<AudioConfig | null>(null);
 const profiles = ref<Profile[]>([]);
 const mode = ref<AudioMode>("stereo");
+const device = ref<DeviceInfo | null>(null);
 
 // ─── IPC Layer ──────────────────────────────────────────────
 
@@ -118,6 +131,14 @@ async function sendRequest(
 
 // Module-level mock state so ToggleMode flips the value (mirrors daemon behavior)
 let mockMode: AudioMode = "stereo";
+const mockStatus = {
+  daemon_version: "0.1.0",
+  device_connected: true,
+  eq_active: false,
+  active_profile: "Flat",
+  mode: mockMode as AudioMode,
+  smart_button_action: "toggle_mode",
+};
 
 function mockResponse(request: Record<string, unknown>): DaemonResponse {
   const type = request.type as string;
@@ -125,13 +146,7 @@ function mockResponse(request: Record<string, unknown>): DaemonResponse {
     case "GetStatus":
       return {
         type: "Status",
-        payload: {
-          daemon_version: "0.1.0",
-          device_connected: true,
-          eq_active: false,
-          active_profile: "Flat",
-          mode: mockMode,
-        },
+        payload: { ...mockStatus, mode: mockMode },
       };
     case "GetMode":
       return { type: "Mode", payload: mockMode };
@@ -141,6 +156,13 @@ function mockResponse(request: Record<string, unknown>): DaemonResponse {
     case "SetMode": {
       const req = request as { type: string; payload: { mode: AudioMode } };
       if (req.payload?.mode) mockMode = req.payload.mode;
+      return { type: "Ok", payload: null };
+    }
+    case "SetSmartButton": {
+      const req = request as { type: string; payload: { action: string } };
+      if (mockStatus.smart_button_action) {
+        mockStatus.smart_button_action = req.payload?.action || "toggle_mode";
+      }
       return { type: "Ok", payload: null };
     }
     case "GetEq":
@@ -163,6 +185,20 @@ function mockResponse(request: Record<string, unknown>): DaemonResponse {
           { name: "Movie", audio: {}, created_at: "2026-09-09" },
           { name: "eSport", audio: {}, created_at: "2026-09-09" },
         ],
+      };
+    case "GetDevice":
+      return {
+        type: "Device",
+        payload: {
+          usb_bus: 1,
+          usb_addr: 5,
+          alsa_card: 2,
+          pipewire_sink: "alsa_output.usb-Sennheiser_EPOS_GSX_300-00.analog-stereo",
+          pipewire_source: "alsa_input.usb-Sennheiser_EPOS_GSX_300-00.analog-stereo",
+          hidraw: "/dev/hidraw3",
+          input_event: "/dev/input/event7",
+          firmware_version: null,
+        },
       };
     default:
       return { type: "Ok", payload: null };
@@ -206,6 +242,13 @@ export function useDaemon() {
     const res = await sendRequest({ type: "GetProfiles" });
     if (res?.type === "Profiles") {
       profiles.value = res.payload;
+    }
+  }
+
+  async function fetchDevice() {
+    const res = await sendRequest({ type: "GetDevice" });
+    if (res?.type === "Device") {
+      device.value = res.payload as DeviceInfo | null;
     }
   }
 
@@ -266,6 +309,31 @@ export function useDaemon() {
     }
   }
 
+  async function createProfile(name: string) {
+    if (!audio.value) return;
+    const res = await sendRequest({
+      type: "CreateProfile",
+      payload: { name, audio: audio.value },
+    });
+    if (res?.type === "Ok") {
+      await fetchProfiles();
+      await fetchStatus();
+    }
+    return res?.type === "Ok";
+  }
+
+  async function deleteProfile(name: string) {
+    const res = await sendRequest({
+      type: "DeleteProfile",
+      payload: { name },
+    });
+    if (res?.type === "Ok") {
+      await fetchProfiles();
+      await fetchStatus();
+    }
+    return res?.type === "Ok";
+  }
+
   async function fetchMode() {
     const res = await sendRequest({ type: "GetMode" });
     if (res?.type === "Mode") {
@@ -292,6 +360,16 @@ export function useDaemon() {
     }
   }
 
+  async function setSmartButton(action: string) {
+    const res = await sendRequest({
+      type: "SetSmartButton",
+      payload: { action },
+    });
+    if (res?.type === "Ok" && status.value) {
+      status.value.smart_button_action = action;
+    }
+  }
+
   /**
    * Auto-poll daemon status every 3 seconds.
    * Call once from App.vue setup.
@@ -300,6 +378,7 @@ export function useDaemon() {
     fetchStatus();
     fetchAudio();
     fetchProfiles();
+    fetchDevice();
     setInterval(() => {
       fetchStatus();
       fetchAudio();
@@ -313,9 +392,11 @@ export function useDaemon() {
     audio,
     profiles,
     mode,
+    device,
     fetchStatus,
     fetchAudio,
     fetchProfiles,
+    fetchDevice,
     fetchMode,
     setMode,
     toggleMode,
@@ -325,6 +406,9 @@ export function useDaemon() {
     setVoiceEnhancer,
     setMicGain,
     setActiveProfile,
+    createProfile,
+    deleteProfile,
+    setSmartButton,
     startPolling,
   };
 }

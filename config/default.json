@@ -47,6 +47,6 @@
   ],
   "active_profile": "Flat",
   "smart_button": {
-    "action": "cycle_preset"
+    "action": "toggle_mode"
   }
 }

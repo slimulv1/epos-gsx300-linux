@@ -2,7 +2,7 @@
 defineProps<{ mode: string }>();
 const emit = defineEmits<{ update: [mode: string] }>();
 
-const modes = ["off", "warm", "clear"];
+const modes = ["off", "warm", "clear", "custom"];
 </script>
 
 <template>

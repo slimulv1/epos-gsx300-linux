@@ -8,7 +8,7 @@ import MicSettings from "./components/MicSettings.vue";
 import DeviceInfo from "./components/DeviceInfo.vue";
 import { useDaemon, type EqBand } from "./composables/useDaemon";
 
-const { connected, status, audio, profiles, mode, fetchStatus, fetchAudio, fetchProfiles, toggleMode, setActiveProfile, setEqBands, setSidetone, setNoiseGate, setVoiceEnhancer, setMicGain, startPolling } = useDaemon();
+const { connected, status, audio, profiles, mode, device, fetchStatus, fetchAudio, fetchProfiles, toggleMode, setActiveProfile, createProfile, deleteProfile, setEqBands, setSidetone, setNoiseGate, setVoiceEnhancer, setMicGain, setSmartButton, startPolling } = useDaemon();
 
 const activeTab = ref<"playback" | "mic" | "settings">("playback");
 
@@ -28,7 +28,18 @@ function onSidetoneUpdate(enabled: boolean, level: number) {
 }
 
 function onVoiceUpdate(mode: string) {
-  setVoiceEnhancer(mode);
+  if (mode === "custom" && audio.value) {
+    // Build a voice-oriented 4-band preset from the current EQ bands.
+    const src = audio.value.eq.bands;
+    const customBands = [0, 1, 3, 6].map((i) =>
+      src[i]
+        ? { freq: src[i].freq, gain_db: src[i].gain_db, q: src[i].q }
+        : { freq: [200, 400, 800, 4000][i], gain_db: 0, q: 1.0 }
+    );
+    setVoiceEnhancer("custom", customBands);
+  } else {
+    setVoiceEnhancer(mode);
+  }
 }
 
 function onNoiseGateUpdate(enabled: boolean, thresholdDb: number) {
@@ -37,6 +48,22 @@ function onNoiseGateUpdate(enabled: boolean, thresholdDb: number) {
 
 function onMicGainUpdate(gain: number) {
   setMicGain(gain);
+}
+
+function onSmartButtonUpdate(action: string) {
+  setSmartButton(action);
+}
+
+function onPresetAdd() {
+  const name = window.prompt("Preset name:", "My Preset");
+  if (!name?.trim()) return;
+  createProfile(name.trim());
+}
+
+function onPresetDelete(name: string) {
+  if (window.confirm(`Delete preset "${name}"?`)) {
+    deleteProfile(name);
+  }
 }
 </script>
 
@@ -107,6 +134,8 @@ function onMicGainUpdate(gain: number) {
             :profiles="profiles"
             :active="status?.active_profile || 'Flat'"
             @select="setActiveProfile"
+            @add="onPresetAdd"
+            @delete="onPresetDelete"
           />
         </div>
 
@@ -139,7 +168,12 @@ function onMicGainUpdate(gain: number) {
 
       <!-- Settings Tab -->
       <div v-if="activeTab === 'settings'" class="tab-content">
-        <DeviceInfo :status="status" />
+        <DeviceInfo
+          :status="status"
+          :device="device"
+          :smart-button-action="status?.smart_button_action || 'toggle_mode'"
+          @update:smart-button="onSmartButtonUpdate"
+        />
       </div>
     </main>
   </div>

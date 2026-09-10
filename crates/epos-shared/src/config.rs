@@ -115,6 +115,8 @@ pub struct SmartButtonConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum SmartButtonAction {
+    /// Toggle stereo ⇄ 7.1 (matches EPOS Gaming Suite default: LED blue ⇄ red)
+    ToggleMode,
     ToggleEq,
     CyclePreset,
     ToggleSidetone,
@@ -141,7 +143,7 @@ impl Default for Config {
             ],
             active_profile: "Flat".into(),
             smart_button: SmartButtonConfig {
-                action: SmartButtonAction::CyclePreset,
+                action: SmartButtonAction::ToggleMode,
             },
         }
     }

@@ -108,6 +108,10 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
                 eq_active: state.config.audio.eq.enabled,
                 active_profile: state.config.active_profile.clone(),
                 mode: state.config.mode,
+                smart_button_action: serde_json::to_string(&state.config.smart_button.action)
+                    .unwrap_or_else(|_| "\"toggle_mode\"".into())
+                    .trim_matches('"')
+                    .into(),
             }
         }
         Request::GetDevice => {
@@ -259,12 +263,14 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
         Request::SetSmartButton { action } => {
             use epos_shared::config::SmartButtonAction;
             let btn_action = match action.as_str() {
+                "toggle_mode" => SmartButtonAction::ToggleMode,
                 "toggle_eq" => SmartButtonAction::ToggleEq,
                 "cycle_preset" => SmartButtonAction::CyclePreset,
                 "toggle_sidetone" => SmartButtonAction::ToggleSidetone,
                 "toggle_noise_gate" => SmartButtonAction::ToggleNoiseGate,
-                _ => SmartButtonAction::CyclePreset,
+                _ => SmartButtonAction::ToggleMode,
             };
+            info!("Smart button action set to {:?}", btn_action);
             state.config.smart_button.action = btn_action;
             Response::Ok
         }

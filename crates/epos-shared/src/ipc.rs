@@ -52,6 +52,7 @@ pub enum Response {
         eq_active: bool,
         active_profile: String,
         mode: AudioMode,
+        smart_button_action: String,
     },
     Device(Option<DeviceInfo>),
     Eq(AudioConfig),
