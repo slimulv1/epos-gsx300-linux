@@ -34,7 +34,7 @@ function onVoiceUpdate(mode: string) {
     const customBands = [0, 1, 3, 6].map((i) =>
       src[i]
         ? { freq: src[i].freq, gain_db: src[i].gain_db, q: src[i].q }
-        : { freq: [200, 400, 800, 4000][i], gain_db: 0, q: 1.0 }
+        : { freq: [200, 400, 800, 1600][i % 4], gain_db: 0, q: 1.0 }
     );
     setVoiceEnhancer("custom", customBands);
   } else {

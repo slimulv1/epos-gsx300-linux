@@ -6,6 +6,7 @@ use tokio::sync::RwLock;
 use tracing::{info, error, warn};
 use epos_shared::Config;
 use epos_shared::config::AudioMode;
+use epos_shared::config::AudioConfig;
 use epos_shared::ipc::{Request, Response};
 use crate::audio::AudioPipeline;
 use crate::config;
@@ -250,7 +251,38 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
             let before = state.config.profiles.len();
             state.config.profiles.retain(|p| p.name != name);
             if state.config.profiles.len() < before {
-                info!("Deleted profile '{}'", name);
+                // If we deleted the active profile, fall back to Flat (or first remaining).
+                if state.config.active_profile == name {
+                    let fallback = state
+                        .config
+                        .profiles
+                        .iter()
+                        .find(|p| p.name == "Flat")
+                        .or_else(|| state.config.profiles.first())
+                        .cloned();
+                    if let Some(profile) = fallback {
+                        state.config.audio = profile.audio.clone();
+                        state.config.active_profile = profile.name.clone();
+                        let audio_cfg = state.config.audio.clone();
+                        state.audio.update_config(&audio_cfg);
+                        if let Err(e) = state.audio.apply_full().await {
+                            warn!("Failed to apply fallback profile: {}", e);
+                        }
+                        info!("Deleted active profile '{}' → fallback to '{}'", name, profile.name);
+                    } else {
+                        // No profiles left: reset to defaults.
+                        state.config.audio = AudioConfig::default();
+                        state.config.active_profile = String::from("Flat");
+                        let audio_cfg = state.config.audio.clone();
+                        state.audio.update_config(&audio_cfg);
+                        if let Err(e) = state.audio.apply_full().await {
+                            warn!("Failed to apply default audio: {}", e);
+                        }
+                        info!("Deleted last profile '{}' → reset to defaults", name);
+                    }
+                } else {
+                    info!("Deleted profile '{}'", name);
+                }
                 Response::Ok
             } else {
                 Response::Error {

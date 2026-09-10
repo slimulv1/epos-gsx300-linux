@@ -333,10 +333,16 @@ context.modules = [
             }
             VoiceMode::Custom => {
                 if let Some(ref bands) = self.config.voice_enhancer.custom_bands {
-                    let band_data: Vec<(u32, f32, f32)> = bands.iter()
+                    let active_bands: Vec<(u32, f32, f32)> = bands.iter()
+                        .filter(|b| b.gain_db.abs() >= 0.1)
                         .map(|b| (b.freq, b.gain_db, b.q))
                         .collect();
-                    generate_voice_eq_conf("custom", device_source.as_deref(), &band_data)
+                    if active_bands.is_empty() {
+                        warn!("Custom voice: all gains 0, writing passthrough filter (no EQ)");
+                    } else {
+                        info!("Custom voice: {} active band(s)", active_bands.len());
+                    }
+                    generate_voice_eq_conf("custom", device_source.as_deref(), &active_bands)
                 } else {
                     if conf_path.exists() {
                         std::fs::remove_file(&conf_path)?;
