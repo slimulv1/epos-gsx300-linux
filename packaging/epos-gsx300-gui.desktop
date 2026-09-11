@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=EPOS GSX 300
+Comment=Configure your EPOS GSX 300 USB gaming DAC
+Exec=epos-gsx300-gui
+Icon=epos-gsx300
+Categories=Audio;AudioVideo;
+Keywords=epos;gsx;audio;dac;gaming;eq;
+StartupWMClass=epos-gsx300-gui
+Terminal=false

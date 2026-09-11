@@ -1,0 +1,174 @@
+/* ─────────────────────────────────────────────
+   EPOS GSX 300 — Global design tokens & base
+   Palette from EPOS Gaming Suite (pcper.com review)
+   ───────────────────────────────────────────── */
+
+:root {
+  /* Core surfaces */
+  --bg: #1b2b30;
+  --panel: #1a1f22;
+  --panel-2: #22292d;
+  --footer: #14181b;
+
+  /* Accent */
+  --accent: #4ecdc4;
+  --accent-dim: rgba(78, 205, 196, 0.35);
+  --accent-glow: rgba(78, 205, 196, 0.18);
+
+  /* Text */
+  --text: #e8eef0;
+  --muted: #8a9ba0;
+  --faint: #5c6b70;
+
+  /* Grid / lines */
+  --grid: #2a3a3f;
+  --border: #223033;
+
+  /* State */
+  --danger: #e74c5e;
+  --warn: #e0a458;
+
+  /* Responsive spacing (dwm: fluid across sizes) */
+  --space-1: clamp(4px, 0.4vw, 6px);
+  --space-2: clamp(8px, 0.8vw, 12px);
+  --space-3: clamp(12px, 1.2vw, 20px);
+  --space-4: clamp(16px, 1.8vw, 28px);
+
+  /* Typography */
+  --font-ui: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", "Fira Code", ui-monospace, monospace;
+  --fs-xs: clamp(10px, 0.9vw, 12px);
+  --fs-sm: clamp(11px, 1vw, 13px);
+  --fs-md: clamp(13px, 1.2vw, 15px);
+  --fs-lg: clamp(16px, 1.6vw, 20px);
+  --fs-xl: clamp(20px, 2.2vw, 28px);
+
+  /* Motion */
+  --ease: cubic-bezier(0.25, 0.46, 0.45, 0.94);
+  --time-fast: 150ms;
+  --time-med: 250ms;
+}
+
+/* Inter font — self-hosted via @fontsource if available, else system stack */
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap");
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--font-ui);
+  background: var(--bg);
+  color: var(--text);
+  font-size: var(--fs-md);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  cursor: default;
+}
+
+/* Focus ring — teal, visible for keyboard nav (dwm users) */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+/* Dark scrollbars (webkit + firefox) */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--grid);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
+}
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--grid) transparent;
+}
+
+/* Motion preference */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ─── Shared UI primitives ─── */
+
+.epos-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    border-color var(--time-fast) var(--ease),
+    background var(--time-fast) var(--ease),
+    color var(--time-fast) var(--ease),
+    box-shadow var(--time-fast) var(--ease);
+}
+.epos-btn:hover {
+  border-color: var(--accent-dim);
+  background: #293238;
+}
+.epos-btn:active {
+  transform: scale(0.97);
+}
+.epos-btn--accent {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: transparent;
+}
+.epos-btn--accent:hover {
+  background: var(--accent-glow);
+  box-shadow: 0 0 12px var(--accent-glow);
+}
+.epos-btn--ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--muted);
+}
+.epos-btn--ghost:hover {
+  color: var(--text);
+  background: var(--panel-2);
+}
+.epos-btn:disabled,
+.epos-btn--disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+.epos-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: var(--space-3);
+}

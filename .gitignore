@@ -18,6 +18,15 @@ dist/
 Thumbs.db
 
 # Build artifacts
+target/
+
+# Tauri auto-generated
+crates/epos-gsx300-gui/src-tauri/gen/
+crates/epos-gsx300-gui/src-tauri/icons/android/
+crates/epos-gsx300-gui/src-tauri/target/
+crates/epos-gsx300-gui/dist/
+crates/epos-gsx300-gui/node_modules/
+crates/epos-gsx300-gui/.vite/
 *.deb
 *.rpm
 *.AppImage

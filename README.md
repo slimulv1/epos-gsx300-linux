@@ -26,8 +26,9 @@ epos-gsx300d              Rust daemon — audio DSP + device control
   epos-config             Config + preset management
   epos-shared             IPC types, device IDs
 
-epos-gsx300-gui           Tauri 2.x (Rust + Vue 3) — config GUI
-                          Connects via Unix socket
+epos-gsx300-gui           Tauri 2.x + Vue 3 — native desktop app (Pinia + Naive UI)
+                          Connects to daemon via Unix socket IPC
+                          Responsive: scales from 640×400 to fullscreen (dwm-friendly)
 ```
 
 ## Install
@@ -43,6 +44,9 @@ sudo ./scripts/install.sh --udev
 
 # Install daemon as a systemd user service:
 ./scripts/install.sh
+
+# Install GUI (Tauri desktop app + desktop entry):
+./scripts/install.sh --gui
 ```
 
 <details>
@@ -50,10 +54,11 @@ sudo ./scripts/install.sh --udev
 
 | Option        | What it does                                              |
 | ------------- | --------------------------------------------------------- |
-| (none)        | Install binary to `~/.local/bin`, enable systemd user service |
+| (none)        | Install daemon to `~/.local/bin`, enable systemd user service |
+| `--gui`       | Build + install Tauri desktop app + desktop entry + icon  |
 | `--udev`      | Install udev rule (sudo) — grants `audio` group access    |
 | `--system`    | Install to `/usr/local/bin` + systemd user service        |
-| `--uninstall` | Remove binary, service, config                            |
+| `--uninstall` | Remove daemon, GUI, desktop entry, config                 |
 
 </details>
 
@@ -65,12 +70,19 @@ sudo ./scripts/install.sh --udev
 ## Usage
 
 ```bash
-# Start daemon
+# Start daemon (systemd user service)
 systemctl --user enable --now epos-gsx300d
 
-# Launch GUI
+# Launch GUI (desktop app)
 epos-gsx300-gui
 ```
+
+The GUI is a responsive native desktop app (Tauri 2.x) that scales from
+640×400 to fullscreen — works well with dwm tiling. Bottom-nav has 4 tabs:
+**Playback** (EQ + presets + surround + sidetone + sound test),
+**Microphone** (voice enhancer + gain + noise gate),
+**Device** (USB info + smart button config),
+**Settings** (autostart + status + about).
 
 ## DSP / Noise Gate setup
 
@@ -101,11 +113,12 @@ alongside `epos-eq-*` and `epos-voice-*` filter nodes.
 
 ## Tech Stack
 
-- **Daemon**: Rust + Tokio
-- **GUI**: Tauri 2.x + Vue 3
-- **Audio**: PipeWire integration
-- **USB**: udev rules (no root needed)
-- **Config**: JSON at `~/.config/epos-gsx300/config.json`
+- **Daemon**: Rust + Tokio + signal-hook
+- **GUI**: Tauri 2.x + Vue 3 + Pinia + Naive UI + Lucide icons
+- **Audio**: PipeWire filter-chain (EQ / voice enhancer / noise gate)
+- **USB**: udev rules (no root needed) + rusb + hidapi
+- **IPC**: Unix socket (daemon ↔ GUI) + HTTP bridge (127.0.0.1:9898)
+- **Config**: JSON at `~/.config/epos-gsx300/config.json` (auto-reload on save)
 
 ## License
 
