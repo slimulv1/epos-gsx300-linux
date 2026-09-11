@@ -1,17 +1,30 @@
+use pipewire as pw;
 use serde::Serialize;
-use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
-use tauri::{Emitter, Manager};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use tauri::{Emitter};
+use pw::spa::param::format::{MediaSubtype, MediaType};
+use pw::spa::param::format_utils;
+use pw::spa::pod::Pod;
 
-/// Holds the running `pw-record` child used for live mic level metering.
-/// The reader thread also takes this child out on EOF (device unplugged),
-/// so every state transition is serialized through the same mutex.
+/// Holds the live PipeWire capture stream worker.
+///
+/// Unlike the previous `pw-record` subprocess approach, the meter now opens a
+/// direct PipeWire capture stream (Audio/Capture) targetting the EPOS source
+/// node via `target.object`. No subprocess, no .snd header, no EOF/keep-alive
+/// restart churn: the stream dies cleanly on device unplug and is re-created
+/// by the next `mic_meter_start` keep-alive tick.
 #[derive(Default)]
 pub struct MicMeterState {
-    pub child: Mutex<Option<Child>>,
+    /// Set to true by `mic_meter_stop`. The worker's watchdog timer polls it
+    /// (~300 ms) and quits the main loop from inside the loop thread, so
+    /// `join()` always returns quickly.
+    stop: Arc<AtomicBool>,
+    /// Join handle of the worker thread (None = not running).
+    join: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
-/// Event payload emitted to the frontend (~47x/s):
+/// Event payload emitted to the frontend (~33x/s):
 /// `db` = instantaneous mono peak RELATIVE to the adaptive noise floor
 ///        (0 = idle hiss level; a loud shout reaches ~25-30),
 /// `peak_db` = relative peak-hold with ~16 dB/s falloff,
@@ -25,11 +38,23 @@ pub struct MicLevel {
     pub active: bool,
 }
 
+/// Raw pointer to the `pw_main_loop`. Only `pw_main_loop_quit` is ever called
+/// through it, and only from the main loop thread itself (watchdog timer or
+/// unplug handler), so no Send/Sync requirement leaks into the worker state.
+#[derive(Clone, Copy)]
+struct QuitHandle(*mut pw::sys::pw_main_loop);
+
+impl QuitHandle {
+    fn quit(self) {
+        unsafe { pw::sys::pw_main_loop_quit(self.0) };
+    }
+}
+
 /// Find the raw EPOS GSX 300 mic source node via pw-dump.
 /// Matches by prefix/suffix (NOT the hardcoded serial) so a device swap
 /// still resolves correctly. Returns Ok(None) when the device is absent.
 fn resolve_epos_source() -> Result<Option<String>, String> {
-    let out = Command::new("pw-dump")
+    let out = std::process::Command::new("pw-dump")
         .output()
         .map_err(|e| format!("pw-dump failed (pipewire installed?): {e}"))?;
     if !out.status.success() {
@@ -52,155 +77,259 @@ fn resolve_epos_source() -> Result<Option<String>, String> {
     Ok(None)
 }
 
+/// Live-state of the capture stream, shared by the listener callbacks.
+/// The stream is set up WITHOUT `RT_PROCESS`, so every callback runs on the
+/// main loop thread -> no locking required inside UserData.
+struct MeterData {
+    app: tauri::AppHandle,
+    quit: QuitHandle,
+    /// Negotiated stream format (filled by param_changed).
+    format: pw::spa::param::audio::AudioInfoRaw,
+    /// Noise-floor reference (absolute dBFS). Fixed init from the measured
+    /// EPOS GSX 300 preamp hiss (~-33 dBFS chunk-peak). A bootstrap is not
+    /// used: the stream may start with digital silence, and a median over an
+    /// all-silence window would pin the reference at -60 dB, inflating every
+    /// level by ~25 dB -> ring permanently full. A fixed init heals within a
+    /// second no matter what arrives first.
+    quiet_db: f32,
+    /// Relative peak-hold (rise instantly, fall ~0.35 dB per chunk).
+    peak_db: f32,
+    /// Samples accumulated toward the next 1440-sample (~30 ms) readout.
+    pending: u32,
+    /// Peak |sample| within the pending window.
+    peak: f32,
+    /// True once the stream reaches Streaming (used to distinguish a real
+    /// device unplug from the initial Unconnected state).
+    was_streaming: bool,
+}
+
+const CHUNK_SAMPLES: u32 = 1440; // ~30 ms at 48 kHz -> ~33 emits/s
+
 /// Start the mic level meter. Returns:
 ///   Ok(true)  — meter running (or already running)
 ///   Ok(false) — EPOS mic not present; caller should retry later
-///   Err(msg)  — pw-dump/pw-record unavailable or spawn failed
+///   Err(msg)  — pw-dump unavailable / stream setup failed
 #[tauri::command]
 pub async fn mic_meter_start(
     app: tauri::AppHandle,
     state: tauri::State<'_, MicMeterState>,
 ) -> Result<bool, String> {
+    // Idempotent: if the worker is still alive, it is already metering.
     {
-        let guard = state.child.lock().map_err(|e| e.to_string())?;
-        if guard.is_some() {
-            return Ok(true); // already running
+        let guard = state.join.lock().map_err(|e| e.to_string())?;
+        if let Some(h) = guard.as_ref() {
+            if !h.is_finished() {
+                return Ok(true);
+            }
         }
     }
 
-    let Some(src) = resolve_epos_source()? else {
+    let Some(node) = resolve_epos_source()? else {
         return Ok(false);
     };
 
-    let mut child = Command::new("pw-record")
-        .args([
-            "--target",
-            &src,
-            "--channels",
-            "1",
-            "--rate",
-            "48000",
-            "--format",
-            "f32",
-            "--latency",
-            "50ms",
-            "-",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("pw-record failed (pipewire-utils installed?): {e}"))?;
+    state.stop.store(false, Ordering::SeqCst);
 
-    let stdout = child.stdout.take().ok_or("pw-record: no stdout")?;
-    *state.child.lock().map_err(|e| e.to_string())? = Some(child);
+    let stop = state.stop.clone();
 
-    let app2 = app; // moved into the reader thread
-    std::thread::spawn(move || {
-        use std::io::Read;
-        let mut reader = std::io::BufReader::new(stdout);
-        let mut buf = [0u8; 4096]; // 1024 mono f32 samples per chunk
-        let mut peak_db: f32 = 0.0; // relative peak-hold
-        let mut quiet_db: f32 = -100.0; // adaptive noise-floor reference (absolute dBFS)
-        let mut boot: Vec<f32> = Vec::with_capacity(60); // bootstrap samples
-        let mut started = false;
-        loop {
-            let n = match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break, // EOF → device gone or meter stopped
-                Ok(n) => n,
-            };
-            let mut data = &buf[..n];
-            if !started {
-                started = true;
-                // pw-record prefixes a 24-byte Sun Audio (.snd) header on stdout:
-                // magic ".snd", data offset, size, encoding 6=f32, rate, chans.
-                // Skip it so header bytes are never decoded as samples.
-                if data.len() >= 24 && &data[..4] == b".snd" {
-                    data = &data[24..];
-                }
-            }
-            if data.is_empty() {
-                continue;
-            }
-            let mut peak: f32 = 0.0;
-            for c in data.chunks_exact(4) {
-                let a = f32::from_le_bytes([c[0], c[1], c[2], c[3]]).abs();
-                if a > peak {
-                    peak = a;
-                }
-            }
-            if peak == 0.0 {
-                peak = 1e-9;
-            }
-            let db_full = (20.0 * peak.log10()).max(-60.0); // absolute dBFS
-            // Bootstrap: the first ~1.8s of the stream is unreliable (pw-record
-            // starts with a few hundred ms of digital silence, which would pin
-            // the reference at -60 dB and inflate every level by ~25 dB).
-            // Use the MEDIAN of the first 60 chunks as the initial reference.
-            if boot.len() < 60 {
-                boot.push(db_full);
-                if boot.len() == 60 {
-                    let mut b = boot.clone();
-                    b.sort_by(|a, c| a.partial_cmp(c).unwrap());
-                    quiet_db = b[30];
-                }
-                continue;
-            }
-            // Adaptive noise-floor follower: learns the mic's idle hiss level.
-            // The raw USB preamp is always "alive" (~-35 dBFS here), so without
-            // this reference the ring would swing 30-60% on pure silence.
-            if db_full < quiet_db + 6.0 {
-                quiet_db = quiet_db * 0.98 + db_full * 0.02; // ~1.5 s time constant
-            }
-            let db = (db_full - quiet_db).max(0.0); // 0 dB = at noise floor
-            // Peak-hold (relative): rise instantly, fall ~16 dB/s (0.35 dB per chunk).
-            if db >= peak_db {
-                peak_db = db;
-            } else {
-                peak_db = (peak_db - 0.35).max(db);
-            }
-            let clip = db_full >= -6.0;
-            let _ = app2.emit(
-                "mic-level",
-                MicLevel {
-                    db,
-                    peak_db,
-                    clip,
-                    active: true,
-                },
-            );
-        }
-        // EOF: release the child and tell the frontend we went silent.
-        // (app2 is owned by this closure, so its state borrow cannot escape.)
-        if let Some(mut c) = app2
-            .state::<MicMeterState>()
-            .child
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take())
-        {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-        let _ = app2.emit(
-            "mic-level",
-            MicLevel {
-                db: 0.0,
-                peak_db: 0.0,
-                clip: false,
-                active: false,
-            },
-        );
-    });
+    let handle = std::thread::spawn(move || run_meter(app, stop, node));
 
+    *state.join.lock().map_err(|e| e.to_string())? = Some(handle);
     Ok(true)
 }
 
-/// Stop the mic level meter (kills the pw-record child if running).
+/// Worker body: a direct PipeWire capture stream from the EPOS source node.
+/// Runs its own main loop; exits via `pw_main_loop_quit` either from the
+/// watchdog timer (external stop) or from the unplug/error states.
+fn run_meter(app: tauri::AppHandle, stop: Arc<AtomicBool>, node: String) {
+    pw::init();
+
+    let mainloop = match pw::main_loop::MainLoopRc::new(None) {
+        Ok(ml) => ml,
+        Err(_) => return,
+    };
+    let quit = QuitHandle(mainloop.as_raw_ptr());
+
+    let context = match pw::context::ContextRc::new(&mainloop, None) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let core = match context.connect_rc(None) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let mut props = pw::properties::properties! {
+        *pw::keys::MEDIA_TYPE => "Audio",
+        *pw::keys::MEDIA_CATEGORY => "Capture",
+        *pw::keys::MEDIA_ROLE => "Communication",
+    };
+    props.insert(*pw::keys::TARGET_OBJECT, node);
+
+    let stream = match pw::stream::StreamBox::new(&core, "epos-mic-meter", props) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    let user_data = MeterData {
+        app,
+        quit,
+        format: Default::default(),
+        quiet_db: -33.0,
+        peak_db: 0.0,
+        pending: 0,
+        peak: 0.0,
+        was_streaming: false,
+    };
+
+    let _listener = stream
+        .add_local_listener_with_user_data(user_data)
+        .state_changed(|_stream, user_data, _old, new| {
+            use pw::stream::StreamState;
+            match new {
+                StreamState::Streaming => user_data.was_streaming = true,
+                StreamState::Error(_) => {
+                    let _ = user_data
+                        .app
+                        .emit("mic-level", MicLevel { db: 0.0, peak_db: 0.0, clip: false, active: false });
+                    user_data.quit.quit();
+                }
+                StreamState::Unconnected if user_data.was_streaming => {
+                    // Device unplugged after we were streaming.
+                    let _ = user_data
+                        .app
+                        .emit("mic-level", MicLevel { db: 0.0, peak_db: 0.0, clip: false, active: false });
+                    user_data.quit.quit();
+                }
+                _ => {}
+            }
+        })
+        .param_changed(|_stream, user_data, id, param| {
+            let Some(param) = param else { return };
+            if id != pw::spa::param::ParamType::Format.as_raw() {
+                return;
+            }
+            let (media_type, media_subtype) = match format_utils::parse_format(param) {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            if media_type != MediaType::Audio || media_subtype != MediaSubtype::Raw {
+                return;
+            }
+            let _ = user_data.format.parse(param);
+        })
+        .process(|stream, user_data| {
+            use std::convert::TryInto;
+            let Some(mut buffer) = stream.dequeue_buffer() else {
+                return;
+            };
+            let datas = buffer.datas_mut();
+            if datas.is_empty() {
+                return;
+            }
+            let data = &mut datas[0];
+            let chunk_size = data.chunk().size() as usize;
+            let Some(samples) = data.data() else { return };
+            let n_bytes = samples.len().min(chunk_size);
+            let n_f32 = n_bytes / 4;
+            for i in 0..n_f32 {
+                let off = i * 4;
+                let a = f32::from_le_bytes(
+                    [samples[off], samples[off + 1], samples[off + 2], samples[off + 3]]
+                        .try_into()
+                        .unwrap(),
+                )
+                .abs();
+                if a > user_data.peak {
+                    user_data.peak = a;
+                }
+                user_data.pending += 1;
+                if user_data.pending >= CHUNK_SAMPLES {
+                    let mut p = user_data.peak;
+                    if p == 0.0 {
+                        p = 1e-9;
+                    }
+                    let db_full = (20.0 * p.log10()).max(-60.0); // absolute dBFS
+                    // Adaptive noise-floor follower (both directions): only
+                    // chases while the input sits within 8 dB of the reference
+                    // (idle hiss fluctuation). Real audio sits > 8 dB above the
+                    // floor and must never drag the reference upward.
+                    if (db_full - user_data.quiet_db).abs() < 8.0 {
+                        user_data.quiet_db += (db_full - user_data.quiet_db) * 0.01; // ~3 s
+                    }
+                    let db = (db_full - user_data.quiet_db).max(0.0);
+                    // Peak-hold: rise instantly, fall ~16 dB/s (0.35 dB per chunk).
+                    if db >= user_data.peak_db {
+                        user_data.peak_db = db;
+                    } else {
+                        user_data.peak_db = (user_data.peak_db - 0.35).max(db);
+                    }
+                    let clip = db_full >= -6.0;
+                    let _ = user_data.app.emit(
+                        "mic-level",
+                        MicLevel {
+                            db,
+                            peak_db: user_data.peak_db,
+                            clip,
+                            active: true,
+                        },
+                    );
+                    user_data.pending = 0;
+                    user_data.peak = 0.0;
+                }
+            }
+        })
+        .register()
+        .ok();
+
+    // Request raw mono f32 at the graph rate (leave rate/channels empty so
+    // PipeWire negotiates; 48 kHz is the EPOS native rate).
+    let mut audio_info = pw::spa::param::audio::AudioInfoRaw::new();
+    audio_info.set_format(pw::spa::param::audio::AudioFormat::F32LE);
+    let obj = pw::spa::pod::Object {
+        type_: pw::spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
+        id: pw::spa::param::ParamType::EnumFormat.as_raw(),
+        properties: audio_info.into(),
+    };
+    let values: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &pw::spa::pod::Value::Object(obj),
+    )
+    .unwrap()
+    .0
+    .into_inner();
+    let mut params = [Pod::from_bytes(&values).unwrap()];
+
+    let _ = stream.connect(
+        pw::spa::utils::Direction::Input,
+        None,
+        pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
+        &mut params,
+    );
+
+    // Watchdog: polls the stop flag every 300 ms and quits from this (loop)
+    // thread, so the external stop path never races with the loop internals.
+    let _stop = stop;
+    let quit2 = quit;
+    let _timer = mainloop.loop_().add_timer(move |_expirations| {
+        if _stop.load(Ordering::SeqCst) {
+            quit2.quit();
+        }
+    });
+    let _ = _timer.update_timer(
+        Some(std::time::Duration::from_millis(300)),
+        Some(std::time::Duration::from_millis(300)),
+    );
+
+    mainloop.run();
+}
+
+/// Stop the mic level meter (quits the main loop via the watchdog; join <= ~300 ms).
 #[tauri::command]
 pub async fn mic_meter_stop(state: tauri::State<'_, MicMeterState>) -> Result<(), String> {
-    if let Some(mut c) = state.child.lock().map_err(|e| e.to_string())?.take() {
-        let _ = c.kill();
-        let _ = c.wait();
+    state.stop.store(true, Ordering::SeqCst);
+    if let Some(h) = state.join.lock().map_err(|e| e.to_string())?.take() {
+        let _ = h.join();
     }
     Ok(())
 }

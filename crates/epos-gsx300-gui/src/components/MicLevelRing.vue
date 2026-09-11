@@ -35,7 +35,7 @@ const START_DEG = 30; // first segment at 1h (just past the gap)
 const SEG_DEG = TRACK_DEG / SEGMENTS; // 10.0°
 const SEG_SWEEP = 8.6; // ~1.4deg notch between segments
 const RANGE_DB = 18; // 18 dB above the noise floor = full ring
-const GATE_DB = 5; // below this the ring reads as silence (noise p99 ≈ 4.8 dB)
+const GATE_DB = 3.5; // small ambience may light 1-2 notches; idle hiss stays below
 
 function polar(angleDeg: number): [number, number] {
   const a = ((angleDeg - 90) * Math.PI) / 180; // 0deg => top; positive = clockwise
