@@ -1,4 +1,5 @@
 mod ipc_client;
+mod mic_meter;
 
 use ipc_client::DaemonClient;
 use std::io::Write;
@@ -83,6 +84,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             daemon_request,
             play_test_tone,
+            mic_meter::mic_meter_start,
+            mic_meter::mic_meter_stop,
             autostart_get,
             autostart_set
         ])
@@ -90,6 +93,7 @@ pub fn run() {
             let client = DaemonClient::new();
             app.manage(client);
             app.manage(ToneState(Mutex::new(None)));
+            app.manage(mic_meter::MicMeterState::default());
             Ok(())
         })
         .run(tauri::generate_context!())

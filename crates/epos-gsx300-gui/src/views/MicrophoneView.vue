@@ -1,9 +1,61 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, onMounted, onUnmounted } from "vue";
+import { invoke } from "@tauri-apps/api/core";
 import { useDaemonStore } from "../stores/daemon";
+import MicLevelRing from "../components/MicLevelRing.vue";
 
 const store = useDaemonStore();
 const disconnected = computed(() => !store.status?.device_connected);
+
+/* ─── Mic level meter lifecycle ─── */
+let meterRetry: ReturnType<typeof setTimeout> | null = null;
+let meterRunning = false;
+let meterDestroyed = false;
+
+async function startMeter() {
+  if (meterRunning || meterDestroyed) return;
+  try {
+    const ok = await invoke<boolean>("mic_meter_start");
+    meterRunning = ok;
+    if (!ok) {
+      // No EPOS device right now — retry until it appears or view unmounts.
+      scheduleRetry();
+    }
+  } catch {
+    // No Tauri runtime (browser dev): MicLevelRing falls back to its mock signal.
+  }
+}
+
+function scheduleRetry() {
+  if (meterRetry || meterDestroyed) return;
+  meterRetry = setTimeout(async () => {
+    meterRetry = null;
+    if (!meterDestroyed && !meterRunning) await startMeter();
+  }, 2000);
+}
+
+async function stopMeter() {
+  meterDestroyed = true;
+  if (meterRetry) {
+    clearTimeout(meterRetry);
+    meterRetry = null;
+  }
+  if (meterRunning) {
+    try {
+      await invoke("mic_meter_stop");
+    } catch {
+      /* ignore */
+    }
+    meterRunning = false;
+  }
+}
+
+onMounted(() => {
+  startMeter();
+});
+onUnmounted(() => {
+  stopMeter();
+});
 
 /* ─── Voice enhancer ─── */
 const voiceModes = ["off", "warm", "clear", "custom"] as const;
@@ -51,20 +103,23 @@ function onGateThresholdChange(threshold: number) {
       </div>
     </div>
 
-    <!-- Mic Gain -->
+    <!-- Mic Gain + live level ring -->
     <div class="section-card">
       <h3 class="section-title">MIC GAIN</h3>
-      <div class="slider-row">
-        <input
-          type="range"
-          class="accent-range"
-          :min="0"
-          :max="100"
-          :value="micGain"
-          :disabled="disconnected"
-          @input="onMicGainChange(($event.target as HTMLInputElement).valueAsNumber)"
-        />
-        <span class="value-badge">{{ micGain }}%</span>
+      <div class="gain-layout">
+        <MicLevelRing />
+        <div class="slider-row mic-slider">
+          <input
+            type="range"
+            class="accent-range"
+            :min="0"
+            :max="100"
+            :value="micGain"
+            :disabled="disconnected"
+            @input="onMicGainChange(($event.target as HTMLInputElement).valueAsNumber)"
+          />
+          <span class="value-badge">{{ micGain }}%</span>
+        </div>
       </div>
     </div>
 
@@ -164,6 +219,16 @@ function onGateThresholdChange(threshold: number) {
   box-shadow: 0 0 12px var(--accent-glow);
 }
 
+/* Mic gain layout: ring left, slider right (stack on narrow tiles) */
+.gain-layout {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+.mic-slider {
+  flex: 1;
+}
+
 /* Slider */
 .slider-row {
   display: flex;
@@ -221,6 +286,13 @@ function onGateThresholdChange(threshold: number) {
 @media (max-width: 500px) {
   .voice-grid {
     grid-template-columns: repeat(2, 1fr);
+  }
+  .gain-layout {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .mic-slider {
+    width: 100%;
   }
 }
 </style>
