@@ -12,9 +12,10 @@ pub struct MicMeterState {
 }
 
 /// Event payload emitted to the frontend (~47x/s):
-/// `db` = instantaneous mono peak in dBFS (floor -60),
-/// `peak_db` = peak-hold with ~16 dB/s falloff,
-/// `clip` = true when db >= -6 dBFS,
+/// `db` = instantaneous mono peak RELATIVE to the adaptive noise floor
+///        (0 = idle hiss level; a loud shout reaches ~25-30),
+/// `peak_db` = relative peak-hold with ~16 dB/s falloff,
+/// `clip` = true when absolute signal >= -6 dBFS,
 /// `active` = false when no signal present (device unplugged / meter stopped).
 #[derive(Clone, Serialize)]
 pub struct MicLevel {
@@ -98,7 +99,9 @@ pub async fn mic_meter_start(
         use std::io::Read;
         let mut reader = std::io::BufReader::new(stdout);
         let mut buf = [0u8; 4096]; // 1024 mono f32 samples per chunk
-        let mut peak_db: f32 = -60.0;
+        let mut peak_db: f32 = 0.0; // relative peak-hold
+        let mut quiet_db: f32 = -100.0; // adaptive noise-floor reference (absolute dBFS)
+        let mut boot: Vec<f32> = Vec::with_capacity(60); // bootstrap samples
         let mut started = false;
         loop {
             let n = match reader.read(&mut buf) {
@@ -128,14 +131,34 @@ pub async fn mic_meter_start(
             if peak == 0.0 {
                 peak = 1e-9;
             }
-            let db = (20.0 * peak.log10()).max(-60.0);
-            // Peak-hold: rise instantly, fall ~16 dB/s (0.35 dB per chunk).
+            let db_full = (20.0 * peak.log10()).max(-60.0); // absolute dBFS
+            // Bootstrap: the first ~1.8s of the stream is unreliable (pw-record
+            // starts with a few hundred ms of digital silence, which would pin
+            // the reference at -60 dB and inflate every level by ~25 dB).
+            // Use the MEDIAN of the first 60 chunks as the initial reference.
+            if boot.len() < 60 {
+                boot.push(db_full);
+                if boot.len() == 60 {
+                    let mut b = boot.clone();
+                    b.sort_by(|a, c| a.partial_cmp(c).unwrap());
+                    quiet_db = b[30];
+                }
+                continue;
+            }
+            // Adaptive noise-floor follower: learns the mic's idle hiss level.
+            // The raw USB preamp is always "alive" (~-35 dBFS here), so without
+            // this reference the ring would swing 30-60% on pure silence.
+            if db_full < quiet_db + 6.0 {
+                quiet_db = quiet_db * 0.98 + db_full * 0.02; // ~1.5 s time constant
+            }
+            let db = (db_full - quiet_db).max(0.0); // 0 dB = at noise floor
+            // Peak-hold (relative): rise instantly, fall ~16 dB/s (0.35 dB per chunk).
             if db >= peak_db {
                 peak_db = db;
             } else {
                 peak_db = (peak_db - 0.35).max(db);
             }
-            let clip = db >= -6.0;
+            let clip = db_full >= -6.0;
             let _ = app2.emit(
                 "mic-level",
                 MicLevel {
@@ -161,8 +184,8 @@ pub async fn mic_meter_start(
         let _ = app2.emit(
             "mic-level",
             MicLevel {
-                db: -60.0,
-                peak_db: -60.0,
+                db: 0.0,
+                peak_db: 0.0,
                 clip: false,
                 active: false,
             },
