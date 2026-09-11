@@ -38,14 +38,20 @@ impl HidHandler {
     }
 
     /// Start the blocking HID reader thread. Never returns until daemon exit.
+    ///
+    /// Retries finding the hidraw node forever: the daemon may start before the
+    /// device is plugged in (or the device may be unplugged/replugged at any
+    /// time), and hidraw node numbers change on re-enumeration — so after any
+    /// read failure or EOF we close the file and re-scan from scratch.
     pub fn spawn_reader(&self) -> thread::JoinHandle<()> {
         let tx = self.tx.clone();
-        thread::spawn(move || {
+        thread::spawn(move || loop {
+            // Outer retry loop: locate the device (may be absent at boot).
             let path = match Self::find_hidraw() {
                 Some(p) => p,
                 None => {
-                    warn!("GSX 300 hidraw not found — smart button listener disabled");
-                    return;
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
                 }
             };
 
@@ -53,24 +59,27 @@ impl HidHandler {
                 Ok(f) => f,
                 Err(e) => {
                     warn!(
-                        "Failed to open {} for reading — smart button listener disabled: {}",
+                        "Failed to open {} for reading — retrying: {}",
                         path.display(),
                         e
                     );
-                    return;
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
                 }
             };
             info!("HID listener active on {}", path.display());
 
             let mut buf = [0u8; 64];
+            let mut stuck_errors = 0;
             loop {
                 match file.read(&mut buf) {
                     Ok(0) => {
-                        // Device closed — wait and retry (hotplug)
-                        thread::sleep(Duration::from_secs(1));
-                        continue;
+                        // EOF — device closed/unplugged. Re-scan from scratch.
+                        info!("HID stream closed on {} — re-scanning for device", path.display());
+                        break;
                     }
                     Ok(n) => {
+                        stuck_errors = 0;
                         let rid = buf[0];
                         let val = buf.get(1).copied().unwrap_or(0);
                         match rid {
@@ -108,8 +117,15 @@ impl HidHandler {
                         }
                     }
                     Err(e) => {
-                        warn!("HID read error: {} — retrying in 2s", e);
-                        thread::sleep(Duration::from_secs(2));
+                        // Stale fd after unplug returns EIO/ENODEV; a few of
+                        // these may race the device teardown, but if it keeps
+                        // failing the file is dead — drop it and re-scan.
+                        stuck_errors += 1;
+                        if stuck_errors > 3 {
+                            warn!("HID read persistently failing: {} — re-scanning", e);
+                            break;
+                        }
+                        thread::sleep(Duration::from_secs(1));
                     }
                 }
             }

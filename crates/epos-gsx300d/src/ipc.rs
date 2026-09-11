@@ -15,6 +15,28 @@ use crate::led::LedController;
 
 use anyhow::Result;
 
+/// True when a request mutates daemon state (RAM + config file). Read-only
+/// requests (GetStatus/GetEq/GetMode/GetProfiles/GetDevice) return here false,
+/// so the GUI's 3s status polling never rewrites the config file to disk.
+pub fn request_is_mutation(req: &Request) -> bool {
+    matches!(
+        req,
+        Request::SetEq { .. }
+            | Request::SetSidetone { .. }
+            | Request::SetNoiseGate { .. }
+            | Request::SetVoiceEnhancer { .. }
+            | Request::SetMicGain { .. }
+            | Request::SetMode { .. }
+            | Request::ToggleMode
+            | Request::SetActiveProfile { .. }
+            | Request::CreateProfile { .. }
+            | Request::DeleteProfile { .. }
+            | Request::SetSmartButton { .. }
+            | Request::Reload
+            | Request::Quit
+    )
+}
+
 pub struct IpcState {
     pub config: Config,
     pub audio: AudioPipeline,
@@ -72,6 +94,8 @@ async fn handle_client(stream: UnixStream, state: Arc<RwLock<IpcState>>) -> Resu
             }
         };
 
+        let is_mutation = request_is_mutation(&request);
+
         let response = {
             let mut st = state.write().await;
             handle_request(request, &mut st).await
@@ -79,8 +103,9 @@ async fn handle_client(stream: UnixStream, state: Arc<RwLock<IpcState>>) -> Resu
 
         send_response(&mut writer, &response).await?;
 
-        // Persist config after mutations
-        if matches!(response, Response::Ok) {
+        // Persist config only after mutating requests. Read-only requests
+        // (the GUI polls GetStatus every 3s) must not churn the file.
+        if matches!(response, Response::Ok) && is_mutation {
             let st = state.read().await;
             if let Err(e) = config::save(&st.config) {
                 warn!("Failed to save config: {}", e);
@@ -174,6 +199,11 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
         // --- Mic ---
         Request::SetMicGain { gain } => {
             state.config.audio.mic_gain = gain;
+            // Sync into the pipeline's config copy — apply_mic_gain reads
+            // self.config.mic_gain, and without this the handler applied the
+            // previous value instead of the requested one.
+            let audio_cfg = state.config.audio.clone();
+            state.audio.update_config(&audio_cfg);
             if let Err(e) = state.audio.apply_mic_gain().await {
                 warn!("Failed to apply mic gain: {}", e);
             }
@@ -464,13 +494,15 @@ async fn process_http_body(
         }
     };
 
+    let is_mutation = request_is_mutation(&request);
+
     let response = {
         let mut st = state.write().await;
         handle_request(request, &mut st).await
     };
 
     // Persist config after mutations (same rule as Unix socket)
-    if matches!(response, Response::Ok) {
+    if matches!(response, Response::Ok) && is_mutation {
         let st = state.read().await;
         if let Err(e) = config::save(&st.config) {
             warn!("Failed to save config (http): {}", e);

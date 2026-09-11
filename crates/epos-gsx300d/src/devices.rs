@@ -87,11 +87,17 @@ fn find_alsa_card(_vid: u16, _pid: u16) -> Option<u8> {
         return None;
     }
 
-    // Read /proc/asound/cards to find matching card
+    // Read /proc/asound/cards to find matching card.
+    //
+    // IMPORTANT: match by device NAME, not by "USB Audio" — the system may
+    // host several USB audio devices (e.g. a Generic USB Audio card with its
+    // own 'Mic Capture Volume' control). Matching "USB Audio" blindly returns
+    // whichever card is enumerated first, so mic gain was applied to the WRONG
+    // device while amixer happily reported success. EPOS shows up as
+    // "EPOS GSX 300" / "Sennheiser EPOS GSX 300" in the cards file.
     if let Ok(cards) = std::fs::read_to_string(proc_sound.join("cards")) {
         for line in cards.lines() {
-            // Look for USB Audio with matching vendor/product
-            if line.contains("USB Audio") {
+            if line.contains("EPOS") || line.contains("GSX 300") {
                 // Extract card number from beginning of line
                 if let Some(card_str) = line.split_whitespace().next() {
                     if let Ok(card) = card_str.parse::<u8>() {
