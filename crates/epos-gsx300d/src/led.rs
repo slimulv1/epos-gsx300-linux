@@ -3,17 +3,24 @@
 //! The GSX 300 has an LED ring around the volume dial:
 //!   - Blue  = Stereo (2.0)
 //!   - Red   = Surround (7.1)
+//!   - Pink  = both bits set (0x03) — not used by the daemon
 //!
-//! HID Report Descriptor (120 bytes):
-//!   Vendor Collection (0xFFFF, page 0xFF13):
-//!     Report ID 0x02 Output (1B): 2 LED bits (usages 0x05/0x06) + 6 pad
-//!   Consumer Collection (0x0C):
-//!     Report ID 0x04 Output (38B): Primary host→device command
-//!     Report ID 0x06 Output (36B): Secondary host→device command
+//! HID Report Descriptor — fully decoded (120 bytes, verified on hardware):
+//!   Report ID 0x01 (Consumer): volume dial — input bits 0x09E9 (up) / 0x09EA
+//!     (down) / 0x09CF (mute). Incremental detents only; NO absolute readback.
+//!   Report ID 0x02 (Vendor 0xFF13, 1-byte):
+//!     Output 2 bits → usages 0x05 (LED blue) / 0x06 (LED red)
+//!     Input  3 bits → usages 0x02 (stereo) / 0x03 (7.1) / 0x04 (long-press)
+//!     Remaining bits constant padding (must be zero).
+//!   Report ID 0x04 (Output 38B), 0x05 (Input 34B), 0x06 (Output 36B),
+//!     0x07 (Input 32B), 0x1A (Input 16B): vendor commands, not yet RE'd —
+//!     possibly profile write / mixer protocol used by EPOS Gaming Suite.
 //!
 //! Protocol is not publicly documented. This module uses the vendor Report ID 2
-//! as the simplest LED control path. Values are configurable in config.json
-//! under `led_probe` for easy adjustment once the real protocol is decoded.
+//! as the simplest LED control path (2-bit output). Values are configurable in
+//! config.json under `led_probe` for easy adjustment once the real protocol is
+//! decoded. NOTE: because the output field is only 2 bits, values >0x03 are
+//! ignored by the firmware — writes are clamped in `write_vendor_report`.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -167,6 +174,10 @@ impl LedController {
 
 /// Write vendor Report ID 0x02 (1-byte output)
 fn write_vendor_report(file: &mut File, byte: u8) -> Result<()> {
+    // The descriptor's output field is only 2 bits (usages 0x05/0x06).
+    // The firmware silently ignores any higher bits → clamp to 0x00..=0x03
+    // so a bad config value can never produce a no-op write.
+    let byte = byte & 0x03;
     let mut packet = vec![0u8; HID_OUTPUT_SIZE];
     packet[0] = REPORT_ID_VENDOR_LED;
     packet[1] = byte;

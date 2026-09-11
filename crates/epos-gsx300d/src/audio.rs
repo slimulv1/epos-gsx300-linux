@@ -269,14 +269,14 @@ context.modules = [
                         type   = ladspa
                         name   = rnnoise
                         plugin = "librnnoise_ladspa"
-                        label  = noise_suppressor_stereo
+                        label  = noise_suppressor_mono
                         control = {{
                             "VAD Threshold (%)" {vad_threshold:.1}
                         }}
                     }}
                 ]
             }}
-            audio.position = [ FL FR ]
+            audio.position = [ MONO ]
             capture.props = {{
                 node.name   = "epos-noisegate-capture"
                 target.object = "{source}"

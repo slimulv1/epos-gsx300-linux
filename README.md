@@ -67,6 +67,30 @@ sudo ./scripts/install.sh --udev
 > device's hidraw interface, which the daemon uses to control the LED
 > ring and read the smart button / volume dial.
 
+## Hardware compatibility notes (CX21988)
+
+The GSX 300 is built on the **Conexant/Synaptics CX21988** (AudioSmart)
+codec. Key facts that shape the daemon design:
+
+- **Playback**: USB altsets advertise `S16_LE`@48k and `S24_3LE`@48k/**96k**.
+  The PipeWire drop-in (`50-epos-gsx300-gaming.conf`) pins the sink to
+  `S24_3LE`@48k — 96k is skipped deliberately: the noise gate (rnnoise)
+  is fixed at 48k, 44.1kHz is *not* natively supported by the chip, and
+  48k keeps A2+/EPOS sharing one clock without resampling.
+- **Capture**: hardware is **mono** `S16_LE`@48k only (one altset). The
+  `mono-fallback` PipeWire source is the real hardware path — the noise
+  gate therefore runs in mono (`noise_suppressor_mono`).
+- **EQ 9-band is host-side** (PipeWire filter-chain), because the chip's
+  built-in 5-band hardware EQ is not exposed over USB by the firmware.
+- **Sidetone** (REVERBERATION in the GUI) is the one device-resident
+  DSP feature and is controlled via vendor HID commands.
+- **HID protocol** (fully decoded, see `src/led.rs` header): Report 0x01
+  = volume dial (incremental detents only, no absolute readback), 0x02 =
+  LED / button state (2-bit output, 3-bit input), 0x04/0x05/0x06/0x07/
+  0x1A = undisclosed vendor commands (probable profile/mixer protocol).
+  Because the dial exposes only relative detents, the daemon tracks the
+  volume level host-side and reports it via `GetStatus` for the GUI.
+
 ## Usage
 
 ```bash
