@@ -56,6 +56,7 @@ export interface DeviceStatus {
   active_profile: string;
   mode: AudioMode;
   smart_button_action?: string;
+  volume?: number;
 }
 
 // ─── Response shape from daemon ─────────────────────────────

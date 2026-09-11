@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { useDaemonStore } from "../stores/daemon";
-import { Usb, MonitorSpeaker, Radio, Cpu } from "lucide-vue-next";
+import { Usb, MonitorSpeaker, Radio, Cpu, Volume2 } from "lucide-vue-next";
 
 const store = useDaemonStore();
 
@@ -58,6 +58,11 @@ const actionLabels: Record<string, string> = {
           <Cpu :size="14" class="info-icon" />
           <span class="info-label">Firmware</span>
           <span class="info-value">{{ store.device.firmware_version || 'unknown' }}</span>
+        </div>
+        <div class="info-row">
+          <Volume2 :size="14" class="info-icon" />
+          <span class="info-label">Volume dial</span>
+          <span class="info-value">{{ store.status?.volume ?? '—' }}%</span>
         </div>
       </div>
     </div>

@@ -53,6 +53,7 @@ pub enum Response {
         active_profile: String,
         mode: AudioMode,
         smart_button_action: String,
+        volume: i32,
     },
     Device(Option<DeviceInfo>),
     Eq(AudioConfig),

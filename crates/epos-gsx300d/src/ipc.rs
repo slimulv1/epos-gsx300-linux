@@ -41,6 +41,10 @@ pub struct IpcState {
     pub config: Config,
     pub audio: AudioPipeline,
     pub led: Option<LedController>,
+    /// Most recent volume-dial position (0-100, tracked from detents: device
+    /// reports incremental up/down only — no absolute readback exists).
+    /// Initialized to 100 = device power-on default (full volume).
+    pub volume: std::sync::atomic::AtomicI32,
 }
 
 pub async fn run_server(state: Arc<RwLock<IpcState>>) -> Result<()> {
@@ -138,6 +142,7 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
                     .unwrap_or_else(|_| "\"toggle_mode\"".into())
                     .trim_matches('"')
                     .into(),
+                volume: state.volume.load(std::sync::atomic::Ordering::Relaxed),
             }
         }
         Request::GetDevice => {

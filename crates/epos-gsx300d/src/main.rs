@@ -84,6 +84,7 @@ async fn main() -> Result<()> {
         config: config.clone(),
         audio,
         led,
+        volume: std::sync::atomic::AtomicI32::new(100),
     }));
 
     // Background task: handle smart button presses (mode sync) according to
@@ -201,11 +202,15 @@ async fn main() -> Result<()> {
                     }
                 }
                 HidEvent::VolumeChanged(dir) => {
-                    // Device applies gain locally; daemon only tracks direction.
-                    tracing::debug!(
-                        "Volume knob: {}",
-                        if dir > 0 { "up" } else { "down" }
-                    );
+                    // Device applies gain locally; daemon tracks detents
+                    // host-side because the HID descriptor exposes only
+                    // incremental consumer detents (no absolute readback).
+                    // Volume is reported via GetStatus for the GUI.
+                    let st = s.read().await;
+                    let cur = st.volume.load(std::sync::atomic::Ordering::Relaxed);
+                    let next = (cur + dir * 5).clamp(0, 100);
+                    st.volume.store(next, std::sync::atomic::Ordering::Relaxed);
+                    tracing::info!("Volume knob: {} → {}%", if dir > 0 { "up" } else { "down" }, next);
                 }
             }
         }
