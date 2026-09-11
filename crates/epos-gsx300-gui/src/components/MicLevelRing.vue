@@ -17,7 +17,6 @@ const db = ref(-60);
 const peakDb = ref(-60);
 const active = ref(false);
 const clipHold = ref(false); // 500ms visual hold after last clip frame
-const noEvents = ref(true); // true until first event arrives (spinner/NOT READY)
 
 /* ─── Lifecycle handles ─── */
 let unlisten: UnlistenFn | null = null;
@@ -80,7 +79,6 @@ const led = computed<LedState>(() => {
 
 /* ─── Apply a payload from backend (or mock) ─── */
 function apply(p: MicLevelPayload) {
-  noEvents.value = false;
   db.value = p.db;
   peakDb.value = p.peak_db;
   active.value = p.active;
@@ -132,7 +130,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="ring-meter" :class="{ dead: !active, ready: !noEvents }">
+  <div class="ring-meter" :class="{ dead: !active }">
     <svg viewBox="0 0 88 88" role="img" aria-label="Microphone input level">
       <path
         v-for="(s, i) in segments"

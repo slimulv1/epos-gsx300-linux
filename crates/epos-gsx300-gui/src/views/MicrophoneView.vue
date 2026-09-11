@@ -7,54 +7,50 @@ import MicLevelRing from "../components/MicLevelRing.vue";
 const store = useDaemonStore();
 const disconnected = computed(() => !store.status?.device_connected);
 
-/* ─── Mic level meter lifecycle ─── */
-let meterRetry: ReturnType<typeof setTimeout> | null = null;
-let meterRunning = false;
+/* ─── Mic meter lifecycle: keep-alive while this tab is mounted ───
+ * mic_meter_start is idempotent (returns true when already running), so we
+ * simply re-assert it every 2s. This self-heals all failure modes:
+ *  - device absent at first open  → resolve fails, retried next tick
+ *  - device unplugged mid-meter   → pw-record EOFs, backend clears child,
+ *                                   next tick spawns a fresh one when back
+ *  - tab switched mid-start       → late start is stopped on unmount
+ */
+let meterTimer: ReturnType<typeof setInterval> | null = null;
 let meterDestroyed = false;
 
-async function startMeter() {
-  if (meterRunning || meterDestroyed) return;
+async function ensureMeter() {
+  if (meterDestroyed) return;
   try {
     const ok = await invoke<boolean>("mic_meter_start");
-    meterRunning = ok;
-    if (!ok) {
-      // No EPOS device right now — retry until it appears or view unmounts.
-      scheduleRetry();
+    if (meterDestroyed && ok) {
+      // Start resolved after unmount — stop it so no capture leaks.
+      try {
+        await invoke("mic_meter_stop");
+      } catch {
+        /* ignore */
+      }
     }
   } catch {
-    // No Tauri runtime (browser dev): MicLevelRing falls back to its mock signal.
-  }
-}
-
-function scheduleRetry() {
-  if (meterRetry || meterDestroyed) return;
-  meterRetry = setTimeout(async () => {
-    meterRetry = null;
-    if (!meterDestroyed && !meterRunning) await startMeter();
-  }, 2000);
-}
-
-async function stopMeter() {
-  meterDestroyed = true;
-  if (meterRetry) {
-    clearTimeout(meterRetry);
-    meterRetry = null;
-  }
-  if (meterRunning) {
-    try {
-      await invoke("mic_meter_stop");
-    } catch {
-      /* ignore */
-    }
-    meterRunning = false;
+    // No Tauri runtime (browser dev): MicLevelRing falls back to its mock.
   }
 }
 
 onMounted(() => {
-  startMeter();
+  ensureMeter();
+  meterTimer = setInterval(ensureMeter, 2000);
 });
-onUnmounted(() => {
-  stopMeter();
+
+onUnmounted(async () => {
+  meterDestroyed = true;
+  if (meterTimer) {
+    clearInterval(meterTimer);
+    meterTimer = null;
+  }
+  try {
+    await invoke("mic_meter_stop");
+  } catch {
+    /* ignore */
+  }
 });
 
 /* ─── Voice enhancer ─── */
@@ -118,7 +114,6 @@ function onGateThresholdChange(threshold: number) {
             :disabled="disconnected"
             @input="onMicGainChange(($event.target as HTMLInputElement).valueAsNumber)"
           />
-          <span class="value-badge">{{ micGain }}%</span>
         </div>
       </div>
     </div>

@@ -56,7 +56,7 @@ fn resolve_epos_source() -> Result<Option<String>, String> {
 ///   Ok(false) — EPOS mic not present; caller should retry later
 ///   Err(msg)  — pw-dump/pw-record unavailable or spawn failed
 #[tauri::command]
-pub fn mic_meter_start(
+pub async fn mic_meter_start(
     app: tauri::AppHandle,
     state: tauri::State<'_, MicMeterState>,
 ) -> Result<bool, String> {
@@ -99,13 +99,27 @@ pub fn mic_meter_start(
         let mut reader = std::io::BufReader::new(stdout);
         let mut buf = [0u8; 4096]; // 1024 mono f32 samples per chunk
         let mut peak_db: f32 = -60.0;
+        let mut started = false;
         loop {
             let n = match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break, // EOF → device gone or meter stopped
                 Ok(n) => n,
             };
+            let mut data = &buf[..n];
+            if !started {
+                started = true;
+                // pw-record prefixes a 24-byte Sun Audio (.snd) header on stdout:
+                // magic ".snd", data offset, size, encoding 6=f32, rate, chans.
+                // Skip it so header bytes are never decoded as samples.
+                if data.len() >= 24 && &data[..4] == b".snd" {
+                    data = &data[24..];
+                }
+            }
+            if data.is_empty() {
+                continue;
+            }
             let mut peak: f32 = 0.0;
-            for c in buf[..n].chunks_exact(4) {
+            for c in data.chunks_exact(4) {
                 let a = f32::from_le_bytes([c[0], c[1], c[2], c[3]]).abs();
                 if a > peak {
                     peak = a;
@@ -160,7 +174,7 @@ pub fn mic_meter_start(
 
 /// Stop the mic level meter (kills the pw-record child if running).
 #[tauri::command]
-pub fn mic_meter_stop(state: tauri::State<'_, MicMeterState>) -> Result<(), String> {
+pub async fn mic_meter_stop(state: tauri::State<'_, MicMeterState>) -> Result<(), String> {
     if let Some(mut c) = state.child.lock().map_err(|e| e.to_string())?.take() {
         let _ = c.kill();
         let _ = c.wait();
