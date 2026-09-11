@@ -80,7 +80,7 @@ impl AudioPipeline {
         let output = tokio::process::Command::new("amixer")
             .args([
                 "-c", &card.to_string(),
-                "set", "Mic Capture Volume",
+                "cset", "name='Mic Capture Volume'",
                 &format!("{}%", gain),
             ])
             .output()
@@ -136,6 +136,17 @@ impl AudioPipeline {
         };
 
         let filter_conf = generate_eq_filter_conf(&self.config.eq.bands, device);
+
+        // All bands flat → remove config instead of writing a stub that
+        // PipeWire rejects ("Invalid argument" → crash loop).
+        if filter_conf.is_empty() {
+            if conf_path.exists() {
+                std::fs::remove_file(&conf_path)?;
+                info!("EQ filter config removed (all bands flat)");
+                return Ok(true);
+            }
+            return Ok(false);
+        }
 
         std::fs::create_dir_all(&conf_dir)?;
         std::fs::write(&conf_path, &filter_conf)?;
@@ -347,11 +358,13 @@ context.modules = [
                         .map(|b| (b.freq, b.gain_db, b.q))
                         .collect();
                     if active_bands.is_empty() {
-                        warn!("Custom voice: all gains 0, writing passthrough filter (no EQ)");
+                        // All gains 0 → behave like Off: remove config instead of
+                        // writing a useless passthrough filter with no target.
+                        None
                     } else {
                         info!("Custom voice: {} active band(s)", active_bands.len());
+                        Some(generate_voice_eq_conf("custom", device_source.as_deref(), &active_bands))
                     }
-                    Some(generate_voice_eq_conf("custom", device_source.as_deref(), &active_bands))
                 } else {
                     None
                 }
@@ -435,12 +448,11 @@ fn generate_eq_filter_conf(bands: &[epos_shared::config::EqBand], device: &Devic
         active += 1;
     }
 
-    // If all bands are flat, return empty config
+    // If all bands are flat, return empty string so the caller REMOVES the
+    // config file. A comment-only stub is REJECTED by PipeWire's conf parser
+    // ("Invalid argument") and crashes the whole audio stack.
     if active == 0 {
-        return format!(
-            "# EPOS GSX 300 EQ - all bands flat, no processing needed\n# Device: {}\n",
-            device.pipewire_sink
-        );
+        return String::new();
     }
 
     format!(
