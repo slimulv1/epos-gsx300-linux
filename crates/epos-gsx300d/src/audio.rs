@@ -43,14 +43,14 @@ impl AudioPipeline {
     /// Apply all audio settings to the device
     pub async fn apply_full(&mut self) -> Result<()> {
         self.apply_mic_gain().await?;
-        if self.config.eq.enabled {
-            self.apply_eq().await?;
-        } else {
-            self.remove_eq().await?;
-        }
+        let mut changed = false;
+        changed |= self.write_eq_conf()?;
         self.apply_sidetone().await?;
-        self.apply_noise_gate().await?;
-        self.apply_voice_enhancer().await?;
+        changed |= self.write_noise_gate_conf()?;
+        changed |= self.write_voice_conf()?;
+        if changed {
+            reload_pipewire().await;
+        }
         Ok(())
     }
 
@@ -112,43 +112,42 @@ impl AudioPipeline {
     //
     // Loaded by the main pipewire instance; requires a pipewire restart.
 
-    pub async fn apply_eq(&mut self) -> Result<()> {
-        let Some(ref device) = self.device else {
-            debug!("No device, skipping EQ");
-            return Ok(());
-        };
-
-        if !self.config.eq.enabled {
-            return Ok(());
-        }
-
-        let filter_conf = generate_eq_filter_conf(&self.config.eq.bands, device);
+    /// Write or remove the EQ filter-chain config. Returns true if the
+    /// on-disk config actually changed (caller decides whether to reload).
+    fn write_eq_conf(&self) -> Result<bool> {
         let conf_dir = dirs::config_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
             .join("pipewire")
             .join("pipewire.conf.d");
         let conf_path = conf_dir.join("50-epos-eq.conf");
 
+        if !self.config.eq.enabled {
+            if conf_path.exists() {
+                std::fs::remove_file(&conf_path)?;
+                info!("EQ filter config removed");
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+
+        let Some(ref device) = self.device else {
+            debug!("No device, skipping EQ");
+            return Ok(false);
+        };
+
+        let filter_conf = generate_eq_filter_conf(&self.config.eq.bands, device);
+
         std::fs::create_dir_all(&conf_dir)?;
         std::fs::write(&conf_path, &filter_conf)?;
         info!("EQ filter config written to {}", conf_path.display());
 
-        // PipeWire needs a restart to load the new filter-chain module
-        reload_pipewire().await;
-
-        Ok(())
+        Ok(true)
     }
 
-    pub async fn remove_eq(&self) -> Result<()> {
-        let conf_path = dirs::config_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
-            .join("pipewire")
-            .join("pipewire.conf.d")
-            .join("50-epos-eq.conf");
-
-        if conf_path.exists() {
-            std::fs::remove_file(&conf_path)?;
-            info!("EQ filter config removed");
+    /// Apply EQ from config — write config + restart PipeWire if changed.
+    pub async fn apply_eq(&mut self) -> Result<()> {
+        if self.write_eq_conf()? {
+            // PipeWire needs a restart to load the new filter-chain module
             reload_pipewire().await;
         }
         Ok(())
@@ -215,17 +214,28 @@ impl AudioPipeline {
     // Noise gate via WirePlumber rnnoise filter on the capture node.
     // Writes a filter config that WirePlumber loads automatically.
 
-    pub async fn apply_noise_gate(&self) -> Result<()> {
-        let Some(ref device) = self.device else {
-            debug!("No device, skipping noise gate");
-            return Ok(());
-        };
-
+    /// Write or remove the noise-gate filter-chain config.
+    /// Returns true if the on-disk config actually changed.
+    fn write_noise_gate_conf(&self) -> Result<bool> {
         let conf_dir = dirs::config_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
             .join("pipewire")
             .join("pipewire.conf.d");
         let conf_path = conf_dir.join("93-epos-noisegate.conf");
+
+        if !self.config.noise_gate.enabled {
+            if conf_path.exists() {
+                std::fs::remove_file(&conf_path)?;
+                info!("Noise gate filter config removed");
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+
+        let Some(ref device) = self.device else {
+            debug!("No device, skipping noise gate");
+            return Ok(false);
+        };
 
         if self.config.noise_gate.enabled {
             // Map threshold_db (-60..0) → VAD Threshold % (50..100):
@@ -275,12 +285,16 @@ context.modules = [
             std::fs::create_dir_all(&conf_dir)?;
             std::fs::write(&conf_path, &filter_conf)?;
             info!("Noise gate filter written (rnnoise, capture: {})", device.pipewire_source);
-        } else if conf_path.exists() {
-            std::fs::remove_file(&conf_path)?;
-            info!("Noise gate filter config removed");
         }
 
-        reload_pipewire().await;
+        Ok(true)
+    }
+
+    /// Apply noise gate from config — write config + restart PipeWire if changed.
+    pub async fn apply_noise_gate(&self) -> Result<()> {
+        if self.write_noise_gate_conf()? {
+            reload_pipewire().await;
+        }
         Ok(())
     }
 
@@ -293,7 +307,9 @@ context.modules = [
     // Uses a PipeWire filter-chain source module (libpipewire-module-filter-chain)
     // written to ~/.config/pipewire/pipewire.conf.d/51-epos-voice-enhancer.conf
 
-    pub async fn apply_voice_enhancer(&mut self) -> Result<()> {
+    /// Write or remove the voice-enhancer filter-chain config.
+    /// Returns true if the on-disk config actually changed.
+    fn write_voice_conf(&self) -> Result<bool> {
         let conf_dir = dirs::config_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
             .join("pipewire")
@@ -303,33 +319,26 @@ context.modules = [
         let device_source = self.device.as_ref().map(|d| d.pipewire_source.clone());
 
         let filter_conf = match self.config.voice_enhancer.mode {
-            VoiceMode::Off => {
-                if conf_path.exists() {
-                    std::fs::remove_file(&conf_path)?;
-                    info!("Voice enhancer disabled, config removed");
-                }
-                reload_pipewire().await;
-                return Ok(());
-            }
+            VoiceMode::Off => None,
             VoiceMode::Warm => {
                 // Boost low-mid frequencies for warmth
-                generate_voice_eq_conf("warm", device_source.as_deref(), &[
+                Some(generate_voice_eq_conf("warm", device_source.as_deref(), &[
                     (200, 4.0, 0.8),
                     (350, 3.0, 1.0),
                     (500, 2.0, 1.0),
                     (4000, -1.0, 1.2),
                     (8000, -2.0, 1.0),
-                ])
+                ]))
             }
             VoiceMode::Clear => {
                 // Boost presence and clarity
-                generate_voice_eq_conf("clear", device_source.as_deref(), &[
+                Some(generate_voice_eq_conf("clear", device_source.as_deref(), &[
                     (200, -2.0, 1.0),
                     (500, -1.0, 1.0),
                     (2500, 3.0, 1.0),
                     (4000, 4.0, 0.8),
                     (6000, 3.0, 1.2),
-                ])
+                ]))
             }
             VoiceMode::Custom => {
                 if let Some(ref bands) = self.config.voice_enhancer.custom_bands {
@@ -342,22 +351,37 @@ context.modules = [
                     } else {
                         info!("Custom voice: {} active band(s)", active_bands.len());
                     }
-                    generate_voice_eq_conf("custom", device_source.as_deref(), &active_bands)
+                    Some(generate_voice_eq_conf("custom", device_source.as_deref(), &active_bands))
                 } else {
-                    if conf_path.exists() {
-                        std::fs::remove_file(&conf_path)?;
-                    }
-                    reload_pipewire().await;
-                    return Ok(());
+                    None
                 }
             }
         };
 
-        std::fs::create_dir_all(&conf_dir)?;
-        std::fs::write(&conf_path, &filter_conf)?;
-        info!("Voice enhancer filter written ({:?})", self.config.voice_enhancer.mode);
+        match filter_conf {
+            Some(conf) => {
+                std::fs::create_dir_all(&conf_dir)?;
+                std::fs::write(&conf_path, &conf)?;
+                info!("Voice enhancer filter written ({:?})", self.config.voice_enhancer.mode);
+                Ok(true)
+            }
+            None => {
+                if conf_path.exists() {
+                    std::fs::remove_file(&conf_path)?;
+                    info!("Voice enhancer disabled, config removed");
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+        }
+    }
 
-        reload_pipewire().await;
+    /// Apply voice enhancer — write config + restart PipeWire if changed.
+    pub async fn apply_voice_enhancer(&self) -> Result<()> {
+        if self.write_voice_conf()? {
+            reload_pipewire().await;
+        }
         Ok(())
     }
 }

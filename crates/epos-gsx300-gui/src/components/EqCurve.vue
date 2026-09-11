@@ -21,6 +21,60 @@ const MAX_DB = 12;
 const PADDING = { top: 16, bottom: 24, left: 36, right: 16 };
 const DOT_RADIUS = 5;
 const HOVER_RADIUS = 8;
+const DISPLAY_STEP = 0.1; // min gain change that counts as a real edit
+const EMIT_DEBOUNCE_MS = 250;
+
+// Source of truth for drawing. Mirrors props.bands but updates immediately
+// during drag/slider/keyboard so the curve never lags, while actual
+// "update" emissions are debounced (see scheduleEmit).
+const display = ref<EqBand[]>([]);
+watch(
+  () => props.bands,
+  (b) => {
+    if (dragging.value === null) display.value = b;
+  },
+  { deep: true, immediate: true }
+);
+
+// ── Debounced emit ──────────────────────────────────────────────
+// Dragging an EQ band fires pointermove at 60-120 Hz; each "update"
+// would trigger SetEq IPC → PipeWire config write → pipewire restart.
+// Debounce so the daemon only reloads once per gesture.
+let emitTimer: ReturnType<typeof setTimeout> | null = null;
+let pending: EqBand[] | null = null;
+
+function scheduleEmit(bands: EqBand[]) {
+  pending = bands;
+  if (emitTimer) clearTimeout(emitTimer);
+  emitTimer = setTimeout(() => {
+    emitTimer = null;
+    if (pending) {
+      emit("update", pending);
+      pending = null;
+    }
+  }, EMIT_DEBOUNCE_MS);
+}
+
+function flushEmit() {
+  if (emitTimer) {
+    clearTimeout(emitTimer);
+    emitTimer = null;
+  }
+  if (pending) {
+    emit("update", pending);
+    pending = null;
+  }
+}
+
+// Shared mutation path: update display immediately (smooth), emit debounced.
+function updateBand(index: number, value: number) {
+  if (Math.abs(value - display.value[index].gain_db) < DISPLAY_STEP) return;
+  const next = [...display.value];
+  next[index] = { ...next[index], gain_db: value };
+  display.value = next;
+  scheduleEmit(next);
+  draw();
+}
 
 function resizeCanvas() {
   const c = canvas.value;
@@ -46,6 +100,7 @@ onMounted(() => {
 });
 onUnmounted(() => {
   ro?.disconnect();
+  if (emitTimer) clearTimeout(emitTimer);
 });
 
 function freqToX(freq: number, w: number): number {
@@ -197,15 +252,14 @@ function onPointerMove(e: PointerEvent) {
     const rect = canvas.value.getBoundingClientRect();
     const y = e.clientY - rect.top;
     const newDb = Math.max(MIN_DB, Math.min(MAX_DB, yToDb(y, canvas.value.clientHeight)));
-    const newBands = [...props.bands];
-    newBands[dragging.value] = { ...newBands[dragging.value], gain_db: newDb };
-    emit("update", newBands);
+    updateBand(dragging.value, newDb);
     updateTooltip(e);
   }
   draw();
 }
 
 function onPointerUp() {
+  if (dragging.value !== null) flushEmit(); // send final position immediately
   dragging.value = null;
   tooltip.value = null;
   draw();
@@ -219,7 +273,7 @@ function onPointerLeave() {
 
 function updateTooltip(e: PointerEvent) {
   if (dragging.value === null || !canvas.value) return;
-  const band = props.bands[dragging.value];
+  const band = display.value[dragging.value];
   const rect = canvas.value.getBoundingClientRect();
   tooltip.value = {
     x: e.clientX - rect.left,
@@ -230,9 +284,7 @@ function updateTooltip(e: PointerEvent) {
 }
 
 function onBandChange(index: number, value: number) {
-  const newBands = [...props.bands];
-  newBands[index] = { ...newBands[index], gain_db: value };
-  emit("update", newBands);
+  updateBand(index, value);
   draw();
 }
 
@@ -299,6 +351,7 @@ watch(
           orient="vertical"
           :class="{ active: selectedBand === i }"
           @input="onBandChange(i, ($event.target as HTMLInputElement).valueAsNumber)"
+          @change="flushEmit"
           @focus="selectedBand = i"
         />
         <span class="band-value" :class="{ active: selectedBand === i }">

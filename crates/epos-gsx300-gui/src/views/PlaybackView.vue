@@ -35,13 +35,44 @@ function onSidetoneUpdate(enabled: boolean, level: number) {
 const soundPlaying = ref(false);
 async function toggleSoundTest() {
   try {
-    soundPlaying.value = (await invoke("play_test_tone", {})) as boolean;
+    soundPlaying.value = (await invoke("play_test_tone", {
+      eqEnabeld: store.audio?.eq?.enabled ?? false,
+    })) as boolean;
   } catch (e) {
     console.error("Sound test failed:", e);
   }
 }
 
 const disconnected = computed(() => !store.status?.device_connected);
+
+/* ─── Save preset modal ─── */
+const saveOpen = ref(false);
+const saveName = ref("");
+const saveError = ref("");
+
+function openSave() {
+  saveName.value = "";
+  saveError.value = "";
+  saveOpen.value = true;
+}
+
+async function confirmSave() {
+  const name = saveName.value.trim();
+  if (!name) {
+    saveError.value = "Name cannot be empty";
+    return;
+  }
+  if (store.profiles.some((p) => p.name === name)) {
+    saveError.value = "A preset with this name already exists";
+    return;
+  }
+  const ok = await store.createProfile(name);
+  if (ok) {
+    saveOpen.value = false;
+  } else {
+    saveError.value = "Failed to save preset";
+  }
+}
 </script>
 
 <template>
@@ -58,7 +89,7 @@ const disconnected = computed(() => !store.status?.device_connected);
           {{ p.name }}
         </option>
       </select>
-      <button class="epos-btn epos-btn--accent" title="Save preset" :disabled="disconnected">
+      <button class="epos-btn epos-btn--accent" title="Save preset" :disabled="disconnected" @click="openSave">
         SAVE
       </button>
     </div>
@@ -66,12 +97,7 @@ const disconnected = computed(() => !store.status?.device_connected);
     <!-- Mode toggle -->
     <div class="mode-bar">
       <span class="mode-label">AUDIO MODE</span>
-      <button
-        class="mode-pill"
-        :class="{ active: store.mode === 'surround71' }"
-        @click="onModeToggle"
-        :disabled="disconnected"
-      >
+      <button class="mode-pill" @click="onModeToggle" :disabled="disconnected">
         <span class="pill-option" :class="{ selected: store.mode === 'stereo' }">2.0</span>
         <span class="pill-option" :class="{ selected: store.mode === 'surround71' }">7.1</span>
       </button>
@@ -127,6 +153,26 @@ const disconnected = computed(() => !store.status?.device_connected);
           <Square v-else :size="14" />
           {{ soundPlaying ? 'STOP' : 'PLAY' }}
         </button>
+      </div>
+    </div>
+
+    <!-- Save preset modal -->
+    <div v-if="saveOpen" class="modal-overlay" @click.self="saveOpen = false">
+      <div class="modal">
+        <h3 class="modal-title">SAVE PRESET</h3>
+        <input
+          v-model="saveName"
+          class="modal-input"
+          placeholder="Preset name"
+          autofocus
+          @keydown.enter="confirmSave"
+          @keydown.esc="saveOpen = false"
+        />
+        <p v-if="saveError" class="modal-error">{{ saveError }}</p>
+        <div class="modal-actions">
+          <button class="epos-btn" @click="saveOpen = false">CANCEL</button>
+          <button class="epos-btn epos-btn--accent" @click="confirmSave">SAVE</button>
+        </div>
       </div>
     </div>
   </div>
@@ -282,6 +328,56 @@ const disconnected = computed(() => !store.status?.device_connected);
 .sound-btn.playing {
   border-color: var(--danger);
   color: var(--danger);
+}
+
+/* Save preset modal */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(10, 15, 17, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.modal {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: var(--space-4);
+  width: min(360px, 90vw);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.modal-title {
+  font-size: var(--fs-sm);
+  color: var(--text);
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+.modal-input {
+  padding: 8px 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: var(--fs-sm);
+  font-family: var(--font-ui);
+}
+.modal-input:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+.modal-error {
+  font-size: var(--fs-xs);
+  color: var(--danger);
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 /* Responsive */

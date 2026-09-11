@@ -27,7 +27,7 @@ struct ToneState(Mutex<Option<Child>>);
 /// Play the test tone through the EQ filter chain (or stop it if playing).
 /// Returns the NEW state: true = now playing, false = stopped.
 #[tauri::command]
-fn play_test_tone(state: State<'_, ToneState>) -> Result<bool, String> {
+fn play_test_tone(eq_enabled: bool, state: State<'_, ToneState>) -> Result<bool, String> {
     let mut guard = state.0.lock().map_err(|_| "tone state poisoned".to_string())?;
 
     // Already playing → stop it
@@ -43,8 +43,12 @@ fn play_test_tone(state: State<'_, ToneState>) -> Result<bool, String> {
     f.write_all(TEST_TONE).map_err(|e| e.to_string())?;
     drop(f);
 
-    let child = Command::new("pw-play")
-        .args(["--target", "epos-eq-input"])
+    // Route through the EQ filter chain when EQ is active, else default sink.
+    let mut cmd = Command::new("pw-play");
+    if eq_enabled {
+        cmd.args(["--target", "epos-eq-input"]);
+    }
+    let child = cmd
         .arg(&path)
         .spawn()
         .map_err(|e| format!("pw-play failed (pipewire-utils installed?): {e}"))?;
