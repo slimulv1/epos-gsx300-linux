@@ -1,4 +1,4 @@
-# Rust
+# Rust build artifacts
 /target
 **/*.rs.bk
 
@@ -17,9 +17,6 @@ dist/
 .DS_Store
 Thumbs.db
 
-# Build artifacts
-target/
-
 # Tauri auto-generated
 crates/epos-gsx300-gui/src-tauri/gen/
 crates/epos-gsx300-gui/src-tauri/icons/android/
@@ -32,5 +29,5 @@ crates/epos-gsx300-gui/.vite/
 *.AppImage
 *.pkg.tar.zst
 
-# Tauri
-crates/epos-gsx300-gui/src-tauri/target/
+# Raw firmware dumps (copyrighted Sennheiser/EPOS firmware — keep local)
+docs/reverse-engineering/dumps/*.bin

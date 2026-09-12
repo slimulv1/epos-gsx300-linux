@@ -2,7 +2,9 @@
 
 Open-source Linux replacement for EPOS Gaming Suite.
 
-EQ, sidetone, noise gate, voice enhancer, and audio control for the EPOS GSX 300 USB DAC.
+EQ, sidetone, noise gate, voice enhancer, and audio control for the
+EPOS GSX 300 USB DAC — plus a fully documented reverse-engineering
+archive of the device (firmware, HID protocol, hardware internals).
 
 ## Features
 
@@ -16,26 +18,42 @@ EQ, sidetone, noise gate, voice enhancer, and audio control for the EPOS GSX 300
 - **Configurable smart button** — physical dial click (or long-press) dispatches one of 5 actions: toggle mode (default), toggle EQ, cycle presets, toggle sidetone, toggle noise gate — set via Settings tab
 - Dark UI with gaming aesthetic
 
-## Architecture
+## Repository layout
 
 ```
-epos-gsx300d              Rust daemon — audio DSP + device control
-  epos-devices            USB/udev detection
-  epos-audio              PipeWire audio processing
-  epos-hid                HID event handling
-  epos-config             Config + preset management
-  epos-shared             IPC types, device IDs
-
-epos-gsx300-gui           Tauri 2.x + Vue 3 — native desktop app (Pinia + Naive UI)
-                          Connects to daemon via Unix socket IPC
-                          Responsive: scales from 640×400 to fullscreen (dwm-friendly)
+.
+├── crates/
+│   ├── epos-gsx300d/       Rust daemon — audio DSP + device control
+│   │   └── src/            (audio, hid, led, devices, ipc, mic_meter)
+│   ├── epos-gsx300-gui/    Tauri 2.x + Vue 3 desktop app (Pinia + Naive UI)
+│   └── epos-shared/        Shared crate — IPC types, device IDs, config schema
+├── docs/
+│   ├── GUI-REDESIGN-PLAN.md          GUI roadmap
+│   └── reverse-engineering/          ↓ device RE archive (see below)
+├── config/
+│   └── default.json                   Default daemon config
+├── packaging/
+│   ├── archlinux/                    PKGBUILD
+│   └── epos-gsx300-gui.desktop       Desktop entry
+├── scripts/
+│   ├── install.sh                    Install / uninstall helper
+│   ├── hid-capture.py                Raw HID report capture (debug)
+│   ├── led-probe.py                  LED ring probe (debug)
+│   └── test-smart-button.py          Smart-button behavior test
+├── systemd/
+│   ├── epos-gsx300d.service          Daemon user service
+│   └── pipewire-ladspa.conf          PipeWire rnnoise LADSPA config
+├── udev/
+│   └── 70-epos-gsx300.rules          Device access rule (audio group)
+├── Cargo.toml                        Workspace manifest
+└── README.md
 ```
 
 ## Install
 
 ```bash
 # From source
-git clone --recurse-submodules https://github.com/slimulv1/epos-gsx300-linux.git
+git clone https://github.com/slimulv1/epos-gsx300-linux.git
 cd epos-gsx300-linux
 cargo build --release
 
@@ -67,6 +85,38 @@ sudo ./scripts/install.sh --udev
 > device's hidraw interface, which the daemon uses to control the LED
 > ring and read the smart button / volume dial.
 
+## Usage
+
+```bash
+# Start daemon (systemd user service)
+systemctl --user enable --now epos-gsx300d
+
+# Launch GUI (desktop app)
+epos-gsx300-gui
+```
+
+The GUI is a responsive native desktop app (Tauri 2.x) that scales from
+640×400 to fullscreen — works well with dwm tiling. Bottom-nav has 4 tabs:
+**Playback** (EQ + presets + surround + sidetone + sound test),
+**Microphone** (voice enhancer + gain + noise gate),
+**Device** (USB info + smart button config),
+**Settings** (autostart + status + about).
+
+## Architecture
+
+```
+epos-gsx300d              Rust daemon — audio DSP + device control
+  epos-devices            USB/udev detection
+  epos-audio              PipeWire audio processing
+  epos-hid                HID event handling
+  epos-config             Config + preset management
+  epos-shared             IPC types, device IDs
+
+epos-gsx300-gui           Tauri 2.x + Vue 3 — native desktop app (Pinia + Naive UI)
+                          Connects to daemon via Unix socket IPC
+                          Responsive: scales from 640×400 to fullscreen (dwm-friendly)
+```
+
 ## Hardware compatibility notes (CX21988)
 
 The GSX 300 is built on the **Conexant/Synaptics CX21988** (AudioSmart)
@@ -87,26 +137,23 @@ codec. Key facts that shape the daemon design:
 - **HID protocol** (fully decoded, see `src/led.rs` header): Report 0x01
   = volume dial (incremental detents only, no absolute readback), 0x02 =
   LED / button state (2-bit output, 3-bit input), 0x04/0x05/0x06/0x07/
-  0x1A = undisclosed vendor commands (probable profile/mixer protocol).
-  Because the dial exposes only relative detents, the daemon tracks the
-  volume level host-side and reports it via `GetStatus` for the GUI.
+  0x1A = undisclosed vendor commands. Because the dial exposes only
+  relative detents, the daemon tracks the volume level host-side and
+  reports it via `GetStatus` for the GUI.
 
-## Usage
+## Reverse engineering
 
-```bash
-# Start daemon (systemd user service)
-systemctl --user enable --now epos-gsx300d
+This repository contains the full reverse-engineering archive of the
+EPOS GSX 300 (2026-09): firmware dump + disassembly (W65C02S CPU),
+HID/memory-bus protocol decode, register map, persistence tests.
 
-# Launch GUI (desktop app)
-epos-gsx300-gui
-```
+**Start here:**
 
-The GUI is a responsive native desktop app (Tauri 2.x) that scales from
-640×400 to fullscreen — works well with dwm tiling. Bottom-nav has 4 tabs:
-**Playback** (EQ + presets + surround + sidetone + sound test),
-**Microphone** (voice enhancer + gain + noise gate),
-**Device** (USB info + smart button config),
-**Settings** (autostart + status + about).
+- [`docs/reverse-engineering/README.md`](docs/reverse-engineering/README.md) — index + safety rules
+- [`docs/reverse-engineering/HARDWARE-BOOK.md`](docs/reverse-engineering/HARDWARE-BOOK.md) — community-facing device book
+- [`docs/reverse-engineering/QUICK-REFERENCE.md`](docs/reverse-engineering/QUICK-REFERENCE.md) — at-a-glance protocols & registers
+
+Raw firmware dumps are kept local (copyrighted Sennheiser/EPOS firmware).
 
 ## DSP / Noise Gate setup
 
