@@ -1,3 +1,20 @@
+1238: JMP $b3be
+123b: JMP $b458
+123e: JMP $a321
+1241: JMP $a3ed
+1244: JMP $a4a4
+1247: JMP $e4fd
+124a: JMP $bd72
+124d: JMP $c98a
+1250: JMP $d34b
+1253: JMP $e9ba
+1256: LDA #$00
+1258: BNE $03
+125a: JMP $b321
+125d: LDA (,zp)$00
+125f: RTI
+1260: LDA (,zp)$00
+1262: EOR (,X)$60
 1400: RTS
 1401: RTS
 1402: JMP $1aaa
@@ -119,8 +136,8 @@
 15a9: BEQ $26
 15ab: CMP #$30
 15ad: BEQ $4b
-15af: 57 !UNDEF
-15b0: STZ $3e80
+15af: RMB5 $9c
+15b1: BRA $3e
 15b3: SBC (,zp)$7a
 15b5: BBR0 $20 → $15b8
 15b8: SMB2 $4d
@@ -130,7 +147,7 @@
 15bf: STZ $01a9
 15c2: STA $14a0
 15c5: BRA $2a
-15c7: RMB1 $4d
+15c7: RMB2 $4d
 15c9: CMP (,zp)$02
 15cb: JSR $570f
 15ce: STZ $2080
@@ -143,13 +160,13 @@
 15dd: LDA #$01
 15df: STA $14a0
 15e2: SMB2 $4d
-15e4: 57 !UNDEF
-15e5: STZ $0980
+15e4: RMB5 $9c
+15e6: BRA $09
 15e8: SMB2 $4d
-15ea: d7 !UNDEF
-15eb: STZ $01a9
+15ea: SMB5 $9c
+15ec: LDA #$01
 15ee: STA $14a0
-15f1: BBR4 $9c → $15f4
+15f1: BBR5 $9c → $15f4
 15f4: JMP $e827
 15f7: JMP $e83d
 15fa: SBC (,zp)$7a
@@ -161,7 +178,7 @@
 1606: STZ $01a9
 1609: STA $14a0
 160c: BRA $e3
-160e: RMB1 $4d
+160e: RMB2 $4d
 1610: CMP (,zp)$02
 1612: JSR $d70f
 1615: STZ $d980
@@ -318,7 +335,7 @@
 185e: LDA #$00
 1860: JSR $1864
 1863: RTS
-1864: BBR1 $a3 → $1867
+1864: BBR2 $a3 → $1867
 1867: BBS1 $4f → $186a
 186a: BRA $02
 186c: AND #$fc
@@ -345,8 +362,7 @@
 189c: INX
 189d: BBS5 $e8 → $18a0
 18a0: INX
-18a1: f7 !UNDEF
-18a2: INX
+18a1: SMB7 $e8
 18a3: AND (,X)$e9
 18a5: BIT $d4e9
 18a8: INX
@@ -426,8 +442,8 @@
 1a1e: 03 !UNDEF
 1a50: 6b !UNDEF
 1a51: PHP
-1a52: f7 !UNDEF
-1a53: LDY ,X$1a57
+1a52: SMB7 $bc
+1a54: RMB5 $1a
 1a56: RTS
 1a57: LDA #$07
 1a59: JMP $bcf9
@@ -443,14 +459,13 @@
 1a69: BRA $01
 1a6b: RTS
 1a6c: BBR1 $a2 → $1a6f
-1a6f: 17 !UNDEF
-1a70: LDX #$20
-1a72: LDA (,zp)$da
+1a6f: RMB1 $a2
+1a71: JSR $dab2
 1a74: JSR $d894
 1a77: JSR $e18d
-1a7a: BBR1 $a2 → $1a7d
-1a7d: RMB1 $a2
-1a7f: RMB3 $a3
+1a7a: BBR2 $a2 → $1a7d
+1a7d: RMB2 $a2
+1a7f: RMB6 $a3
 1a81: LDA (,zp)$00
 1a83: d4 !UNDEF
 1a84: JSR $d8a4
@@ -3196,8 +3211,7 @@ a09f: BNE $f2
 a0a1: CLI
 a0a2: RTS
 a0a3: 22 !UNDEF
-a0a4: 57 !UNDEF
-a0a5: 0b !UNDEF
+a0a4: RMB5 $0b
 a0a6: AND (,zp)$40
 a0a8: 22 !UNDEF
 a0a9: e2 !UNDEF
@@ -3258,15 +3272,14 @@ a119: BEQ $03
 a11b: DEC $12d2
 a11e: PLA
 a11f: STA $d8
-a121: BBR2 $93 → $a124
+a121: BBR3 $93 → $a124
 a124: JSR $123e
 a127: CMP (,zp)$40
 a129: 54 !UNDEF
 a12a: TSB $32
 a12c: RTI
 a12d: 22 !UNDEF
-a12e: 37 !UNDEF
-a12f: 0b !UNDEF
+a12e: RMB3 $0b
 a130: BBR0 $3c → $a133
 a133: WAI
 a134: LDA $40
@@ -3282,13 +3295,13 @@ a144: LDX $47
 a146: 22 !UNDEF
 a147: 23 !UNDEF
 a148: LDA $38
-a14a: BBR6 $93 → $a14d
+a14a: BBR7 $93 → $a14d
 a14d: JSR $1453
 a150: JSR $1238
 a153: 33 !UNDEF
 a154: AND (,zp)$85
 a156: LSR $86
-a158: RMB2 $32
+a158: RMB4 $32
 a15a: STA $43
 a15c: STX $44
 a15e: STY $45
@@ -3300,10 +3313,10 @@ a167: STP
 a168: AND (,zp)$40
 a16a: JSR $13c3
 a16d: BBR1 $39 → $a170
-a170: BBR4 $3c → $a173
+a170: BBR5 $3c → $a173
 a173: 22 !UNDEF
-a174: 17 !UNDEF
-a175: AND ,Y$4032
+a174: RMB1 $39
+a176: AND (,zp)$40
 a178: JSR $be3b
 a17b: JSR $bf1e
 a17e: LDA $137d
@@ -3336,7 +3349,7 @@ a1b0: JSR $bf4d
 a1b3: JSR $c110
 a1b6: AND (,zp)$85
 a1b8: LSR $86
-a1ba: RMB2 $32
+a1ba: RMB4 $32
 a1bc: STA $43
 a1be: STX $44
 a1c0: STY $45
@@ -3379,10 +3392,10 @@ a210: LDA $ad
 a212: BNE $0a
 a214: LDA $ae
 a216: BNE $04
-a218: 97 !UNDEF
-a219: STY ,X$80
-a21b: TSB $c6
-a21d: LDX $adc6
+a218: SMB1 $94
+a21a: BRA $04
+a21c: DEC $ae
+a21e: DEC $ad
 a220: BBS3 $95 → $a223
 a223: LDA $b7
 a225: BNE $0a
@@ -3434,10 +3447,10 @@ a285: LDA $bb
 a287: BNE $0a
 a289: LDA $bc
 a28b: BNE $04
-a28d: d7 !UNDEF
-a28e: STA ,X$80
-a290: TSB $c6
-a292: LDY ,X$bbc6
+a28d: SMB5 $95
+a28f: BRA $04
+a291: DEC $bc
+a293: DEC $bb
 a295: RTS
 a296: LDA #$c7
 a298: STA $123f
@@ -3457,7 +3470,7 @@ a2b6: LDA $bd
 a2b8: BNE $0a
 a2ba: LDA $be
 a2bc: BNE $04
-a2be: SMB5 $95
+a2be: SMB6 $95
 a2c0: BRA $04
 a2c2: DEC $be
 a2c4: DEC $bd
@@ -3471,12 +3484,12 @@ a2d4: LDA $bf
 a2d6: BNE $0a
 a2d8: LDA $c0
 a2da: BNE $04
-a2dc: f7 !UNDEF
-a2dd: STA ,X$80
-a2df: TSB $c6
-a2e1: CPY #$c6
-a2e3: BBS3 $60 → $a2e6
-a2e6: 03 !UNDEF
+a2dc: SMB7 $95
+a2de: BRA $04
+a2e0: DEC $c0
+a2e2: DEC $bf
+a2e4: RTS
+a2e5: LDA #$03
 a2e7: STA $123f
 a2ea: LDA #$a3
 a2ec: STA $1240
@@ -3499,11 +3512,10 @@ a310: LDA $c3
 a312: BNE $0a
 a314: LDA $c4
 a316: BNE $04
-a318: 97 !UNDEF
-a319: STX ,Y$80
-a31b: TSB $c6
-a31d: CPY $c6
-a31f: c3 !UNDEF
+a318: SMB1 $96
+a31a: BRA $04
+a31c: DEC $c4
+a31e: DEC $c3
 a320: RTS
 a321: LDA #$3f
 a323: STA $123f
@@ -3525,11 +3537,11 @@ a344: LDA #$a1
 a346: STA $1240
 a349: BBR1 $99 → $a34c
 a34c: RTS
-a34d: 97 !UNDEF
-a34e: STA ,Y$40d2
+a34d: SMB1 $99
+a34f: CMP (,zp)$40
 a351: 54 !UNDEF
 a352: TSB $58
-a354: BBR3 $93 → $a357
+a354: BBR4 $93 → $a357
 a357: JSR $13c6
 a35a: JSR $1241
 a35d: LDA $aa
@@ -3537,9 +3549,9 @@ a35f: BEQ $02
 a361: DEC $aa
 a363: JSR $e9c3
 a366: SEI
-a367: 17 !UNDEF
-a368: STA ,Y$ad60
-a36b: ORA #$10
+a367: RMB1 $99
+a369: RTS
+a36a: LDA $1009
 a36d: BEQ $08
 a36f: LDA $d1
 a371: CMP #$ff
@@ -3549,22 +3561,20 @@ a377: LDA #$84
 a379: STA $1242
 a37c: LDA #$a3
 a37e: STA $1243
-a381: 97 !UNDEF
-a382: STA ,X$a960
-a385: LDX #$8d
-a387: 42 !UNDEF
-a388: ORA (,zp)$a9
-a38a: a3 !UNDEF
+a381: SMB1 $9d
+a383: RTS
+a384: LDA #$a2
+a386: STA $1242
+a389: LDA #$a3
 a38b: STA $1243
 a38e: BBS5 $94 → $a391
 a391: LDA $c7
 a393: BNE $0a
 a395: LDA $c8
 a397: BNE $04
-a399: d7 !UNDEF
-a39a: STY ,X$80
-a39c: TSB $c6
-a39e: INY
+a399: SMB5 $94
+a39b: BRA $04
+a39d: DEC $c8
 a39f: DEC $c7
 a3a1: RTS
 a3a2: LDA #$c2
@@ -3576,34 +3586,33 @@ a3af: LDA $c9
 a3b1: BNE $0a
 a3b3: LDA $ca
 a3b5: BNE $04
-a3b7: SMB5 $94
+a3b7: SMB6 $94
 a3b9: BRA $04
 a3bb: DEC $ca
 a3bd: DEC $c9
-a3bf: 97 !UNDEF
-a3c0: STA ,X$a960
-a3c3: CPX #$8d
-a3c5: 42 !UNDEF
-a3c6: ORA (,zp)$a9
-a3c8: a3 !UNDEF
+a3bf: SMB1 $9d
+a3c1: RTS
+a3c2: LDA #$e0
+a3c4: STA $1242
+a3c7: LDA #$a3
 a3c9: STA $1243
 a3cc: BBS7 $94 → $a3cf
 a3cf: LDA $cb
 a3d1: BNE $0a
 a3d3: LDA $cc
 a3d5: BNE $04
-a3d7: f7 !UNDEF
-a3d8: STY ,X$80
-a3da: TSB $c6
-a3dc: CPY $cbc6
+a3d7: SMB7 $94
+a3d9: BRA $04
+a3db: DEC $cc
+a3dd: DEC $cb
 a3df: RTS
 a3e0: LDA #$ed
 a3e2: STA $1242
 a3e5: LDA #$a3
 a3e7: STA $1243
-a3ea: 97 !UNDEF
-a3eb: STA ,X$a960
-a3ee: SED
+a3ea: SMB1 $9d
+a3ec: RTS
+a3ed: LDA #$f8
 a3ef: STA $1242
 a3f2: LDA #$a3
 a3f4: STA $1243
@@ -3612,25 +3621,23 @@ a3f8: LDA #$05
 a3fa: STA $1242
 a3fd: LDA #$a4
 a3ff: STA $1243
-a402: 97 !UNDEF
-a403: STA ,X$a960
-a406: ORA ,Y$428d
-a409: ORA (,zp)$a9
-a40b: LDY $8d
-a40d: 43 !UNDEF
-a40e: ORA (,zp)$5f
-a410: 93 !UNDEF
-a411: ASL $20
-a413: CMP #$13
+a402: SMB1 $9d
+a404: RTS
+a405: LDA #$19
+a407: STA $1242
+a40a: LDA #$a4
+a40c: STA $1243
+a40f: BBR5 $93 → $a412
+a412: JSR $13c9
 a415: JSR $1244
 a418: RTS
 a419: LDA #$26
 a41b: STA $1242
 a41e: LDA #$a4
 a420: STA $1243
-a423: 97 !UNDEF
-a424: STA ,X$a960
-a427: ROR A
+a423: SMB1 $9d
+a425: RTS
+a426: LDA #$6a
 a428: STA $1242
 a42b: LDA #$a3
 a42d: STA $1243
@@ -3658,12 +3665,12 @@ a45c: LDA $cf
 a45e: BNE $0a
 a460: LDA $d0
 a462: BNE $04
-a464: 97 !UNDEF
-a465: STA ,X$80
-a467: TSB $c6
-a469: BNE $c6
-a46b: BBS4 $60 → $a46e
-a46e: SEI
+a464: SMB1 $95
+a466: BRA $04
+a468: DEC $d0
+a46a: DEC $cf
+a46c: RTS
+a46d: LDA #$78
 a46f: STA $1245
 a472: LDA #$a4
 a474: STA $1246
@@ -3759,7 +3766,7 @@ a51e: RTS
 a51f: PHX
 a520: PHY
 a521: LDY #$9b
-a523: BBR2 $09 → $a526
+a523: BBR3 $09 → $a526
 a526: LDY #$4d
 a528: JSR $a533
 a52b: BNE $fb
@@ -3792,15 +3799,13 @@ a54c: DEY
 a54d: RTS
 a54e: RTS
 a54f: 22 !UNDEF
-a550: 77 !UNDEF
-a551: 0b !UNDEF
+a550: RMB7 $0b
 a552: STA $3c
 a554: LDA $0452
 a557: AND (,zp)$40
 a559: 22 !UNDEF
-a55a: RMB3 $0b
-a55c: 57 !UNDEF
-a55d: 0b !UNDEF
+a55a: RMB6 $0b
+a55c: RMB5 $0b
 a55e: LDA $044d
 a561: ORA #$01
 a563: STA $08
@@ -3815,7 +3820,7 @@ a579: LDA ,X$ebbb
 a57c: STA $045e
 a57f: LDA (,zp)$0f
 a581: ROL ,X$0fb2
-a584: BBR2 $a9 → $a587
+a584: BBR3 $a9 → $a587
 a587: STA $0458
 a58a: STA $045c
 a58d: RTS
@@ -3834,15 +3839,15 @@ a5a1: LDA $38
 a5a3: CLC
 a5a4: RTS
 a5a5: BBS5 $99 → $a5a8
-a5a8: BBR4 $3c → $a5ab
+a5a8: BBR5 $3c → $a5ab
 a5ab: STA $38
 a5ad: RTS
 a5ae: BBS5 $99 → $a5b1
 a5b1: STA $38
 a5b3: RTS
-a5b4: BBR6 $3a → $a5b7
-a5b7: BBR4 $3c → $a5ba
-a5ba: BBR5 $3c → $a5bd
+a5b4: BBR7 $3a → $a5b7
+a5b7: BBR5 $3c → $a5ba
+a5ba: BBR6 $3c → $a5bd
 a5bd: RTS
 a5be: LDA #$0d
 a5c0: BRA $e3
@@ -3979,11 +3984,9 @@ a83b: EOR (,X)$20
 a83d: SBC $ea
 a83f: CMP #$50
 a841: BNE $04
-a843: f7 !UNDEF
-a844: TYA
+a843: SMB7 $98
 a845: BRA $c1
-a847: 37 !UNDEF
-a848: 9b !UNDEF
+a847: RMB3 $9b
 a849: RTS
 a84a: INC $40
 a84c: BNE $02
@@ -4024,14 +4027,12 @@ a88e: CMP (,zp)$02
 a890: 03 !UNDEF
 a891: ORA $93a7
 a894: JSR $a58e
-a897: 17 !UNDEF
-a898: ORA (,X)$27
-a89a: STA ,Y$c020
-a89d: SMB3 $20
-a89f: c3 !UNDEF
-a8a0: SBC #$17
-a8a2: ORA (,X)$d2
-a8a4: RTI
+a897: RMB1 $01
+a899: RMB2 $99
+a89b: JSR $b7c0
+a89e: JSR $e9c3
+a8a1: RMB1 $01
+a8a3: CMP (,zp)$40
 a8a5: PHX
 a8a6: TSB $20
 a8a8: SMB3 $13
@@ -4046,7 +4047,7 @@ a8bf: JSR $123b
 a8c2: SBC (,zp)$00
 a8c4: BPL $80
 a8c6: e3 !UNDEF
-a8c7: BBR5 $93 → $a8ca
+a8c7: BBR6 $93 → $a8ca
 a8ca: JSR $13f9
 a8cd: JSR $1247
 a8d0: BRA $d8
@@ -4065,24 +4066,24 @@ a8f0: LDA $40
 a8f2: PHA
 a8f3: LDA $41
 a8f5: PHA
-a8f6: BBR3 $9f → $a8f9
-a8f9: RMB2 $9f
+a8f6: BBR4 $9f → $a8f9
+a8f9: RMB4 $9f
 a8fb: JSR $bdc1
-a8fe: BBR6 $01 → $a901
-a901: BBR1 $93 → $a904
+a8fe: BBR7 $01 → $a901
+a901: BBR2 $93 → $a904
 a904: JSR $1411
 a907: JSR $124a
-a90a: BBR2 $9f → $a90d
+a90a: BBR3 $9f → $a90d
 a90d: JSR $1414
 a910: JSR $124d
-a913: BBR6 $9d → $a916
+a913: BBR7 $9d → $a916
 a916: JSR $d36d
-a919: BBR6 $9c → $a91c
+a919: BBR7 $9c → $a91c
 a91c: JSR $d48d
 a91f: JSR $d564
-a922: BBR4 $9f → $a925
+a922: BBR5 $9f → $a925
 a925: JSR $d459
-a928: BBR3 $a3 → $a92b
+a928: BBR4 $a3 → $a92b
 a92b: JSR $d539
 a92e: PLA
 a92f: STA $41
@@ -4094,14 +4095,14 @@ a937: LDA $40
 a939: PHA
 a93a: LDA $41
 a93c: PHA
-a93d: BBR6 $01 → $a940
-a940: BBR1 $93 → $a943
+a93d: BBR7 $01 → $a940
+a940: BBR2 $93 → $a943
 a943: JSR $1411
 a946: JSR $124a
-a949: BBR2 $9f → $a94c
+a949: BBR3 $9f → $a94c
 a94c: JSR $1414
 a94f: JSR $124d
-a952: BBR6 $9c → $a955
+a952: BBR7 $9c → $a955
 a955: JSR $d48d
 a958: PLA
 a959: STA $41
@@ -4109,7 +4110,7 @@ a95b: PLA
 a95c: STA $40
 a95e: AND (,zp)$60
 a960: JSR $1483
-a963: BBR1 $a3 → $a966
+a963: BBR2 $a3 → $a966
 a966: LDA #$13
 a968: STA $08b7
 a96b: LDA #$03
@@ -4184,7 +4185,7 @@ ac2e: AND #$fe
 ac30: JSR $acff
 ac33: TXA
 ac34: STZ $40
-ac36: BBR2 $98 → $ac39
+ac36: BBR3 $98 → $ac39
 ac39: LDA #$00
 ac3b: ADC $41
 ac3d: JSR $acff
@@ -4239,7 +4240,7 @@ ac9b: JSR $ad63
 ac9e: JSR $acff
 aca1: TXA
 aca2: STZ $42
-aca4: BBR2 $98 → $aca7
+aca4: BBR3 $98 → $aca7
 aca7: LDA #$00
 aca9: ADC $43
 acab: JSR $acff
@@ -4285,27 +4286,27 @@ acfa: JSR $a4eb
 acfd: PLX
 acfe: RTS
 acff: PHA
-ad00: SMB5 $05
+ad00: SMB6 $05
 ad02: PLA
 ad03: LDY #$08
 ad05: ROL A
 ad06: BCC $06
 ad08: PHA
-ad09: SMB5 $01
+ad09: SMB6 $01
 ad0b: PLA
 ad0c: BRA $04
 ad0e: PHA
-ad0f: RMB3 $01
+ad0f: RMB6 $01
 ad11: PLA
 ad12: JSR $ae73
 ad15: DEY
 ad16: BNE $ed
 ad18: ROL A
 ad19: PHA
-ad1a: RMB2 $00
+ad1a: RMB4 $00
 ad1c: PLA
 ad1d: PHA
-ad1e: RMB3 $05
+ad1e: RMB6 $05
 ad20: PLA
 ad21: LDA #$00
 ad23: JSR $ae82
@@ -4313,21 +4314,21 @@ ad26: PHA
 ad27: SMB4 $00
 ad29: PLA
 ad2a: JSR $ae82
-ad2d: BBR5 $01 → $ad30
+ad2d: BBR6 $01 → $ad30
 ad30: LDA #$ff
 ad32: PHA
-ad33: RMB2 $00
+ad33: RMB4 $00
 ad35: PLA
 ad36: JSR $ae95
 ad39: RTS
 ad3a: PHA
-ad3b: RMB3 $05
+ad3b: RMB6 $05
 ad3d: PLA
 ad3e: PHY
 ad3f: LDY #$08
 ad41: LDA #$00
 ad43: PHA
-ad44: RMB2 $00
+ad44: RMB4 $00
 ad46: PLA
 ad47: JSR $ae82
 ad4a: PHA
@@ -4343,7 +4344,7 @@ ad59: ROL A
 ad5a: DEY
 ad5b: BNE $e6
 ad5d: PHA
-ad5e: RMB2 $00
+ad5e: RMB4 $00
 ad60: PLA
 ad61: PLY
 ad62: RTS
@@ -4425,13 +4426,13 @@ ade4: AND #$02
 ade6: ORA $48
 ade8: RTS
 ade9: PHA
-adea: RMB3 $05
+adea: RMB6 $05
 adec: PLA
 aded: PHX
 adee: LDX #$00
 adf0: BBS6 $01 → $adf3
 adf3: PHA
-adf4: RMB2 $00
+adf4: RMB4 $00
 adf6: PLA
 adf7: JSR $ae82
 adfa: PHA
@@ -4445,10 +4446,10 @@ ae06: PLX
 ae07: RTS
 ae08: JSR $ade9
 ae0b: PHA
-ae0c: SMB5 $05
+ae0c: SMB6 $05
 ae0e: PLA
 ae0f: PHA
-ae10: SMB5 $01
+ae10: SMB6 $01
 ae12: PLA
 ae13: JSR $ae95
 ae16: PHA
@@ -4456,18 +4457,18 @@ ae17: SMB4 $00
 ae19: PLA
 ae1a: JSR $ae82
 ae1d: PHA
-ae1e: RMB3 $01
+ae1e: RMB6 $01
 ae20: PLA
 ae21: JSR $ae82
 ae24: PHA
-ae25: RMB2 $00
+ae25: RMB4 $00
 ae27: PLA
 ae28: JMP $ae95
 ae2b: PHA
-ae2c: SMB5 $05
+ae2c: SMB6 $05
 ae2e: PLA
 ae2f: PHA
-ae30: RMB3 $01
+ae30: RMB6 $01
 ae32: PLA
 ae33: JSR $ae82
 ae36: PHA
@@ -4475,34 +4476,33 @@ ae37: SMB4 $00
 ae39: PLA
 ae3a: JSR $ae82
 ae3d: PHA
-ae3e: SMB5 $01
+ae3e: SMB6 $01
 ae40: PLA
 ae41: JSR $ae82
 ae44: JSR $ae95
 ae47: PHA
-ae48: SMB5 $05
+ae48: SMB6 $05
 ae4a: PLA
 ae4b: RTS
 ae4c: PHA
-ae4d: 57 !UNDEF
-ae4e: TYA
+ae4d: RMB5 $98
 ae4f: PLA
 ae50: JSR $ae73
 ae53: JMP $ae2b
-ae56: BBR4 $98 → $ae59
+ae56: BBR5 $98 → $ae59
 ae59: JSR $ad3a
 ae5c: JMP $ae4c
 ae5f: RTS
 ae60: PHA
-ae61: SMB5 $05
+ae61: SMB6 $05
 ae63: PLA
 ae64: PHA
-ae65: RMB3 $01
+ae65: RMB6 $01
 ae67: PLA
 ae68: JSR $ae73
 ae6b: JSR $ae82
 ae6e: PHA
-ae6f: RMB3 $05
+ae6f: RMB6 $05
 ae71: PLA
 ae72: RTS
 ae73: JSR $ae82
@@ -4511,7 +4511,7 @@ ae77: SMB4 $00
 ae79: PLA
 ae7a: JSR $ae82
 ae7d: PHA
-ae7e: RMB2 $00
+ae7e: RMB4 $00
 ae80: PLA
 ae81: RTS
 ae82: BBS4 $98 → $ae85
@@ -4539,7 +4539,7 @@ aea6: RTS
 aea7: LDX #$00
 aea9: JSR $ac1d
 aeac: RTS
-aead: RMB2 $98
+aead: RMB4 $98
 aeaf: LDA $1265
 aeb2: CMP #$ff
 aeb4: BNE $01
@@ -4623,9 +4623,9 @@ af53: BPL $fa
 af55: STA $0240
 af58: STA $0241
 af5b: SMB0 $06
-af5d: 17 !UNDEF
-af5e: ORA (,X)$87
-af60: STA ,Y$ebb2
+af5d: RMB1 $01
+af5f: SMB0 $99
+af61: LDA (,zp)$eb
 af63: RTI
 af64: LDA (,zp)$eb
 af66: EOR (,X)$20
@@ -4650,8 +4650,7 @@ af98: BCC $00
 af9a: BBS5 $97 → $af9d
 af9d: JSR $a5c2
 afa0: JMP ($0046)
-afa3: 17 !UNDEF
-afa4: TYA
+afa3: RMB1 $98
 afa5: JSR $a58e
 afa8: CLC
 afa9: RTS
@@ -4673,9 +4672,8 @@ afc8: JSR $b00c
 afcb: JSR $b063
 afce: JSR $b063
 afd1: BEQ $05
-afd3: BBR4 $97 → $afd6
-afd6: 97 !UNDEF
-afd7: TYA
+afd3: BBR5 $97 → $afd6
+afd6: SMB1 $98
 afd8: JSR $b01e
 afdb: JSR $b029
 afde: BBS4 $99 → $afe1
@@ -4687,8 +4685,7 @@ afea: STA $0262
 afed: STA $0263
 aff0: STA $0265
 aff3: STA $0264
-aff6: 17 !UNDEF
-aff7: TYA
+aff6: RMB1 $98
 aff8: RTS
 aff9: BBS4 $99 → $affc
 affc: JSR $b1e8
@@ -4773,7 +4770,7 @@ b0a2: INX
 b0a3: DEY
 b0a4: BNE $f7
 b0a6: RTS
-b0a7: RMB2 $99
+b0a7: RMB4 $99
 b0a9: LDA $0265
 b0ac: STA $43
 b0ae: LDA $0264
@@ -4804,8 +4801,7 @@ b0e6: LDA $0265
 b0e9: STA $41
 b0eb: LDA $0264
 b0ee: STA $40
-b0f0: 57 !UNDEF
-b0f1: TYA
+b0f0: RMB5 $98
 b0f2: JSR $b106
 b0f5: CMP ,X$0242
 b0f8: BEQ $02
@@ -4816,8 +4812,7 @@ b100: BNE $f0
 b102: JSR $ae56
 b105: RTS
 b106: BBS5 $98 → $b109
-b109: d7 !UNDEF
-b10a: TYA
+b109: SMB5 $98
 b10b: PHX
 b10c: LDX #$00
 b10e: JSR $ac53
@@ -4829,8 +4824,7 @@ b118: INC $40
 b11a: BNE $16
 b11c: INC $41
 b11e: BNE $04
-b120: 97 !UNDEF
-b121: TYA
+b120: SMB1 $98
 b122: BRA $09
 b124: BBS2 $98 → $b127
 b127: LDY #$80
@@ -4843,8 +4837,7 @@ b132: JSR $ae60
 b135: PLA
 b136: RTS
 b137: LDX #$00
-b139: 57 !UNDEF
-b13a: TYA
+b139: RMB5 $98
 b13b: JSR $b140
 b13e: BRA $fb
 b140: CPX #$16
@@ -4872,15 +4865,15 @@ b16a: STA $45
 b16c: STA $44
 b16e: STA $43
 b170: STA $42
-b172: RMB3 $99
-b174: 77 !UNDEF
-b175: STA ,Y$2968
-b178: RTI
+b172: RMB6 $99
+b174: RMB7 $99
+b176: PLA
+b177: AND #$40
 b179: BEQ $02
-b17b: SMB5 $99
+b17b: SMB6 $99
 b17d: PLA
-b17e: f7 !UNDEF
-b17f: STA ,Y$2380
+b17e: SMB7 $99
+b180: BRA $23
 b182: STA $46
 b184: STA $0264
 b187: BRA $1c
@@ -4890,7 +4883,7 @@ b18e: BRA $15
 b190: STA $42
 b192: BRA $11
 b194: STA $43
-b196: BBR6 $99 → $b199
+b196: BBR7 $99 → $b199
 b199: LDX #$14
 b19b: BRA $08
 b19d: STA $45
@@ -4937,8 +4930,8 @@ b1ee: CPX $0241
 b1f1: BEQ $f8
 b1f3: JSR $b1fd
 b1f6: BBR0 $99 → $b1f9
-b1f9: 17 !UNDEF
-b1fa: ORA (,X)$fa
+b1f9: RMB1 $01
+b1fb: PLX
 b1fc: RTS
 b1fd: LDX $0240
 b200: LDA ,X$0200
@@ -4958,8 +4951,8 @@ b21a: PLA
 b21b: RTS
 b21c: JSR $b225
 b21f: BBS0 $99 → $b222
-b222: 97 !UNDEF
-b223: ORA (,X)$60
+b222: SMB1 $01
+b224: RTS
 b225: PHX
 b226: LDX $0241
 b229: STA ,X$0200
@@ -5113,6 +5106,473 @@ b35c: LDX #$00
 b35e: SBC (,zp)$00
 b360: TSB $01
 b362: ROL $e2
+b3be: AND #$7f
+b3c0: CMP #$0d
+b3c2: BEQ $1e
+b3c4: CMP #$7f
+b3c6: BEQ $04
+b3c8: CMP #$08
+b3ca: BNE $16
+b3cc: LDX $a7
+b3ce: BEQ $11
+b3d0: DEC $a7
+b3d2: LDA #$08
+b3d4: JSR $a5a5
+b3d7: LDA #$20
+b3d9: JSR $a5a5
+b3dc: LDA #$08
+b3de: JSR $a5a5
+b3e1: RTS
+b3e2: PHA
+b3e3: JSR $a5a5
+b3e6: LDA $a7
+b3e8: BNE $14
+b3ea: PLA
+b3eb: PHA
+b3ec: CMP #$2f
+b3ee: BNE $0e
+b3f0: PLA
+b3f1: SMB0 $93
+b3f3: LDA #$99
+b3f5: STA $1239
+b3f8: LDA #$b4
+b3fa: STA $123a
+b3fd: RTS
+b3fe: PLA
+b3ff: CMP #$0d
+b401: BNE $15
+b403: SMB0 $93
+b405: LDA #$0d
+b407: PHA
+b408: LDA #$99
+b40a: STA $1239
+b40d: LDA #$b4
+b40f: STA $123a
+b412: PLA
+b413: JSR $b431
+b416: BRA $03
+b418: JSR $b423
+b41b: BCC $03
+b41d: JMP $b3d2
+b420: JMP $b3e1
+b423: CMP #$20
+b425: BCC $1e
+b427: CMP #$61
+b429: BCC $06
+b42b: CMP #$7b
+b42d: BCS $02
+b42f: AND #$5f
+b431: LDX $a7
+b433: STA (,Y)$a5
+b435: CPX #$0e
+b437: BNE $0a
+b439: CMP #$0d
+b43b: BEQ $06
+b43d: CMP #$00
+b43f: BEQ $02
+b441: SEC
+b442: RTS
+b443: INC $a7
+b445: CLC
+b446: RTS
+b447: LDA #$ff
+b449: STA $aa
+b44b: LDA (,zp)$56
+b44d: LDA $b2
+b44f: ORA (,zp)$a6
+b451: LDA #$00
+b453: STA $a7
+b455: RMB7 $9b
+b457: RTS
+b458: LDA (,X)$a5
+b45a: LDX #$00
+b45c: CMP ,X$ec01
+b45f: BNE $0d
+b461: JSR $b48d
+b464: BCS $0e
+b466: LDA (,zp)$2c
+b468: RTI
+b469: LDA (,zp)$ec
+b46b: EOR (,X)$80
+b46d: TSB $bce8
+b470: ORA (,X)$ec
+b472: BNE $e8
+b474: LDA (,zp)$2f
+b476: RTI
+b477: LDA (,zp)$ec
+b479: EOR (,X)$20
+b47b: STZ $20b4
+b47e: RMB4 $b4
+b480: RMB0 $93
+b482: LDA #$be
+b484: STA $1239
+b487: LDA #$b3
+b489: STA $123a
+b48c: RTS
+b48d: INC $a5
+b48f: BNE $02
+b491: INC $a6
+b493: TXA
+b494: ASL A
+b495: TAX
+b496: JMP (,X)$ec08
+b499: SMB7 $9b
+b49b: RTS
+b49c: LDX #$00
+b49e: LDA (,Y)$40
+b4a0: BEQ $17
+b4a2: CMP #$0a
+b4a4: BNE $03
+b4a6: INX
+b4a7: BRA $03
+b4a9: JSR $a5c2
+b4ac: LDA (,Y)$40
+b4ae: BEQ $06
+b4b0: JSR $a5a5
+b4b3: INX
+b4b4: BRA $f6
+b4b6: JSR $a5c2
+b4b9: RTS
+b4ba: RMB2 $97
+b4bc: RMB0 $97
+b4be: LDA $a5
+b4c0: STA $40
+b4c2: LDA $a6
+b4c4: STA $41
+b4c6: JSR $b694
+b4c9: LDY #$00
+b4cb: LDX #$ff
+b4cd: LDA (,X)$40
+b4cf: STA $43
+b4d1: INX
+b4d2: LDA ,X$ec14
+b4d5: BEQ $0a
+b4d7: CMP $43
+b4d9: BNE $f6
+b4db: TXA
+b4dc: ASL A
+b4dd: TAX
+b4de: JMP (,X)$ec1c
+b4e1: SEC
+b4e2: RTS
+b4e3: JSR $a5c2
+b4e6: JSR $b583
+b4e9: JSR $b598
+b4ec: JSR $b68d
+b4ef: LDA $41
+b4f1: BEQ $f9
+b4f3: CMP #$0d
+b4f5: BEQ $ec
+b4f7: JSR $a58e
+b4fa: CLC
+b4fb: RTS
+b4fc: JSR $a5c2
+b4ff: JSR $b583
+b502: JSR $b5e6
+b505: STA $45
+b507: JSR $a5c9
+b50a: JSR $b687
+b50d: JSR $b68d
+b510: LDX $41
+b512: BNE $e3
+b514: JSR $b5e6
+b517: CMP $45
+b519: BEQ $f2
+b51b: PHA
+b51c: JSR $a5c2
+b51f: JSR $b583
+b522: PLA
+b523: BRA $e0
+b525: JSR $a5c2
+b528: JSR $b583
+b52b: JSR $b5e6
+b52e: JSR $a5c9
+b531: JSR $b687
+b534: JSR $b68d
+b537: LDA $41
+b539: BEQ $f9
+b53b: CMP #$0d
+b53d: BEQ $16
+b53f: CMP #$20
+b541: BEQ $b4
+b543: JSR $b5ca
+b546: JSR $b617
+b549: JSR $a5c2
+b54c: JSR $b583
+b54f: JSR $b5e6
+b552: JSR $a5c9
+b555: INC $46
+b557: BNE $02
+b559: INC $47
+b55b: BRA $c8
+b55d: SMB2 $97
+b55f: BRA $04
+b561: SMB0 $97
+b563: BRA $00
+b565: JSR $b67a
+b568: JMP $b4cb
+b56b: JSR $b583
+b56e: SMB4 $97
+b570: JSR $b598
+b573: RMB4 $97
+b575: JMP $b4f7
+b578: LDX #$00
+b57a: JSR $b64b
+b57d: JSR $b611
+b580: JMP $b56b
+b583: LDA $47
+b585: JSR $a5c9
+b588: LDA $46
+b58a: JSR $a5c9
+b58d: LDA #$3a
+b58f: JSR $a5a5
+b592: JSR $b687
+b595: LDX #$00
+b597: RTS
+b598: LDX #$00
+b59a: JSR $b5e6
+b59d: JSR $a5c9
+b5a0: JSR $b687
+b5a3: BBS2 $97 → $b5a6
+b5a6: BBS4 $97 → $b5a9
+b5a9: INX
+b5aa: CPX #$08
+b5ac: BNE $ec
+b5ae: CLC
+b5af: LDA $46
+b5b1: ADC #$08
+b5b3: STA $46
+b5b5: LDA $47
+b5b7: ADC #$00
+b5b9: STA $47
+b5bb: RTS
+b5bc: CLC
+b5bd: LDA $46
+b5bf: ADC #$01
+b5c1: STA $46
+b5c3: LDA $47
+b5c5: ADC #$00
+b5c7: STA $47
+b5c9: RTS
+b5ca: JSR $a5a5
+b5cd: JSR $a5e3
+b5d0: ASL A
+b5d1: ASL A
+b5d2: ASL A
+b5d3: ASL A
+b5d4: STA $42
+b5d6: JSR $b68d
+b5d9: LDA $41
+b5db: BEQ $f9
+b5dd: JSR $a5a5
+b5e0: JSR $a5e3
+b5e3: ORA $42
+b5e5: RTS
+b5e6: BBR0 $97 → $b5e9
+b5e9: LDA $47
+b5eb: STA $41
+b5ed: LDA $46
+b5ef: STA $40
+b5f1: JMP $eae5
+b5f4: BBR2 $97 → $b5f7
+b5f7: LDA $47
+b5f9: STA $41
+b5fb: LDA $46
+b5fd: STA $40
+b5ff: LDX #$00
+b601: JSR $ac1d
+b604: RTS
+b605: RMB1 $97
+b607: BBS1 $97 → $b60a
+b60a: LDA (,Y)$46
+b60c: BRA $02
+b60e: STA (,Y)$46
+b610: RTS
+b611: JSR $b617
+b614: JMP $b67a
+b617: BBR0 $97 → $b61a
+b61a: PHA
+b61b: LDA $47
+b61d: STA $43
+b61f: LDA $46
+b621: STA $42
+b623: PLA
+b624: JSR $eb22
+b627: LDA $42
+b629: STA $46
+b62b: LDA $43
+b62d: STA $47
+b62f: RTS
+b630: BBR2 $97 → $b633
+b633: PHA
+b634: LDA $47
+b636: STA $43
+b638: LDA $46
+b63a: STA $42
+b63c: PLA
+b63d: LDX #$00
+b63f: JSR $ac5b
+b642: LDA $42
+b644: STA $46
+b646: LDA $43
+b648: STA $47
+b64a: RTS
+b64b: JSR $b67a
+b64e: LDA (,X)$40
+b650: CMP #$0d
+b652: BEQ $1a
+b654: JSR $a5e3
+b657: PHA
+b658: JSR $b67a
+b65b: LDA (,X)$40
+b65d: CMP #$0d
+b65f: BEQ $10
+b661: JSR $a5e3
+b664: STA $42
+b666: PLA
+b667: ASL A
+b668: ASL A
+b669: ASL A
+b66a: ASL A
+b66b: ORA $42
+b66d: RTS
+b66e: JMP $b4f7
+b671: PLA
+b672: RTS
+b673: PHA
+b674: SMB1 $97
+b676: PLA
+b677: JMP $b607
+b67a: INC $a5
+b67c: BNE $02
+b67e: INC $a6
+b680: INC $40
+b682: BNE $02
+b684: INC $41
+b686: RTS
+b687: LDA #$20
+b689: JSR $a5a5
+b68c: RTS
+b68d: JSR $a591
+b690: JSR $a594
+b693: RTS
+b694: LDA (,zp)$00
+b696: 43 !UNDEF
+b697: LDX #$00
+b699: JSR $b6b3
+b69c: STA $47
+b69e: JSR $b6b3
+b6a1: STA $46
+b6a3: STX $42
+b6a5: CLC
+b6a6: LDA $40
+b6a8: ADC $42
+b6aa: STA $40
+b6ac: LDA $41
+b6ae: ADC #$00
+b6b0: STA $41
+b6b2: RTS
+b6b3: LDA (,Y)$40
+b6b5: JSR $a5e3
+b6b8: ASL A
+b6b9: ASL A
+b6ba: ASL A
+b6bb: ASL A
+b6bc: INX
+b6bd: INC $a5
+b6bf: BNE $02
+b6c1: INC $a6
+b6c3: STA $42
+b6c5: LDA (,Y)$40
+b6c7: JSR $a5e3
+b6ca: ORA $42
+b6cc: INX
+b6cd: INC $a5
+b6cf: BNE $02
+b6d1: INC $a6
+b6d3: RTS
+b6d4: LDA (,zp)$74
+b6d6: RTI
+b6d7: LDA (,zp)$ec
+b6d9: EOR (,X)$20
+b6db: STZ $0cb4
+b6de: 54 !UNDEF
+b6df: CMP ,X$43
+b6e1: BVC $50
+b6e3: LSR ,X$3a
+b733: STA ,X$eb
+b735: STA $42
+b737: INX
+b738: JSR $eb9e
+b73b: STA $41
+b73d: CMP $42
+b73f: BNE $0a
+b741: CMP #$00
+b743: BEQ $04
+b745: CMP #$ff
+b747: BNE $02
+b749: CLC
+b74a: RTS
+b74b: LDA $42
+b74d: STA $40
+b74f: SEC
+b750: RTS
+b751: CLC
+b752: RTS
+b753: SMB5 $97
+b755: SMB4 $98
+b757: JSR $af41
+b75a: PHP
+b75b: LDA (,zp)$5b
+b75d: RTI
+b75e: LDA (,zp)$ec
+b760: EOR (,X)$b0
+b762: ASL $b2
+b764: AND ,X$40
+b766: LDA (,zp)$ec
+b768: EOR (,X)$20
+b76a: STZ $20b4
+b76d: c2 !UNDEF
+b76e: LDA $57
+b770: SMB1 $28
+b772: RTS
+b773: LDA (,zp)$00
+b775: LSR $b2
+b777: BBR0 $47 → $b77a
+b77a: LDA $c9
+b77c: LSR ,X$f0
+b77e: TRB $46a1
+b781: JSR $a5a5
+b784: INC $46
+b786: BNE $02
+b788: INC $47
+b78a: LDA $47
+b78c: CMP #$12
+b78e: BNE $04
+b790: LDA $46
+b792: CMP #$38
+b794: BCC $e9
+b796: PLA
+b797: PLA
+b798: JMP $b47d
+b79b: INC $a5
+b79d: BNE $02
+b79f: INC $a6
+b7a1: JSR $a5c2
+b7a4: JSR $b583
+b7a7: LDA (,X)$46
+b7a9: JSR $a5c9
+b7ac: INC $46
+b7ae: BNE $02
+b7b0: INC $47
+b7b2: LDA $47
+b7b4: CMP #$12
+b7b6: BNE $04
+b7b8: LDA $46
+b7ba: CMP #$38
+b7bc: BCC $e3
+b7be: CLC
+b7bf: RTS
 b7c0: JSR $13ed
 b7c3: JSR $b862
 b7c6: JSR $b8a7
@@ -5164,10 +5624,22 @@ b834: STA $1274
 b837: LDA $87
 b839: STA $1273
 b83c: STA $1275
-b83f: 97 !UNDEF
-b840: ORA $0f
-b842: BBR3 $07 → $b845
-b845: TSB $b2
+b83f: SMB1 $05
+b841: BBR0 $4f → $b844
+b844: RMB6 $04
+b846: LDA (,zp)$00
+b848: DEC A
+b849: BRA $05
+b84b: SMB6 $04
+b84d: LDA (,zp)$c0
+b84f: DEC A
+b850: BBR2 $4d → $b853
+b853: BBR3 $4d → $b856
+b856: RMB7 $06
+b858: CMP (,zp)$01
+b85a: INY
+b85b: ORA (,Y)$a9
+b85d: ORA (,X)$8d
 b862: LDX #$46
 b864: LDA ,X$f7d6
 b867: STA ,X$4c
@@ -5203,7 +5675,7 @@ b8a0: BNE $02
 b8a2: INC $41
 b8a4: BRA $dc
 b8a6: RTS
-b8a7: BBR2 $9b → $b8aa
+b8a7: BBR3 $9b → $b8aa
 b8aa: LDA (,zp)$00
 b8ac: EOR #$b2
 b8ae: ORA (,Y)$40
@@ -5236,8 +5708,7 @@ b8df: STA $41
 b8e1: PLA
 b8e2: STA $40
 b8e4: LDX #$00
-b8e6: 57 !UNDEF
-b8e7: TYA
+b8e6: RMB5 $98
 b8e8: JSR $eba7
 b8eb: STA ,X$4c
 b8ed: INX
@@ -5287,8 +5758,7 @@ b943: STA $040a
 b946: c2 !UNDEF
 b947: BRA $0a
 b949: TSB $60
-b94b: 17 !UNDEF
-b94c: TYA
+b94b: RMB1 $98
 b94d: LDA (,zp)$11
 b94f: RTI
 b950: LDA (,zp)$00
@@ -5323,7 +5793,7 @@ b986: STA $43
 b988: SBC (,zp)$0a
 b98a: TSB $40
 b98c: 3b !UNDEF
-b98d: BBR6 $98 → $b990
+b98d: BBR7 $98 → $b990
 b990: LDA $040a
 b993: AND #$0f
 b995: CMP #$01
@@ -5340,16 +5810,82 @@ b9ad: AND #$0f
 b9af: ORA $44
 b9b1: JSR $aea1
 b9b4: JSR $b7c0
-b9b7: 17 !UNDEF
-b9b8: LDX #$27
-b9ba: LDX #$f2
+b9b7: RMB1 $a2
+b9b9: RMB2 $a2
+b9bb: SBC (,zp)$00
+b9bd: BPL $80
+b9bf: 03 !UNDEF
+b9c0: JSR $ba3f
+b9c3: c2 !UNDEF
+b9c4: BRA $0a
+b9c6: TSB $60
+b9c8: BBR0 $98 → $b9cb
+b9cb: LDA $040a
+b9ce: AND #$0f
+b9d0: CMP #$01
+b9d2: BEQ $03
+b9d4: JMP $b93e
+b9d7: LDA $42
+b9d9: PHA
+b9da: LDA $43
+b9dc: PHA
+b9dd: JSR $aea1
+b9e0: INX
+b9e1: JSR $aea7
+b9e4: PHA
+b9e5: INX
+b9e6: JSR $aea7
+b9e9: STA $43
+b9eb: PLA
+b9ec: STA $42
+b9ee: LDX #$00
+b9f0: LDA ,X$4c
+b9f2: JSR $acbf
+b9f5: INX
+b9f6: CPX #$47
+b9f8: BCC $f6
+b9fa: LDA #$00
+b9fc: STA $40
+b9fe: STA $41
+ba00: LDA #$00
+ba02: STA $46
+ba04: LDA #$10
+ba06: STA $47
+ba08: LDA (,X)$46
+ba0a: JSR $acbf
+ba0d: LDA $41
+ba0f: CMP #$02
+ba11: BNE $04
+ba13: LDA $40
+ba15: CMP #$37
+ba17: BEQ $0e
+ba19: INC $46
+ba1b: BNE $02
+ba1d: INC $47
+ba1f: INC $40
+ba21: BNE $02
+ba23: INC $41
+ba25: BRA $e1
+ba27: BBR0 $9a → $ba2a
+ba2a: JSR $acf0
+ba2d: PLA
+ba2e: STA $43
+ba30: PLA
+ba31: STA $42
+ba33: LDA #$81
+ba35: LDX #$00
+ba37: JSR $aea1
+ba3a: c2 !UNDEF
+ba3b: BRA $0a
+ba3d: TSB $60
 ba3f: e2 !UNDEF
 ba40: INY
 ba41: ORA (,Y)$01
-ba43: 17 !UNDEF
-ba44: JSR $ba7c
-ba47: JSR $db0c
-ba4a: JSR $db53
+ba43: RMB1 $20
+ba45: JMP (,X)$20ba
+ba48: TSB $20db
+ba4b: 53 !UNDEF
+ba4c: STP
 ba4d: JSR $db9c
 ba50: JSR $dac5
 ba53: LDA #$ff
@@ -5413,30 +5949,94 @@ bac9: LDA $01
 bacb: STA $44
 bacd: LDA $02
 bacf: STA $45
-bad1: RMB1 $04
+bad1: RMB2 $04
 bad3: BBR0 $98 → $bad6
 bad6: SMB4 $04
 bad8: SMB4 $00
 bada: BRA $02
-badc: RMB2 $04
-bade: d7 !UNDEF
-badf: TSB $4f
-bae1: LDA (,X)$04
-bae3: d7 !UNDEF
+badc: RMB4 $04
+bade: SMB5 $04
+bae0: BBR4 $a1 → $bae3
+bae3: SMB5 $00
+bae5: BRA $06
+bae7: CMP (,zp)$01
+bae9: CPY #$04
+baeb: RMB5 $00
+baed: BBS0 $4f → $baf0
+baf0: SMB6 $04
+baf2: SMB6 $00
+baf4: BRA $02
+baf6: RMB6 $04
+baf8: SMB0 $05
+bafa: RMB0 $01
+bafc: SMB1 $05
+bafe: RMB1 $01
+bb00: SMB2 $05
+bb02: BBR4 $a1 → $bb05
+bb05: SMB2 $01
+bb07: BRA $02
+bb09: RMB2 $01
+bb0b: SMB3 $05
+bb0d: RMB3 $01
+bb0f: SMB4 $05
+bb11: SMB4 $01
+bb13: SMB5 $05
+bb15: RMB5 $01
+bb17: SMB6 $05
+bb19: SMB6 $01
+bb1b: RMB7 $05
+bb1d: LDA #$00
+bb1f: STA $06
+bb21: LDA #$00
+bb23: BBR4 $a1 → $bb26
+bb26: STA $02
+bb28: LDA #$00
+bb2a: BBR4 $a1 → $bb2d
+bb2d: LDA #$0f
+bb2f: STA $0f6f
+bb32: LDA #$04
+bb34: STA $0440
+bb37: LDA #$00
+bb39: STA $0441
+bb3c: LDA #$e4
+bb3e: STA $09
+bb40: NOP
+bb41: NOP
+bb42: NOP
+bb43: NOP
+bb44: NOP
+bb45: NOP
+bb46: NOP
+bb47: NOP
+bb48: NOP
+bb49: NOP
+bb4a: NOP
+bb4b: NOP
+bb4c: NOP
+bb4d: NOP
+bb4e: NOP
+bb4f: NOP
+bb50: NOP
+bb51: BBR0 $09 → $bb54
+bb54: JSR $13c0
+bb57: CMP (,zp)$04
+bb59: SEI
+bb5a: TSB $27
+bb5c: ORA (,X)$57
 bcf9: STA $12d1
 bcfc: RTS
 bcfd: LDA #$01
 bcff: STA $137d
 bd02: CMP (,zp)$10
 bd04: ORA (,X)$0d
-bd06: RMB1 $93
+bd06: RMB2 $93
 bd08: LDA #$25
 bd0a: STA $124b
 bd0d: LDA #$bd
 bd0f: STA $124c
 bd12: SMB2 $93
 bd14: BRA $0e
-bd16: RMB1 $93
+bd16: RMB2 $93
 bd18: LDA #$95
 bd1a: STA $124b
 bd1d: LDA #$bb
@@ -5445,7 +6045,7 @@ bd22: SMB2 $93
 bd24: RTS
 bd25: LDA #$02
 bd27: STA $137d
-bd2a: RMB1 $93
+bd2a: RMB2 $93
 bd2c: CMP (,zp)$80
 bd2e: 02 !UNDEF
 bd2f: ORA $80d2
@@ -5455,7 +6055,7 @@ bd36: 03 !UNDEF
 bd37: STA $137d
 bd3a: SBC (,zp)$03
 bd3c: ORA $1601
-bd3f: RMB1 $93
+bd3f: RMB2 $93
 bd41: CMP (,zp)$01
 bd43: ASL $0e
 bd45: CMP (,zp)$01
@@ -5469,14 +6069,14 @@ bd54: ORA $a960
 bd57: TSB $8d
 bd59: ADC ,X$2713
 bd5c: a3 !UNDEF
-bd5d: BBR5 $a1 → $bd60
-bd60: RMB3 $a1
+bd5d: BBR6 $a1 → $bd60
+bd60: RMB6 $a1
 bd62: LDA $137f
 bd65: BEQ $0a
 bd67: CMP $0d00
 bd6a: BEQ $03
 bd6c: STA $0d00
-bd6f: RMB1 $93
+bd6f: RMB2 $93
 bd71: RTS
 bd72: LDA #$05
 bd74: STA $137d
@@ -5512,7 +6112,7 @@ bdb7: CMP (,zp)$02
 bdb9: 03 !UNDEF
 bdba: ORA $a24f
 bdbd: 02 !UNDEF
-bdbe: RMB2 $a2
+bdbe: RMB4 $a2
 bdc0: RTS
 bdc1: JSR $1426
 bdc4: LDA #$00
@@ -5536,10 +6136,9 @@ bde8: JSR $a4d8
 bdeb: BBS7 $01 → $bdee
 bdee: JMP $be37
 bdf1: BBR1 $a2 → $bdf4
-bdf4: 17 !UNDEF
-bdf5: LDX #$2f
-bdf7: LDX #$02
-bdf9: RMB1 $a2
+bdf4: RMB1 $a2
+bdf6: BBR2 $a2 → $bdf9
+bdf9: RMB2 $a2
 bdfb: c2 !UNDEF
 bdfc: 02 !UNDEF
 bdfd: ORA (,X)$0d
@@ -5571,14 +6170,15 @@ be30: ORA (,X)$0d
 be32: CMP (,zp)$02
 be34: 03 !UNDEF
 be35: ORA $2060
-be38: 57 !UNDEF
-be39: LDX ,Y$6060
+be38: RMB5 $be
+be3a: RTS
+be3b: RTS
 be3c: BBS7 $01 → $be3f
 be3f: BRA $16
 be41: LDA $137d
 be44: CMP #$00
 be46: BNE $0e
-be48: RMB1 $93
+be48: RMB2 $93
 be4a: LDA #$fd
 be4c: STA $124b
 be4f: LDA #$bc
@@ -5595,7 +6195,7 @@ be64: STA $1387
 be67: JSR $d564
 be6a: LDA #$00
 be6c: STA $137d
-be6f: RMB1 $93
+be6f: RMB2 $93
 be71: LDA #$95
 be73: STA $124b
 be76: LDA #$bb
@@ -5700,7 +6300,7 @@ bf34: LDA $d2
 bf36: CMP #$ff
 bf38: BEQ $02
 bf3a: INC $d2
-bf3c: BBR5 $a3 → $bf3f
+bf3c: BBR6 $a3 → $bf3f
 bf3f: LDA $d4
 bf41: CMP #$ff
 bf43: BEQ $02
@@ -5723,8 +6323,8 @@ bf62: ASL $3801
 bf65: e2 !UNDEF
 bf66: ASL $0e
 bf68: BRA $10
-bf6a: 37 !UNDEF
-bf6b: BBS1 $a9 → $bf6e
+bf6a: RMB3 $9f
+bf6c: LDA #$e9
 bf6e: STA $124e
 bf71: LDA #$c2
 bf73: STA $124f
@@ -5740,8 +6340,8 @@ bf86: LDA #$c3
 bf88: STA $124f
 bf8b: SMB3 $9f
 bf8d: BRA $0e
-bf8f: 37 !UNDEF
-bf90: BBS1 $a9 → $bf93
+bf8f: RMB3 $9f
+bf91: LDA #$8a
 bf93: STA $124e
 bf96: LDA #$c9
 bf98: STA $124f
@@ -5944,7 +6544,7 @@ c146: LDA $137f
 c149: BEQ $07
 c14b: CMP $0d00
 c14e: BEQ $02
-c150: SMB5 $a1
+c150: SMB6 $a1
 c152: e2 !UNDEF
 c153: ASL A
 c154: ORA $0d02
@@ -5965,7 +6565,7 @@ c172: STA $d4
 c174: BBS2 $a2 → $c177
 c177: JMP $c249
 c17a: BBS6 $a3 → $c17d
-c17d: SMB5 $a3
+c17d: SMB6 $a3
 c17f: JSR $c2da
 c182: LDA $0ffd
 c185: STA $40
@@ -6129,8 +6729,8 @@ c2e1: BNE $02
 c2e3: LDA #$05
 c2e5: STA $13b2
 c2e8: RTS
-c2e9: 37 !UNDEF
-c2ea: BBS1 $d2 → $c2ed
+c2e9: RMB3 $9f
+c2eb: CMP (,zp)$01
 c2ed: ASL $0e
 c2ef: CMP (,zp)$10
 c2f1: ASL $0e
@@ -6145,9 +6745,8 @@ c301: ASL $a90e
 c304: EOR (,X)$80
 c306: 3b !UNDEF
 c307: JSR $1417
-c30a: 17 !UNDEF
-c30b: LDX #$20
-c30d: LDY ,X$d8
+c30a: RMB1 $a2
+c30c: JSR $d8b4
 c30f: c2 !UNDEF
 c310: BRA $16
 c312: ASL $01d2
@@ -6182,8 +6781,8 @@ c350: RTI
 c351: LDA (,zp)$12
 c353: EOR (,X)$07
 c355: LDY #$20
-c3b4: 37 !UNDEF
-c3b5: BBS1 $d2 → $c3b8
+c3b4: RMB3 $9f
+c3b6: CMP (,zp)$01
 c3b8: ASL $0e
 c3ba: RTS
 c3bb: e2 !UNDEF
@@ -6224,8 +6823,8 @@ c404: RTI
 c405: LDA (,zp)$ed
 c407: EOR (,X)$80
 c409: CMP ,X$9f
-c40b: BBR3 $03 → $c40e
-c40e: BBR3 $1d → $c411
+c40b: BBR4 $03 → $c40e
+c40e: BBR4 $1d → $c411
 c411: EOR (,X)$c9
 c413: INC $04d0
 c416: LDA $40
@@ -6245,7 +6844,7 @@ c431: BNE $04
 c433: LDA $40
 c435: CMP #$8c
 c437: BNE $08
-c439: BBR6 $4f → $c43c
+c439: BBR7 $4f → $c43c
 c43c: LDA #$3a
 c43e: JMP $c6fd
 c441: LDA $41
@@ -6254,7 +6853,7 @@ c445: BNE $04
 c447: LDA $40
 c449: CMP #$8d
 c44b: BNE $08
-c44d: BBR6 $4f → $c450
+c44d: BBR7 $4f → $c450
 c450: LDA #$02
 c452: JMP $c6fd
 c455: LDA $41
@@ -6264,12 +6863,12 @@ c45b: LDA $40
 c45d: CMP #$da
 c45f: BNE $0f
 c461: LDA (,X)$40
-c463: BBR4 $4f → $c466
+c463: BBR5 $4f → $c466
 c466: AND #$bf
-c468: BBR5 $4f → $c46b
+c468: BBR6 $4f → $c46b
 c46b: ORA #$20
 c46d: JMP $c6fd
-c470: BBR4 $4f → $c473
+c470: BBR5 $4f → $c473
 c473: LDA $41
 c475: CMP #$ec
 c477: BNE $04
@@ -6303,15 +6902,15 @@ c4b0: JMP $c508
 c4b3: JSR $c853
 c4b6: BCC $03
 c4b8: JMP $c508
-c4bb: BBR3 $4f → $c4be
+c4bb: BBR4 $4f → $c4be
 c4be: BBS2 $4f → $c4c1
 c4c1: BBS3 $4f → $c4c4
 c4c4: JMP $c6e9
 c4c7: JMP $c523
-c4ca: BBR1 $4f → $c4cd
+c4ca: BBR2 $4f → $c4cd
 c4cd: LDA #$e8
 c4cf: BRA $3a
-c4d1: BBR2 $4f → $c4d4
+c4d1: BBR3 $4f → $c4d4
 c4d4: BBS4 $4f → $c4d7
 c4d7: LDA #$0a
 c4d9: BRA $2d
@@ -6322,10 +6921,10 @@ c4e2: LDA #$ab
 c4e4: BRA $25
 c4e6: LDA #$c2
 c4e8: BRA $21
-c4ea: BBR1 $4f → $c4ed
+c4ea: BBR2 $4f → $c4ed
 c4ed: LDA #$00
 c4ef: BRA $17
-c4f1: BBR2 $4f → $c4f4
+c4f1: BBR3 $4f → $c4f4
 c4f4: BBS4 $4f → $c4f7
 c4f7: LDA #$01
 c4f9: BRA $0d
@@ -6375,10 +6974,10 @@ c557: BNE $04
 c559: LDA $40
 c55b: CMP #$ea
 c55d: BNE $27
-c55f: BBR1 $4f → $c562
+c55f: BBR2 $4f → $c562
 c562: LDA #$46
 c564: BRA $17
-c566: BBR2 $4f → $c569
+c566: BBR3 $4f → $c569
 c569: BBS4 $4f → $c56c
 c56c: LDA #$28
 c56e: BRA $b0
@@ -6409,17 +7008,17 @@ c5a3: BNE $04
 c5a5: LDA $40
 c5a7: CMP #$ee
 c5a9: BNE $18
-c5ab: BBR1 $4f → $c5ae
+c5ab: BBR2 $4f → $c5ae
 c5ae: LDA (,zp)$ef
 c5b0: RTI
 c5b1: LDA (,zp)$ec
 c5b3: EOR (,X)$4c
 c5b5: BBS5 $c3 → $c5b8
-c5b8: BBR3 $09 → $c5bb
+c5b8: BBR4 $09 → $c5bb
 c5bb: BIT $b240
 c5be: SBC $4c41
 c5c1: BBS5 $c3 → $c5c4
-c5c4: BBR3 $2d → $c5c7
+c5c4: BBR4 $2d → $c5c7
 c5c7: EOR (,X)$c9
 c5c9: SBC $04d0
 c5cc: LDA $40
@@ -6446,7 +7045,7 @@ c5f6: SBC $04d0
 c5f9: LDA $40
 c5fb: CMP #$3c
 c5fd: BNE $0b
-c5ff: BBR2 $4f → $c602
+c5ff: BBR3 $4f → $c602
 c602: BBS4 $4f → $c605
 c605: LDA #$04
 c607: JMP $c6fd
@@ -6456,7 +7055,7 @@ c60e: BNE $04
 c610: LDA $40
 c612: CMP #$4b
 c614: BNE $0c
-c616: BBR2 $4f → $c619
+c616: BBR3 $4f → $c619
 c619: LDA (,zp)$61
 c61b: RTI
 c61c: LDA (,zp)$ed
@@ -6467,7 +7066,7 @@ c625: SBC $04d0
 c628: LDA $40
 c62a: CMP #$85
 c62c: BNE $0c
-c62e: BBR2 $4f → $c631
+c62e: BBR3 $4f → $c631
 c631: LDA (,zp)$fc
 c633: RTI
 c634: LDA (,zp)$ed
@@ -6490,13 +7089,13 @@ c658: LDA $40
 c65a: CMP #$77
 c65c: BNE $17
 c65e: BBS4 $4f → $c661
-c661: BBR2 $4f → $c664
+c661: BBR3 $4f → $c664
 c664: LDA (,zp)$85
 c666: RTI
 c667: LDA (,zp)$ed
 c669: EOR (,X)$4c
 c66b: BBS5 $c3 → $c66e
-c66e: BBR3 $05 → $c671
+c66e: BBR4 $05 → $c671
 c671: ORA $fd4c
 c674: DEC $a5
 c676: EOR (,X)$c9
@@ -6504,11 +7103,11 @@ c678: SBC $04d0
 c67b: LDA $40
 c67d: CMP #$7b
 c67f: BNE $0b
-c681: BBR3 $4f → $c684
-c684: BBR2 $4f → $c687
+c681: BBR4 $4f → $c684
+c684: BBR3 $4f → $c687
 c687: LDA #$02
 c689: JMP $c6fd
-c68c: BBR2 $4f → $c68f
+c68c: BBR3 $4f → $c68f
 c68f: LDA $41
 c691: CMP #$ed
 c693: BNE $04
@@ -6520,7 +7119,7 @@ c69d: RTI
 c69e: LDA (,zp)$ed
 c6a0: EOR (,X)$4c
 c6a2: BBS5 $c3 → $c6a5
-c6a5: BBR3 $15 → $c6a8
+c6a5: BBR4 $15 → $c6a8
 c6a8: EOR (,X)$c9
 c6aa: SBC $04d0
 c6ad: LDA $40
@@ -6531,7 +7130,7 @@ c6b5: RTI
 c6b6: LDA (,zp)$ed
 c6b8: EOR (,X)$4c
 c6ba: BBS5 $c3 → $c6bd
-c6bd: BBR3 $2a → $c6c0
+c6bd: BBR4 $2a → $c6c0
 c6c0: EOR (,X)$c9
 c6c2: SBC $04d0
 c6c5: LDA $40
@@ -6555,7 +7154,7 @@ c6e7: BRA $14
 c6e9: JSR $c930
 c6ec: BCS $0f
 c6ee: JSR $1435
-c6f1: BBR5 $98 → $c6f4
+c6f1: BBR6 $98 → $c6f4
 c6f4: PHX
 c6f5: JSR $eb95
 c6f8: PLX
@@ -6581,10 +7180,10 @@ c722: BNE $12
 c724: LDA $1382
 c727: BNE $0d
 c729: JSR $c956
-c72c: 37 !UNDEF
-c72d: BBS1 $d2 → $c730
+c72c: RMB3 $9f
+c72e: CMP (,zp)$01
 c730: ASL $0e
-c732: RMB3 $98
+c732: RMB6 $98
 c734: BRA $0d
 c736: LDA $40
 c738: STA $1380
@@ -6751,7 +7350,7 @@ c880: LDA (,X)$40
 c882: ORA #$02
 c884: SEC
 c885: RTS
-c886: BBR1 $92 → $c889
+c886: BBR2 $92 → $c889
 c889: LDA $41
 c88b: CMP #$ed
 c88d: BNE $04
@@ -6789,7 +7388,7 @@ c8cc: BNE $04
 c8ce: LDA $40
 c8d0: CMP #$1e
 c8d2: BEQ $a6
-c8d4: BBR2 $92 → $c8d7
+c8d4: BBR3 $92 → $c8d7
 c8d7: LDA $41
 c8d9: CMP #$ed
 c8db: BNE $04
@@ -6811,7 +7410,7 @@ c8f9: BNE $03
 c8fb: JMP $c87a
 c8fe: CLC
 c8ff: RTS
-c900: BBR2 $9b → $c903
+c900: BBR3 $9b → $c903
 c903: LDX #$00
 c905: LDA (,zp)$2c
 c907: RTI
@@ -6870,6 +7469,19 @@ c960: ASL $01d2
 c963: ASL $600e
 c966: CMP (,zp)$04
 c968: ASL $a90e
+c98a: BBR0 $a0 → $c98d
+c98d: RMB0 $a0
+c98f: BBR5 $a2 → $c992
+c992: JSR $1450
+c995: JSR $1250
+c998: BBS3 $a2 → $c99b
+c99b: RMB5 $a2
+c99d: RMB3 $9f
+c99f: BBR2 $9f → $c9a2
+c9a2: JSR $c966
+c9a5: CMP (,zp)$01
+c9a7: ASL $0e
+c9a9: RTS
 c9aa: LDA #$00
 c9ac: STA $41
 c9ae: LDY #$09
@@ -6899,8 +7511,7 @@ c9d9: ASL $a3f7
 c9dc: e2 !UNDEF
 c9dd: LSR $040e
 c9e0: 02 !UNDEF
-c9e1: 77 !UNDEF
-c9e2: a3 !UNDEF
+c9e1: RMB7 $a3
 c9e3: CMP (,zp)$01
 c9e5: LSR $280e
 c9e8: RTS
@@ -6918,8 +7529,8 @@ c9fe: PLX
 c9ff: RTS
 ca00: JSR $1438
 ca03: RMB0 $9f
-ca05: 17 !UNDEF
-ca06: BBS1 $27 → $ca09
+ca05: RMB1 $9f
+ca07: RMB2 $9f
 ca09: LDX #$06
 ca0b: LDA (,Y)$40
 ca0d: STA $46
@@ -6997,7 +7608,7 @@ ca95: ASL A
 ca96: TAX
 ca97: JMP (,X)$ecab
 ca9a: CLC
-ca9b: BBR3 $a1 → $ca9e
+ca9b: BBR4 $a1 → $ca9e
 ca9e: SEC
 ca9f: ROL $1388
 caa2: CLC
@@ -7019,26 +7630,26 @@ cac0: BEQ $bc
 cac2: CMP #$04
 cac4: BNE $b8
 cac6: CLC
-cac7: BBR6 $a2 → $caca
+cac7: BBR7 $a2 → $caca
 caca: SEC
 cacb: BRA $1f
 cacd: LDA (,Y)$40
 cacf: ASL A
 cad0: BCC $07
 cad2: CLC
-cad3: BBR3 $a0 → $cad6
+cad3: BBR4 $a0 → $cad6
 cad6: SEC
 cad7: BRA $13
 cad9: CLC
-cada: BBR4 $a0 → $cadd
+cada: BBR5 $a0 → $cadd
 cadd: SEC
 cade: BRA $0c
 cae0: CLC
-cae1: BBR2 $a0 → $cae4
+cae1: BBR3 $a0 → $cae4
 cae4: SEC
 cae5: BRA $05
 cae7: CLC
-cae8: BBR1 $a0 → $caeb
+cae8: BBR2 $a0 → $caeb
 caeb: SEC
 caec: ROL $1388
 caef: LDA (,zp)$88
@@ -7073,7 +7684,7 @@ cb25: LDX #$02
 cb27: LDA (,Y)$40
 cb29: CMP #$01
 cb2b: BNE $04
-cb2d: RMB2 $a1
+cb2d: RMB4 $a1
 cb2f: BRA $46
 cb31: CMP #$00
 cb33: BEQ $42
@@ -7099,20 +7710,18 @@ cb58: CMP #$03
 cb5a: BEQ $dd
 cb5c: CMP #$04
 cb5e: BNE $d9
-cb60: 77 !UNDEF
-cb61: LDX #$80
-cb63: 13 !UNDEF
+cb60: RMB7 $a2
+cb62: BRA $13
 cb64: LDA (,Y)$40
 cb66: ASL A
 cb67: BCC $04
-cb69: RMB2 $a0
+cb69: RMB4 $a0
 cb6b: BRA $0a
-cb6d: 57 !UNDEF
-cb6e: LDY #$80
-cb70: ASL $37
-cb72: LDY #$80
-cb74: 02 !UNDEF
-cb75: RMB1 $a0
+cb6d: RMB5 $a0
+cb6f: BRA $06
+cb71: RMB3 $a0
+cb73: BRA $02
+cb75: RMB2 $a0
 cb77: SMB2 $9f
 cb79: RTS
 cb7a: LDA $137d
@@ -7180,7 +7789,7 @@ cbf5: BPL $4e
 cbf7: ASL $a2f7
 cbfa: CMP (,zp)$02
 cbfc: LSR $800e
-cbff: BBR1 $b1 → $cc02
+cbff: BBR2 $b1 → $cc02
 cc02: ASL A
 cc03: BCC $0c
 cc05: c2 !UNDEF
@@ -7190,9 +7799,8 @@ cc0b: CMP (,zp)$02
 cc0d: ROL $800e
 cc10: ASL ,X$10c2
 cc13: ROL $0e
-cc15: d7 !UNDEF
-cc16: LDY #$d2
-cc18: 02 !UNDEF
+cc15: SMB5 $a0
+cc17: CMP (,zp)$02
 cc19: ROL $0e
 cc1b: BRA $12
 cc1d: c2 !UNDEF
@@ -7216,7 +7824,7 @@ cc41: CMP #$80
 cc43: BCS $2b
 cc45: STA $137f
 cc48: BNE $10
-cc4a: RMB1 $93
+cc4a: RMB2 $93
 cc4c: LDA #$35
 cc4e: STA $124b
 cc51: LDA #$bd
@@ -7225,7 +7833,7 @@ cc56: SMB2 $93
 cc58: BRA $13
 cc5a: LDA #$04
 cc5c: STA $137d
-cc5f: RMB1 $93
+cc5f: RMB2 $93
 cc61: LDA #$56
 cc63: STA $124b
 cc66: LDA #$bd
@@ -7289,14 +7897,14 @@ cce3: c2 !UNDEF
 cce4: 44 !UNDEF
 cce5: LDA (,zp)$01
 cce7: EOR $2f
-cce9: BBR3 $08 → $ccec
+cce9: BBR4 $08 → $ccec
 ccec: INX
 cced: 44 !UNDEF
 ccee: LDA (,zp)$00
 ccf0: EOR $80
 ccf2: ORA ,X$4f3f
 ccf5: ORA (,Y)$cf
-ccf7: BBR3 $07 → $ccfa
+ccf7: BBR4 $07 → $ccfa
 ccfa: ASL A
 ccfb: 44 !UNDEF
 ccfc: LDA (,zp)$01
@@ -7328,7 +7936,7 @@ cd2e: RTS
 cd2f: ASL A
 cd30: TAX
 cd31: PHX
-cd32: BBR2 $9b → $cd35
+cd32: BBR3 $9b → $cd35
 cd35: LDA (,zp)$32
 cd37: RTI
 cd38: LDA (,zp)$00
@@ -7347,7 +7955,7 @@ cd4f: LDA $42
 cd51: STA $40
 cd53: LDA $43
 cd55: STA $41
-cd57: SMB5 $98
+cd57: SMB6 $98
 cd59: JSR $eb95
 cd5c: BRA $0d
 cd5e: PLX
@@ -7359,7 +7967,7 @@ cd69: LDA (,X)$40
 cd6b: STA $44
 cd6d: LDA (,zp)$00
 cd6f: EOR $60
-cd71: BBR2 $9b → $cd74
+cd71: BBR3 $9b → $cd74
 cd74: LDA (,zp)$40
 cd76: RTI
 cd77: LDA (,zp)$00
@@ -7396,7 +8004,7 @@ cdb3: RTI
 cdb4: LDA (,zp)$13
 cdb6: EOR (,X)$80
 cdb8: ASL $b2
-cdba: BBR1 $40 → $cdbd
+cdba: BBR2 $40 → $cdbd
 cdbd: SBC (,zp)$41
 cdbf: LDA (,zp)$01
 cdc1: 44 !UNDEF
@@ -7437,12 +8045,12 @@ ce14: SMB0 $9f
 ce16: RTS
 ce17: CMP #$00
 ce19: BEQ $10
-ce1b: BBR1 $4f → $ce1e
+ce1b: BBR2 $4f → $ce1e
 ce1e: CMP #$02
 ce20: BNE $09
 ce22: LDA #$03
 ce24: BRA $05
-ce26: BBR2 $4f → $ce29
+ce26: BBR3 $4f → $ce29
 ce29: BIT #$01
 ce2b: RTS
 ce2c: LDX #$02
@@ -7502,7 +8110,7 @@ ce90: BNE $38
 ce92: LDX #$02
 ce94: LDA (,Y)$40
 ce96: BNE $10
-ce98: RMB1 $93
+ce98: RMB2 $93
 ce9a: LDA #$56
 ce9c: STA $124b
 ce9f: LDA #$bd
@@ -7517,7 +8125,7 @@ ceb0: CPX #$01
 ceb2: BCC $f6
 ceb4: BRA $14
 ceb6: STA $1384
-ceb9: RMB1 $93
+ceb9: RMB2 $93
 cebb: LDA #$72
 cebd: STA $124b
 cec0: LDA #$bd
@@ -7536,7 +8144,7 @@ ced7: SEI
 ced8: 44 !UNDEF
 ced9: LDA (,zp)$00
 cedb: EOR $7f
-cedd: BBR3 $06 → $cee0
+cedd: BBR4 $06 → $cee0
 cee0: DEC A
 cee1: 44 !UNDEF
 cee2: LDA (,zp)$02
@@ -7622,16 +8230,15 @@ cf78: INX
 cf79: LDA (,Y)$42
 cf7b: STA $41
 cf7d: RTS
-cf7e: 57 !UNDEF
-cf7f: LDX #$a2
-cf81: ORA (,X)$b1
-cf83: 42 !UNDEF
+cf7e: RMB5 $a2
+cf80: LDX #$01
+cf82: LDA (,Y)$42
 cf84: STA $1251
 cf87: INX
 cf88: LDA (,Y)$42
 cf8a: STA $1252
-cf8d: 97 !UNDEF
-cf8e: BBS1 $d7 → $cf91
+cf8d: SMB1 $9f
+cf8f: SMB5 $a2
 cf91: JMP $cff8
 cf94: LDX #$01
 cf96: LDA (,Y)$42
@@ -7658,9 +8265,8 @@ cfbc: STA $13af
 cfbf: INX
 cfc0: LDA (,Y)$40
 cfc2: STA $13b0
-cfc5: 57 !UNDEF
-cfc6: LDX #$a9
-cfc8: PLP
+cfc5: RMB5 $a2
+cfc7: LDA #$28
 cfc9: STA $1251
 cfcc: LDA #$d1
 cfce: STA $1252
@@ -7806,10 +8412,24 @@ d2ce: RTI
 d2cf: LDA (,zp)$13
 d2d1: EOR (,X)$b2
 d2d3: BIT ,X$b244
-d36d: 77 !UNDEF
-d36e: STA ,X$d7ad
-d371: ORA (,zp)$29
-d373: RTI
+d34b: LDA $12fd
+d34e: CMP #$04
+d350: BEQ $01
+d352: RTS
+d353: LDA $1322
+d356: STA $12a2
+d359: LDA $1323
+d35c: STA $12a3
+d35f: LDX #$24
+d361: LDA ,X$12fd
+d364: STA ,X$12d6
+d367: DEX
+d368: BPL $f7
+d36a: SMB7 $9d
+d36c: RTS
+d36d: RMB7 $9d
+d36f: LDA $12d7
+d372: AND #$40
 d374: BNE $0a
 d376: LDX #$1f
 d378: LDA #$00
@@ -7869,18 +8489,16 @@ d3ef: JSR $eb1a
 d3f2: STA ,X$1282
 d3f5: INX
 d3f6: BRA $f2
-d3f8: d7 !UNDEF
-d3f9: BBS1 $80 → $d3fc
+d3f8: SMB5 $9f
+d3fa: BRA $5d
 d3fc: LDA $98
 d3fe: AND #$02
 d400: STA $49
-d402: 17 !UNDEF
-d403: TYA
+d402: RMB1 $98
 d404: LDA $12d7
 d407: AND #$10
 d409: BEQ $02
-d40b: 97 !UNDEF
-d40c: TYA
+d40b: SMB1 $98
 d40d: LDA $12d7
 d410: AND #$40
 d412: BEQ $25
@@ -7901,8 +8519,7 @@ d432: AND #$fd
 d434: ORA $49
 d436: STA $98
 d438: RTS
-d439: 57 !UNDEF
-d43a: TYA
+d439: RMB5 $98
 d43b: CPX $12d8
 d43e: BEQ $09
 d440: JSR $b106
@@ -7914,13 +8531,13 @@ d44c: LDA $98
 d44e: AND #$fd
 d450: ORA $49
 d452: STA $98
-d454: d7 !UNDEF
-d455: BBS1 $80 → $d458
+d454: SMB5 $9f
+d456: BRA $01
 d458: RTS
 d459: SBC (,zp)$4e
 d45b: ASL $1501
-d45e: 57 !UNDEF
-d45f: BBS1 $a2 → $d462
+d45e: RMB5 $9f
+d460: LDX #$22
 d462: LDA ,X$1281
 d465: STA ,X$138c
 d468: DEX
@@ -7939,12 +8556,12 @@ d481: LDA ,X$12fd
 d484: STA ,X$12d6
 d487: DEX
 d488: BPL $f7
-d48a: f7 !UNDEF
-d48b: STZ $a560
-d48e: TYA
+d48a: SMB7 $9c
+d48c: RTS
+d48d: LDA $98
 d48f: AND #$10
 d491: STA $49
-d493: RMB2 $98
+d493: RMB4 $98
 d495: LDA $12d7
 d498: AND #$40
 d49a: BEQ $02
@@ -8010,11 +8627,11 @@ d52d: AND #$ef
 d52f: ORA $49
 d531: STA $98
 d533: JSR $ae2b
-d536: 77 !UNDEF
-d537: STZ $f260
-d53a: LSR $010e
-d53d: ORA ,X$47
-d53f: a3 !UNDEF
+d536: RMB7 $9c
+d538: RTS
+d539: SBC (,zp)$4e
+d53b: ASL $1501
+d53e: RMB4 $a3
 d540: LDX #$20
 d542: LDA ,X$12a4
 d545: STA ,X$138c
@@ -8035,7 +8652,7 @@ d560: 03 !UNDEF
 d561: SMB0 $9f
 d563: RTS
 d564: JSR $1486
-d567: BBR5 $93 → $d56a
+d567: BBR6 $93 → $d56a
 d56a: RTS
 d56b: LDA $137d
 d56e: CMP #$05
@@ -8046,9 +8663,8 @@ d576: BNE $03
 d578: JMP $d5a1
 d57b: BBS1 $a2 → $d57e
 d57e: JSR $143b
-d581: 97 !UNDEF
-d582: LDX #$ad
-d584: SMB0 $13
+d581: SMB1 $a2
+d583: LDA $1387
 d586: JSR $d8b4
 d589: LDX $12d0
 d58c: JSR $da8c
@@ -8062,9 +8678,8 @@ d59c: JSR $d8b4
 d59f: BRA $0b
 d5a1: BBR1 $a2 → $d5a4
 d5a4: JSR $dab2
-d5a7: 17 !UNDEF
-d5a8: LDX #$20
-d5aa: STY ,X$d8
+d5a7: RMB1 $a2
+d5a9: JSR $d894
 d5ac: LDA $1386
 d5af: BNE $03
 d5b1: JMP $d5e8
@@ -8091,9 +8706,9 @@ d5df: LDA $1386
 d5e2: CMP $d7
 d5e4: BEQ $13
 d5e6: BRA $d2
-d5e8: BBR1 $a2 → $d5eb
-d5eb: RMB1 $a2
-d5ed: RMB3 $a3
+d5e8: BBR2 $a2 → $d5eb
+d5eb: RMB2 $a2
+d5ed: RMB6 $a3
 d5ef: LDA (,zp)$00
 d5f1: d4 !UNDEF
 d5f2: JSR $d8a4
@@ -8105,10 +8720,9 @@ d5fc: RTI
 d5fd: LDA (,zp)$f6
 d5ff: EOR (,X)$b2
 d601: ROL ,X$b244
-d64a: d7 !UNDEF
-d64b: LDX #$4c
-d64d: SED
-d64e: BBS4 $b2 → $d651
+d64a: SMB5 $a2
+d64c: JMP $cff8
+d64f: LDA (,zp)$60
 d651: RTI
 d652: LDA (,zp)$00
 d654: EOR (,X)$80
@@ -8130,7 +8744,7 @@ d670: BVS $40
 d672: LDA (,zp)$00
 d674: EOR (,X)$a9
 d676: ORA (,X)$8d
-d678: BBR5 $02 → $d67b
+d678: BBR6 $02 → $d67b
 d6b2: ORA (,zp)$10
 d6b4: 02 !UNDEF
 d6b5: 0b !UNDEF
@@ -8470,8 +9084,8 @@ daba: LDA #$44
 dabc: STA $b1
 dabe: LDA #$00
 dac0: STA $b2
-dac2: 37 !UNDEF
-dac3: STY ,X$60
+dac2: RMB3 $94
+dac4: RTS
 dac5: e2 !UNDEF
 dac6: INY
 dac7: ORA (,Y)$08
@@ -8510,10 +9124,10 @@ db52: RTS
 db53: e2 !UNDEF
 db54: INY
 db55: ORA (,Y)$10
-db57: 17 !UNDEF
-db58: SBC (,zp)$16
-db5a: BPL $80
-db5c: ORA (,zp)$e2
+db57: RMB1 $f2
+db59: ASL ,X$10
+db5b: BRA $12
+db5d: e2 !UNDEF
 db5e: ORA ,X$200f
 db61: ORA $1dad
 db64: BBR0 $29 → $db67
@@ -8814,7 +9428,7 @@ ddad: ORA $e2
 ddaf: ROL A
 ddb0: BBR0 $10 → $ddb3
 ddb3: JSR $dffe
-ddb6: BBR1 $94 → $ddb9
+ddb6: BBR2 $94 → $ddb9
 ddb9: c2 !UNDEF
 ddba: BRA $1e
 ddbc: BBR0 $20 → $ddbf
@@ -8842,7 +9456,7 @@ dde9: ORA $e2
 ddeb: 2b !UNDEF
 ddec: BBR0 $10 → $ddef
 ddef: JSR $dffe
-ddf2: BBR1 $94 → $ddf5
+ddf2: BBR2 $94 → $ddf5
 ddf5: c2 !UNDEF
 ddf6: BRA $1f
 ddf8: BBR0 $20 → $ddfb
@@ -8882,12 +9496,12 @@ de42: RTI
 de43: ASL $d2
 de45: BRA $1f
 de47: BBR0 $80 → $de4a
-de4a: BBR1 $94 → $de4d
+de4a: BBR2 $94 → $de4d
 de4d: c2 !UNDEF
 de4e: BRA $1f
 de50: BBR0 $20 → $de53
 de53: 13 !UNDEF
-de54: BBR3 $4f → $de57
+de54: BBR4 $4f → $de57
 de57: SBC (,zp)$14
 de59: BPL $80
 de5b: CLC
@@ -8901,9 +9515,9 @@ de69: PHP
 de6a: c2 !UNDEF
 de6b: BRA $26
 de6d: BBR0 $c2 → $de70
-de70: RMB1 $0f
+de70: RMB2 $0f
 de72: BRA $72
-de74: BBR6 $9a → $de77
+de74: BBR7 $9a → $de77
 de77: BBR1 $a2 → $de7a
 de7a: BBS2 $a2 → $de7d
 de7d: LDA #$01
@@ -8949,13 +9563,13 @@ decf: BPL $09
 ded1: c2 !UNDEF
 ded2: BRA $26
 ded4: BBR0 $c2 → $ded7
-ded7: RMB1 $0f
+ded7: RMB2 $0f
 ded9: RTS
 deda: CMP (,zp)$80
 dedc: LDY $d208
 dedf: BRA $26
 dee1: BBR0 $d2 → $dee4
-dee4: RMB1 $0f
+dee4: RMB2 $0f
 dee6: RTS
 dee7: LDA $127b
 deea: CMP $80
@@ -8990,8 +9604,8 @@ df21: SBC (,zp)$c8
 df23: ORA (,Y)$20
 df25: ORA #$d2
 df27: RTI
-df28: 37 !UNDEF
-df29: BBR0 $d2 → $df2c
+df28: RMB3 $0f
+df2a: CMP (,zp)$40
 df2c: AND ,Y$600f
 df2f: CMP (,zp)$80
 df31: LDY $a908
@@ -9045,7 +9659,7 @@ dff7: PHP
 dff8: LDA #$00
 dffa: STA $084b
 dffd: RTS
-dffe: BBR1 $94 → $e001
+dffe: BBR2 $94 → $e001
 e001: LDA $1016
 e004: AND #$0f
 e006: STA $40
@@ -9112,7 +9726,7 @@ e07c: LDA #$b6
 e07e: SEC
 e07f: SBC #$05
 e081: RTS
-e082: BBR1 $a3 → $e085
+e082: BBR2 $a3 → $e085
 e085: STA $40
 e087: TYA
 e088: JSR $e06e
@@ -9122,7 +9736,7 @@ e08f: CMP #$b1
 e091: BCS $02
 e093: LDA #$b1
 e095: RTS
-e096: BBR1 $a3 → $e099
+e096: BBR2 $a3 → $e099
 e099: BBS2 $4f → $e09c
 e09c: CPY $61
 e09e: BNE $02
@@ -9136,11 +9750,11 @@ e0ad: 03 !UNDEF
 e0ae: JMP $e129
 e0b1: BBS5 $94 → $e0b4
 e0b4: RTS
-e0b5: BBR3 $4d → $e0b8
+e0b5: BBR4 $4d → $e0b8
 e0b8: BBR0 $9d → $e0bb
 e0bb: SBC (,zp)$1a
 e0bd: BBR0 $80 → $e0c0
-e0c0: RMB1 $9a
+e0c0: RMB2 $9a
 e0c2: BRA $02
 e0c4: SMB2 $9a
 e0c6: c2 !UNDEF
@@ -9167,7 +9781,7 @@ e0f3: JSR $e167
 e0f6: RTS
 e0f7: JSR $e174
 e0fa: RTS
-e0fb: BBR3 $4f → $e0fe
+e0fb: BBR4 $4f → $e0fe
 e0fe: SBC (,zp)$14
 e100: BPL $80
 e102: RMB0 $f2
@@ -9187,7 +9801,7 @@ e121: RTS
 e122: JSR $e18d
 e125: JSR $e174
 e128: RTS
-e129: BBR3 $4f → $e12c
+e129: BBR4 $4f → $e12c
 e12c: SBC (,zp)$14
 e12e: BPL $80
 e130: RMB0 $f2
@@ -9212,7 +9826,7 @@ e156: e2 !UNDEF
 e157: 13 !UNDEF
 e158: BPL $02
 e15a: ORA $20
-e15c: RMB3 $e1
+e15c: RMB6 $e1
 e15e: BRA $03
 e160: JSR $e174
 e163: RTS
@@ -9231,7 +9845,7 @@ e179: STA $0f1b
 e17c: RTS
 e17d: JSR $145c
 e180: CMP (,zp)$04
-e182: BBR2 $0f → $e185
+e182: BBR3 $0f → $e185
 e185: TRB $090f
 e188: BVC $8d
 e18a: TRB $600f
@@ -9314,9 +9928,8 @@ e22b: STA $0f25
 e22e: RTS
 e22f: JSR $1477
 e232: e2 !UNDEF
-e233: 17 !UNDEF
-e234: BPL $80
-e236: 22 !UNDEF
+e233: RMB1 $10
+e235: BRA $22
 e237: LDA #$00
 e239: ASL A
 e23a: ASL A
@@ -9336,7 +9949,7 @@ e251: EOR (,X)$08
 e253: JSR $e44c
 e256: JMP $e41e
 e259: JSR $e491
-e25c: BBR1 $4d → $e25f
+e25c: BBR2 $4d → $e25f
 e25f: SBC (,zp)$c7
 e261: TSB $08
 e263: ORA #$d2
@@ -9393,7 +10006,7 @@ e2c2: ORA $4b
 e2c4: STA $0f1d
 e2c7: SBC (,zp)$2a
 e2c9: BBR0 $10 → $e2cc
-e2cc: BBR1 $94 → $e2cf
+e2cc: BBR2 $94 → $e2cf
 e2cf: LDA #$00
 e2d1: STA $4b
 e2d3: LDA $0f2a
@@ -9459,7 +10072,7 @@ e356: c2 !UNDEF
 e357: ORA (,X)$30
 e359: BBR0 $f2 → $e35c
 e35c: BBR0 $10 → $e35f
-e35f: BBR1 $94 → $e362
+e35f: BBR2 $94 → $e362
 e362: LDA (,zp)$0a
 e364: BBS2 $27 → $e367
 e367: SBC (,zp)$16
@@ -9498,7 +10111,7 @@ e3a9: c2 !UNDEF
 e3aa: TSB $30
 e3ac: BBR0 $60 → $e3af
 e3af: JSR $147d
-e3b2: BBR1 $4d → $e3b5
+e3b2: BBR2 $4d → $e3b5
 e3b5: BBS0 $9d → $e3b8
 e3b8: SBC (,zp)$c7
 e3ba: TSB $08
@@ -9542,8 +10155,8 @@ e40c: STA $0f44
 e40f: RTS
 e410: JSR $147a
 e413: CMP (,zp)$40
-e415: 37 !UNDEF
-e416: BBR0 $d2 → $e419
+e415: RMB3 $0f
+e417: CMP (,zp)$40
 e419: AND ,Y$200f
 e41c: STA (,Y)$e4
 e41e: c2 !UNDEF
@@ -9624,8 +10237,8 @@ e49d: CMP (,zp)$02
 e49f: RTI
 e4a0: PHP
 e4a1: RTS
-e4a2: BBR4 $4f → $e4a5
-e4a5: BBR1 $a3 → $e4a8
+e4a2: BBR5 $4f → $e4a5
+e4a5: BBR2 $a3 → $e4a8
 e4a8: CMP (,zp)$01
 e4aa: TRB $d20f
 e4ad: BRA $4e
@@ -9634,13 +10247,11 @@ e4b2: LSR $a90f
 e4b5: LSR $85
 e4b7: LDA $00a9
 e4ba: STA $ae
-e4bc: 17 !UNDEF
-e4bd: STY ,X$a9
-e4bf: CMP #$8d
-e4c1: PHA
-e4c2: ORA (,zp)$a9
-e4c4: CPX $8d
-e4c6: EOR #$12
+e4bc: RMB1 $94
+e4be: LDA #$c9
+e4c0: STA $1248
+e4c3: LDA #$e4
+e4c5: STA $1249
 e4c8: RTS
 e4c9: BBR1 $94 → $e4cc
 e4cc: CMP (,zp)$40
@@ -9653,7 +10264,7 @@ e4d7: PHP
 e4d8: CMP (,zp)$40
 e4da: ROL $0f
 e4dc: CMP (,zp)$40
-e4de: RMB1 $0f
+e4de: RMB2 $0f
 e4e0: c2 !UNDEF
 e4e1: JSR $0f2c
 e4e4: LDA #$03
@@ -9661,12 +10272,11 @@ e4e6: STA $0f18
 e4e9: CMP (,zp)$02
 e4eb: ROL ,X$b20f
 e4ee: TRB $ad
-e4f0: 17 !UNDEF
-e4f1: STY ,X$a9
-e4f3: SBC ,X$488d
-e4f6: ORA (,zp)$a9
-e4f8: CPX $8d
-e4fa: EOR #$12
+e4f0: RMB1 $94
+e4f2: LDA #$fd
+e4f4: STA $1248
+e4f7: LDA #$e4
+e4f9: STA $1249
 e4fc: RTS
 e4fd: BBS1 $94 → $e500
 e500: RTS
@@ -9678,7 +10288,7 @@ e505: JSR $dab2
 e508: CMP (,zp)$02
 e50a: RTI
 e50b: BBR0 $c7 → $e50e
-e50e: RMB2 $01
+e50e: RMB4 $01
 e510: c2 !UNDEF
 e511: ORA (,X)$c0
 e513: TSB $af
@@ -9689,10 +10299,10 @@ e51c: ORA (,X)$c5
 e51e: TSB $c2
 e520: JSR $04c0
 e523: BRA $1b
-e525: d7 !UNDEF
-e526: STZ $10d2
+e525: SMB5 $9c
+e527: CMP (,zp)$10
 e529: CPY #$04
-e52b: BBR2 $4d → $e52e
+e52b: BBR3 $4d → $e52e
 e52e: CMP (,zp)$01
 e530: CMP $04
 e532: CMP (,zp)$20
@@ -9725,7 +10335,7 @@ e56b: CMP (,zp)$80
 e56d: ASL ,X$0f
 e56f: CMP (,zp)$80
 e571: ORA ,X$0f
-e573: RMB3 $93
+e573: RMB6 $93
 e575: LDA (,zp)$32
 e577: LDA $9417
 e57a: RTS
@@ -9769,16 +10379,15 @@ e5c8: LDA #$a2
 e5ca: STA $1248
 e5cd: LDA #$e4
 e5cf: STA $1249
-e5d2: SMB5 $93
+e5d2: SMB6 $93
 e5d4: RTS
 e5d5: BBS0 $4d → $e5d8
 e5d8: JSR $13cf
-e5db: BBR1 $4d → $e5de
+e5db: BBR2 $4d → $e5de
 e5de: e2 !UNDEF
 e5df: SMB4 $04
 e5e1: PHP
-e5e2: 37 !UNDEF
-e5e3: e2 !UNDEF
+e5e2: RMB3 $e2
 e5e4: CPY #$04
 e5e6: JSR $e232
 e5e9: SMB4 $04
@@ -9787,7 +10396,7 @@ e5ee: BRA $1e
 e5f0: BBR0 $d2 → $e5f3
 e5f3: BBR1 $0f → $e5f6
 e5f6: AND (,zp)$af
-e5f8: RMB1 $94
+e5f8: RMB2 $94
 e5fa: LDA $04d8
 e5fd: STA $04d8
 e600: LSR A
@@ -9810,29 +10419,77 @@ e617: LDA #$08
 e619: RTS
 e61a: LDA #$ff
 e61c: STA $04d8
-e61f: 57 !UNDEF
-e67d: BBR5 $94 → $e680
-e680: BBR1 $a3 → $e683
+e61f: RMB5 $00
+e621: BBS3 $4d → $e624
+e624: SMB2 $01
+e626: JSR $e66e
+e629: LDA $02
+e62b: RMB2 $01
+e62d: BRA $07
+e62f: LDA $0f7a
+e632: LSR A
+e633: LSR A
+e634: LSR A
+e635: LSR A
+e636: SMB5 $00
+e638: AND #$0f
+e63a: CMP #$0d
+e63c: BCS $15
+e63e: TAX
+e63f: LDA ,X$f799
+e642: STA $45
+e644: SMB5 $00
+e646: JSR $e66e
+e649: LDA $02
+e64b: RMB5 $00
+e64d: AND #$0f
+e64f: CMP #$0d
+e651: BCC $03
+e653: JMP $e66b
+e656: TAX
+e657: LDA ,X$f78c
+e65a: STA $44
+e65c: LDX $44
+e65e: BEQ $04
+e660: LDA $45
+e662: BRA $03
+e664: LDA $45
+e666: RTS
+e667: BNE $02
+e669: TXA
+e66a: RTS
+e66b: LDA #$00
+e66d: RTS
+e66e: JSR $e673
+e671: BRA $00
+e673: 22 !UNDEF
+e674: AND (,zp)$22
+e676: AND (,zp)$22
+e678: AND (,zp)$ea
+e67a: NOP
+e67b: NOP
+e67c: RTS
+e67d: BBR6 $94 → $e680
+e680: BBR2 $a3 → $e683
 e683: SBC (,zp)$4e
 e685: ASL $1001
 e688: BBR1 $9d → $e68b
-e68b: 17 !UNDEF
-e68c: STA ,X$d520
-e68f: SBC $cd
-e691: RMB3 $12
+e68b: RMB1 $9d
+e68d: JSR $e5d5
+e690: CMP $1267
 e693: BEQ $04
 e695: STA $1267
 e698: RTS
-e699: BBR3 $9b → $e69c
+e699: BBR4 $9b → $e69c
 e69c: CMP #$00
 e69e: BEQ $01
 e6a0: RTS
-e6a1: RMB2 $9b
+e6a1: RMB4 $9b
 e6a3: LDA (,zp)$0a
 e6a5: CMP #$67
 e6a7: STY ,X$a9
 e6d5: JSR $13d5
-e6d8: BBR1 $a3 → $e6db
+e6d8: BBR2 $a3 → $e6db
 e6db: BBS0 $4f → $e6de
 e6de: BBS1 $4f → $e6e1
 e6e1: BRA $02
@@ -9849,7 +10506,7 @@ e6fa: STA $138b
 e6fd: JSR $c9c2
 e700: RTS
 e701: JSR $13d8
-e704: BBR1 $a3 → $e707
+e704: BBR2 $a3 → $e707
 e707: LDA #$02
 e709: STA $127e
 e70c: STA $138c
@@ -9863,10 +10520,10 @@ e720: JSR $c9c2
 e723: RTS
 e724: LDY $12c7
 e727: JSR $13db
-e72a: BBR1 $a3 → $e72d
+e72a: BBR2 $a3 → $e72d
 e72d: SBC (,zp)$4e
 e72f: ASL $2901
-e732: BBR6 $4f → $e735
+e732: BBR7 $4f → $e735
 e735: CMP $12c6
 e738: BNE $0b
 e73a: CPY $12c7
@@ -9919,25 +10576,23 @@ e7ab: ab !UNDEF
 e7ac: RMB0 $94
 e7ae: RTS
 e7af: JSR $1405
-e7b2: BBR1 $4d → $e7b5
-e7b5: BBR2 $4d → $e7b8
+e7b2: BBR2 $4d → $e7b5
+e7b5: BBR3 $4d → $e7b8
 e7b8: BBS7 $02 → $e7bb
-e7bb: BBR5 $9b → $e7be
-e7be: RMB3 $9b
+e7bb: BBR6 $9b → $e7be
+e7be: RMB6 $9b
 e7c0: BRA $05
 e7c2: BBS6 $9b → $e7c5
-e7c5: SMB5 $9b
-e7c7: 57 !UNDEF
-e7c8: 9b !UNDEF
+e7c5: SMB6 $9b
+e7c7: RMB5 $9b
 e7c9: LDA (,zp)$05
 e7cb: b3 !UNDEF
-e7cc: RMB2 $94
+e7cc: RMB4 $94
 e7ce: BRA $15
-e7d0: BBR3 $94 → $e7d3
+e7d0: BBR4 $94 → $e7d3
 e7d3: BBS5 $9b → $e7d6
-e7d6: d7 !UNDEF
-e7d7: 9b !UNDEF
-e7d8: BBR5 $9b → $e7db
+e7d6: SMB5 $9b
+e7d8: BBR6 $9b → $e7db
 e7db: CMP (,zp)$10
 e7dd: CMP $04
 e7df: BRA $04
@@ -9960,14 +10615,14 @@ e800: EOR $40
 e802: BNE $01
 e804: RTS
 e805: PHA
-e806: BBR1 $a3 → $e809
+e806: BBR2 $a3 → $e809
 e809: e2 !UNDEF
 e80a: LSR $010e
 e80d: 02 !UNDEF
 e80e: PLA
 e80f: RTS
 e810: LDA $40
-e812: BBR2 $4d → $e815
+e812: BBR3 $4d → $e815
 e815: AND #$08
 e817: CMP $1280
 e81a: BEQ $06
@@ -9975,7 +10630,7 @@ e81c: STA $1280
 e81f: JSR $e701
 e822: PLA
 e823: PHA
-e824: BBR4 $9c → $e827
+e824: BBR5 $9c → $e827
 e827: LDA $40
 e829: CMP #$f8
 e82b: BEQ $10
@@ -9986,39 +10641,35 @@ e833: CMP (,zp)$20
 e835: PHX
 e836: TSB $c2
 e838: JSR $04da
-e83b: 57 !UNDEF
-e83c: STZ $8568
-e83f: RTI
+e83b: RMB5 $9c
+e83d: PLA
+e83e: STA $40
 e840: ASL $40
 e842: BCC $0b
 e844: SBC (,zp)$7a
 e846: BBR0 $80 → $e849
-e849: 77 !UNDEF
-e84a: TXS
+e849: RMB7 $9a
 e84b: BRA $02
-e84d: f7 !UNDEF
-e84e: TXS
+e84d: SMB7 $9a
 e84f: ASL $40
 e851: BCC $0b
 e853: SBC (,zp)$7a
 e855: BBR0 $40 → $e858
-e858: RMB3 $9a
+e858: RMB6 $9a
 e85a: BRA $02
-e85c: SMB5 $9a
+e85c: SMB6 $9a
 e85e: ASL $40
 e860: BCC $0b
 e862: SBC (,zp)$7a
 e864: BBR0 $20 → $e867
-e867: 57 !UNDEF
-e868: TXS
+e867: RMB5 $9a
 e869: BRA $02
-e86b: d7 !UNDEF
-e86c: TXS
+e86b: SMB5 $9a
 e86d: ASL $40
 e86f: BCC $21
 e871: SBC (,zp)$7a
 e873: BBR0 $10 → $e876
-e876: RMB2 $9a
+e876: RMB4 $9a
 e878: BRA $18
 e87a: SMB4 $9a
 e87c: e2 !UNDEF
@@ -10064,8 +10715,7 @@ e8cb: STA $12cd
 e8ce: LDA #$e9
 e8d0: STA $12ce
 e8d3: RTS
-e8d4: 17 !UNDEF
-e8d5: 93 !UNDEF
+e8d4: RMB1 $93
 e8d6: LDA #$00
 e8d8: JMP ($12cd)
 e8db: JSR $e8a8
@@ -10135,7 +10785,7 @@ e959: ORA (,zp)$10
 e95b: LDA $12c6
 e95e: ORA #$01
 e960: JMP $e724
-e963: BBR6 $4f → $e966
+e963: BBR7 $4f → $e966
 e966: LDA #$71
 e968: STA $12cd
 e96b: LDA #$e9
@@ -10144,13 +10794,13 @@ e970: RTS
 e971: LDA $12c6
 e974: ORA #$02
 e976: JMP $e724
-e979: BBR6 $4f → $e97c
+e979: BBR7 $4f → $e97c
 e97c: JSR $e8a8
-e97f: 17 !UNDEF
-e980: STZ ,X$c6ad
-e983: ORA (,zp)$29
-e985: SBC ,X$2420
-e988: SMB5 $60
+e97f: RMB1 $9e
+e981: LDA $12c6
+e984: AND #$fd
+e986: JSR $e724
+e989: RTS
 e98a: NOP
 e98b: NOP
 e98c: NOP
@@ -10193,11 +10843,11 @@ e9d2: TAX
 e9d3: JMP (,X)$f7c6
 e9d6: LDA #$01
 e9d8: STA $1005
-e9db: RMB2 $4f
+e9db: RMB4 $4f
 e9dd: c2 !UNDEF
 e9de: BRA $26
 e9e0: BBR0 $c2 → $e9e3
-e9e3: RMB1 $0f
+e9e3: RMB2 $0f
 e9e5: c2 !UNDEF
 e9e6: BRA $17
 e9e8: BPL $d2
@@ -10220,17 +10870,17 @@ ea03: ORA (,Y)$c2
 ea05: ORA (,X)$65
 ea07: BBR0 $47 → $ea0a
 ea0a: SMB0 $4d
-ea0c: RMB1 $4d
+ea0c: RMB2 $4d
 ea0e: c2 !UNDEF
 ea0f: BPL $c0
 ea11: TSB $60
 ea13: LDA #$02
 ea15: STA $1005
-ea18: RMB2 $4f
+ea18: RMB4 $4f
 ea1a: c2 !UNDEF
 ea1b: BRA $26
 ea1d: BBR0 $c2 → $ea20
-ea20: RMB1 $0f
+ea20: RMB2 $0f
 ea22: c2 !UNDEF
 ea23: BRA $17
 ea25: BPL $d2
@@ -10255,11 +10905,11 @@ ea44: BBR0 $47 → $ea47
 ea47: RTS
 ea48: LDA #$03
 ea4a: STA $1005
-ea4d: RMB2 $4f
+ea4d: RMB4 $4f
 ea4f: c2 !UNDEF
 ea50: BRA $26
 ea52: BBR0 $c2 → $ea55
-ea55: RMB1 $0f
+ea55: RMB2 $0f
 ea57: c2 !UNDEF
 ea58: BRA $17
 ea5a: BPL $d2
@@ -10269,12 +10919,12 @@ ea5e: PHP
 ea5f: RTS
 ea60: LDA #$04
 ea62: STA $1005
-ea65: RMB2 $4f
+ea65: RMB4 $4f
 ea67: c2 !UNDEF
 ea68: BRA $26
 ea6a: BBR0 $c2 → $ea6d
-ea6d: RMB1 $0f
-ea6f: RMB2 $4d
+ea6d: RMB2 $0f
+ea6f: RMB4 $4d
 ea71: RTS
 ea72: LDA #$05
 ea74: STA $1005
@@ -10284,11 +10934,11 @@ ea7a: STA $1005
 ea7d: RTS
 ea7e: LDA #$08
 ea80: STA $1005
-ea83: RMB2 $4f
+ea83: RMB4 $4f
 ea85: c2 !UNDEF
 ea86: BRA $26
 ea88: BBR0 $c2 → $ea8b
-ea8b: RMB1 $0f
+ea8b: RMB2 $0f
 ea8d: c2 !UNDEF
 ea8e: BRA $16
 ea90: BPL $20
@@ -10299,14 +10949,12 @@ ea98: JSR $eab8
 ea9b: JSR $eaa1
 ea9e: JMP $ead5
 eaa1: BBR1 $9e → $eaa4
-eaa4: d7 !UNDEF
-eaa5: ORA (,X)$ad
-eaa7: DEC $12
+eaa4: SMB5 $01
+eaa6: LDA $12c6
 eaa9: ORA #$02
 eaab: JMP $e724
-eaae: 57 !UNDEF
-eaaf: ORA (,X)$ad
-eab1: DEC $12
+eaae: RMB5 $01
+eab0: LDA $12c6
 eab3: AND #$fd
 eab5: JMP $e724
 eab8: e2 !UNDEF
@@ -10319,9 +10967,8 @@ eac3: ORA (,X)$ad
 eac5: DEC $12
 eac7: ORA #$01
 eac9: BRA $07
-eacb: 37 !UNDEF
-eacc: ORA (,X)$ad
-eace: DEC $12
+eacb: RMB3 $01
+eacd: LDA $12c6
 ead0: AND #$fe
 ead2: JMP $e724
 ead5: e2 !UNDEF

@@ -23,7 +23,7 @@ Method: 100% READ-ONLY — memory bus interrupt path, never set bit6/write. No f
 - Code (stable, dense): **0x1400–0x1A00** (vector/jump tables) + **0xA000–0xFFFF** (main firmware ~24KB)
 - 0x6000–0x9FFF: BRK(0x00)/FF fill — unused
 - Data (dynamic): zero-page, 0x400–0x6FF, 0x900–0xBFF, 0x3200–0x5FFF (strings)
-- Boot EEPROM 8KB image @ file 0x805: `JMP $2805` stub → chip reg $0894 control → `JMP ($A875)` indirect into RAM firmware
+- Boot EEPROM 8KB image @ file 0x805: `JMP $2805` stub → chip reg $0894 control → `JMP $A875` ABSOLUTE (opcode 4C `4c 75 a8`, NOT $6C indirect — byte-verified) into RAM firmware
 
 ## Vectors
 - RAM @0xFFFA: NMI=$A0A3, RESET=$A000, IRQ=$A003
@@ -35,7 +35,7 @@ Method: 100% READ-ONLY — memory bus interrupt path, never set bit6/write. No f
 - **$A5A5** = char output; **$A5BE/$A5C2** = CR/LF out; **$B687** = space out
 - **$B5CA** = hex BYTE reader (2 hex chars → ASL×4 → ORA combine)
 - **$B500-$B560** = command line parser: reads char, CMP #$0D (CR=end), CMP #$20 (SP=token sep), JSR $B5CA/$B617 = token dispatch
-- $B5F1 / $B611: `JMP ($xxxx)` indirect through RAM pointer table = dispatch table
+- $B5F1: `4c e5 ea` = `JMP $EAE5` ABSOLUTE (not indirect); $B611: `20 17 b6 4c 7a b6` = `JSR $B617` + `JMP $B67A` absolute — no 0x6C indirect at either address (byte-verified)
 
 ## Chip registers seen in code
 - **$0894** — control register (boot stub AND #$C3 / ORA mask; LED-adjacent: STA $4b + ORA $4b pattern)
@@ -60,13 +60,13 @@ Method: 100% READ-ONLY — memory bus interrupt path, never set bit6/write. No f
 
 ### Full LED HID handler (3-tier dispatch table)
 1. **$EC89** (LDX#0) → 16 primary entries
-2. **$EC91** (LDX#1) → 26 detailed entries
+2. **$EC91** (LDX#1) → 13 entries (26 bytes of 16-bit pointers, 2026-09-12 byte-count corrected from "26 entries")
 3. **$ECAB** (LED value ASL→TAX) → 16 LED modes: [0]=$CA9A off, [1]=$CAAC, [2]=$CAAE (long mode-2 handler), [3]=$CCA4, [4]=$CCD9, [5]=$CD1B
 
 ### LED bit-serial write (KEY FINDING)
 - **$1388/$1389 = LED shift-register pair** — CLC/BBR→SEC + ROL $1388 (SPI-like bit-banging)
 - **$137D ∈ {3,4} = LED processing gate** (only these 2 modes process LED!)
-- $A1 = LED pattern flag byte (BBR3 reads, RMB2 clears)
+- $A1 = LED pattern flag byte (BBR4 reads @CA9B `4f a1 01`, RMB2 clears @CB2D)
 - $9F = LED state flag (SMB0 set on mode change)
 - Blue path: value==5 → clear $1388/$1389 → JMP $ECAB
 - Termination: LDA ($88) + RTI (pointer hardware write)
@@ -161,7 +161,7 @@ slot9 @1253: JMP $E9BA   (static)
 ### Decoded handlers
 - **$A321** (final slot2): LDA #$3F/STA $123F/LDA #$A3/STA $1240 = patches ITSELF (target $A33F); manages down-counters $C5/$C6 (DEC, SMB2 $96 on reaching 0)
 - **$A33F**: patches $123F/$1240 → target $A1D2 (BBS1 $99 chain)
-- **$A3ED** (final slot3): SED/STA $1242/LDA #$A3/STA $1243 → patches slot3 → $A3xx
+- **$A3ED** (final slot3): `LDA #$F8 / STA $1242 / LDA #$A3 / STA $1243 / RTS` — the `F8` byte is the LDA #immediate OPERAND, not a SED opcode (2026-09-12 disasm-verified); patches slot3 → $A3xx
 - **$A3F8**: patches slot3 → $A405
 - **$A419**: patches slot3 → $A426
 - **$A431**: patches slot4 target ($1245/$1246) → $A44F; BBS0 $95 → counts down $CD/$CE
@@ -178,7 +178,7 @@ The firmware uses a **self-modifying dispatch table** in RAM ($1238-$1255): rout
 ### EQ apply chain decode (from boot-dump-3)
 
 ```
-$D564: JSR $1486→JMP $166D (gate) / BBR5 $93 → RTS   ; flag $93 bit5
+$D564: JSR $1486→JMP $166D (gate) / BBR6 $93 → RTS   ; flag $93 bit6 (0x6F=BBR6)
 $D56B: LDA $137D / CMP #$05 / RTS                     ; ONLY applies when mode==5
 $D573: LDA $1387 → BNE → EQ2 path                     ; $1387 = EQ2 enable
        else JMP $D5A1
@@ -253,7 +253,7 @@ c058: JSR $d8b4                   ; EQ2 setup (ROM preset $F76E)
 | $0D08 | STA @1AA2(#01),A0BF,BF5D(#01),BFA7(#02),C0EC(#04); LDA @BF4D | **state flag 1/2/4** (mode-class) |
 
 - $0D08 = **DSP state class**: 01 = basic, 02 = mode2, 04 = EQ-applied — firmware writes it DIRECTLY via memory (not USB report) → **this proves DSP config CAN be written via the memory bus, BUT it is firmware-internal only**
-- $BD62-$BD6F = mode-config commit: LDA $137F → CMP $0D00 → STA $0D00 → RMB1 $93
+- $BD62-$BD6F = mode-config commit: LDA $137F → CMP $0D00 → STA $0D00 → RMB2 $93 (`27 93` @BD6F — 2026-09-12 byte-verified)
 - $BD72 = **MODE-5 SET**: LDA #$05 / STA $137D / SMB2 $A3 (transitions into EQ-active mode; called indirectly through the mode table — no direct JSR)
 - $BF80-$BF9B = mode dispatch: BBS1 $A9 selects handler ptr $C3xx/$C9xx into $124E/$124F → SMB3 $9F
 - $A0BF/$A0C2-$A0CD = firmware mode-2 internal skip chain → JMP $A178
@@ -278,18 +278,17 @@ b82f: LDA $86 → STA $1272 ...
 ```
 
 ### Helpers:
-- **$A5F4 = 4-nibble hex reader**: `LDA ($40),X` → JSR $A5E3 (ASCII→hex) → ASL×4 → STA $42 → next char → ORA $42 → RTS
+- **$A5F4 = 2-hex-char (1 byte) reader**: `LDA ($40),X` → JSR $A5E3 (ASCII→hex) → ASL×4 → STA $42 → next char → ORA $42 → RTS (reads 2 hex chars = 1 byte; NOT 4-nibble — corrected 2026-09-12)
 - **$A5E3 = ASCII→hex convert**: CMP#$61 lowercase → SBC#$28; CMP#$41 uppercase → SBC#$08; SBC#$2F digit
 - **$A84A = 16-bit pointer increment**: INC $40/BNE/INC $41 (stream advance)
-- **$A84A caller-only path**: $A5F4 has exactly 3 callers — ALL inside the $B7D0 block
+- **$A84A caller-only path**: $A5F4 has 4 callers — all inside the $B7D0 block: @B7CF→STA $1002, @B7D8, @B7E1, @B7EA (corrected from "3" on 2026-09-12)
 - **$B790 = end-of-stream check**: LDA $46 / CMP #$38 (56 = config length) / BCC loop / JMP $B47D
 - **$E06E = clamp helper**: BMI→RTS, CMP #$06, BCC→RTS, LDA #$05 (clamp max 5)
 
 ### Boot completion ($B47D-$B48C):
 ```
-b47d: STZ $20B4       ; data
-b47e: RMB2 $B4        ; clear boot flag
-b480: RMB0 $93        ; clear state bit0
+b47d: JSR $B447       ; `20 47 b4` — dispatch through helper (no STZ $20B4 — corrected 2026-09-12)
+b480: RMB0 $93        ; clear state bit0 (`07 93`)
 b482: LDA #$BE / STA $1239   ; PATCH vector slot0 operand hi
 b487: LDA #$B3 / STA $123A   ; PATCH vector slot0 operand lo
 b48c: RTS
@@ -318,17 +317,17 @@ b3d7: LDA #$20 / JSR $A5A5 (echo space)
 
 ## Phase 7h — Mode state machine COMPLETE ($137D, 6 states 0-5)
 
-**Architecture: cooperative state machine** — each mode routine pre-installs the next handler into $124B/$124C + flag $93 (RMB1 disarms / SMB2 arms). The dispatcher reads $137D; if mode 0 → installs $BCFD (auto-advance).
+**Architecture: cooperative state machine** — each mode routine pre-installs the next handler into $124B/$124C + flag $93 (RMB2 `27 93` disarms / SMB2 `a7 93` arms — all 5 sites byte-verified 2026-09-12). The dispatcher reads $137D; if mode 0 → installs $BCFD (auto-advance).
 
 ### Mode table:
 | Mode | Set at | Behavior |
 |------|--------|---------|
 | **0** | $BE5F-$BE6C | **EQ OFF**: LDA #$00 → STA $1386/$1387 (clears BOTH EQ flags) → JSR $D564 (apply no-op) → mode=0 → installs handler $BB95. Dispatcher $BE41: mode==0 → installs $BCFD (advance to mode 1) |
-| **1** | $BCFD | mode=1, RMB1 $93, installs $124B/$124C = $BD25 (mode 2) or $BB95 (alt) |
-| **2** | $BD25 | mode=2, RMB1 $93, continues → mode 3 |
-| **3** | $BD35 | mode=3, RMB1 $93 — **LED/gate state** (LED handler only processes when state ∈ {3,4}) |
-| **4** | $CC5C | Report byte < $80 → STA $137F (config); = 0 → installs $BD35 (back to mode 3); ≠ 0 → mode=4 |
-| **5** | $BD72 | **EQ-active**: mode=5 + SMB2 $A3 — gate for EQ chain $D564 (mode==5 + $93 bit5) |
+| **1** | $BCFD | mode=1, RMB2 $93 (`27 93` @BD06), installs $124B/$124C = $BD25 (mode 2) or $BB95 (alt) |
+| **2** | $BD25 | mode=2, RMB2 $93, continues → mode 3 |
+| **3** | $BD35 | mode=3, RMB2 $93 — **LED/gate state** (LED handler only processes when state ∈ {3,4}) |
+| **4** | $BD58 + $CC5C | Report byte < $80 → STA $137F (config); = 0 → installs $BD35 (back to mode 3); ≠ 0 → mode=4 (TWO write sites: $BD58 `a9 04` + $CC5C — 2026-09-12) |
+| **5** | $BD72 | **EQ-active**: mode=5 + SMB2 $A3 — gate for EQ chain $D564 (mode==5 + flag $93 bit6, BBR6 `6f 93 01` @D567) |
 
 ### Mode-4 processor ($CC32-$CC5C):
 ```
@@ -336,7 +335,7 @@ cc32: LDA $137d / CMP #$03 / BEQ / CMP #$04 / BNE exit  ; gate {3,4}
 cc3d: LDX #$02 / LDA ($40),Y / CMP #$80 / BCS exit       ; threshold 0x80
 cc45: STA $137f                                         ; config store
 cc48: BNE $10 → $CC5A (mode=4)
-cc4a: RMB1 $93 / ptr=$BD35 / SMB2 $93                   ; zero → mode-3 handler
+cc4a: RMB2 $93 / ptr=$BD35 / SMB2 $93                   ; zero → mode-3 handler (`27 93` — 2026-09-12 byte-verified)
 cc5a: LDA #$04 / STA $137d                              ; nonzero → mode 4
 ```
 
@@ -368,7 +367,7 @@ bbd1: SMB2 $93 / RMB2 $A2 / RTS
 ```
 bbd6: LDA #$00 → STA $08B7 / STA $0F50
 bbde: LDA #$0F → STA $08B8
-bbe3: RMB1 $A3
+bbe3: RMB2 $A3
 bbe5: LDA $0D03 / AND #$02 / STA $0D03   ; mask $0D03 bit1
 ```
 

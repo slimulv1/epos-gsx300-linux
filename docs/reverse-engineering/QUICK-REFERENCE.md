@@ -130,7 +130,7 @@ Device: `/dev/hidraw3` (VID `1395` PID `0098`), ep-gsx300 daemon.
 
 ### LED Ring (Report ID `0x02`, Output, vendor page 0xFF13)
 
-Firmware-decode (handler $CA40, 2026-09-12): value = byte[6] & 0x1F
+Firmware-decode (handler entry $CA47 `LDX #$02`, 2026-09-12): value = byte[6] & 0x1F
 
 | Byte | LED |
 |------|-----|
@@ -141,7 +141,7 @@ Firmware-decode (handler $CA40, 2026-09-12): value = byte[6] & 0x1F
 | `0x03` | **Pink** (both bits) |
 | `>0x03` | Ignored by firmware → daemon clamps & 0x03 |
 
-LED = 2-bit shift register $1388/$1389 built via CLC/BBR3/SEC/ROL chain.
+LED = 2-bit shift register $1388/$1389 built via CLC/BBR4/SEC/ROL chain.
 
 ### Smart Button (Report ID `0x02`, Input — state readback)
 

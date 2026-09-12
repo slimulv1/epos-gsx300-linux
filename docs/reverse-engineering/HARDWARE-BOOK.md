@@ -54,7 +54,7 @@ Owner: Magnus (slimulv1). Repo: [epos-gsx300-linux](https://github.com/slimulv1/
   → Host-side tracking ±5/detent, init 100, clamp 0–100 is the ONLY correct design.
 
 ### Report 0x02 — LED / mode (vendor 0xFF13, output)
-Firmware handler decoded @ $CA40–$CA97. LED value byte = byte[6] & 0x1F.
+Firmware handler decoded @ $CA47 (entry `LDX #$02`)–$CA97. LED value byte = byte[6] & 0x1F.
 Decode:
 | Value | Meaning | Firmware path |
 |-------|---------|---------------|
@@ -67,7 +67,7 @@ Decode:
 
 **LED is a shift register, not direct GPIO:**
 - $1388/$1389 = 2-bit LED shift-register pair, built bit-serial:
-  `CLC → BBR3 $A1 → SEC → ROL $1388` (bit 0), then `CLC → BBS5 $4F → SEC → ROL $1388` (bit 1).
+  `CLC → BBR4 $A1 → SEC → ROL $1388` (bit 0), then `CLC → BBS5 $4F → SEC → ROL $1388` (bit 1).
 - Terminated by `LDA ($88) → RTI` — hardware write through ZP pointer $88/$89.
 - Complete chain: $CA87–$CAEC, self-contained.
 - LED dispatch table $ECAB: 16 entries via `ASL A → TAX → JMP (,X)`.
@@ -134,7 +134,7 @@ boot** (multi-stage init converges: $A13F→$A203→$A2C7→$A321):
 
 ### 4.4 Mode state machine ($137D, 6 states) — cooperative scheduler
 Each mode routine pre-installs the next handler into $124B/$124C
-(linked list) + flag $93 (RMB1 close / SMB2 arm).
+(linked list) + flag $93 (RMB2 close / SMB2 arm — opcode 0x27/0xA7, 2026-09-12 verified).
 
 | Mode | Set at | Meaning |
 |------|--------|---------|
@@ -201,7 +201,7 @@ path — confirmed by firmware-level decoding, not just inference.**
 ```
 LDA #$00 → STA $08B7/$0F50
 LDA #$0F → STA $08B8
-RMB1 $A3
+RMB2 $A3
 LDA $0D03 / AND #$02 / STA $0D03
 ```
 

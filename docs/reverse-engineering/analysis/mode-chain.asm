@@ -1,10 +1,10 @@
-bd60: RMB3 $a1
+bd60: RMB6 $a1
 bd62: LDA $137f
 bd65: BEQ $0a
 bd67: CMP $0d00
 bd6a: BEQ $03
 bd6c: STA $0d00
-bd6f: RMB1 $93
+bd6f: RMB2 $93
 bd71: RTS
 bd72: LDA #$05
 bd74: STA $137d
@@ -40,7 +40,7 @@ bdb7: CMP (,zp)$02
 bdb9: 03 !UNDEF
 bdba: ORA $a24f
 bdbd: 02 !UNDEF
-bdbe: RMB2 $a2
+bdbe: RMB4 $a2
 bdc0: RTS
 bdc1: JSR $1426
 bdc4: LDA #$00
@@ -64,10 +64,9 @@ bde8: JSR $a4d8
 bdeb: BBS7 $01 → $bdee
 bdee: JMP $be37
 bdf1: BBR1 $a2 → $bdf4
-bdf4: 17 !UNDEF
-bdf5: LDX #$2f
-bdf7: LDX #$02
-bdf9: RMB1 $a2
+bdf4: RMB1 $a2
+bdf6: BBR2 $a2 → $bdf9
+bdf9: RMB2 $a2
 bdfb: c2 !UNDEF
 bdfc: 02 !UNDEF
 bdfd: ORA (,X)$0d
@@ -99,14 +98,15 @@ be30: ORA (,X)$0d
 be32: CMP (,zp)$02
 be34: 03 !UNDEF
 be35: ORA $2060
-be38: 57 !UNDEF
-be39: LDX ,Y$6060
+be38: RMB5 $be
+be3a: RTS
+be3b: RTS
 be3c: BBS7 $01 → $be3f
 be3f: BRA $16
 be41: LDA $137d
 be44: CMP #$00
 be46: BNE $0e
-be48: RMB1 $93
+be48: RMB2 $93
 be4a: LDA #$fd
 be4c: STA $124b
 be4f: LDA #$bc
@@ -123,7 +123,7 @@ be64: STA $1387
 be67: JSR $d564
 be6a: LDA #$00
 be6c: STA $137d
-be6f: RMB1 $93
+be6f: RMB2 $93
 be71: LDA #$95
 be73: STA $124b
 be76: LDA #$bb
