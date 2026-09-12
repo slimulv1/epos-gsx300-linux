@@ -141,6 +141,10 @@ codec. Key facts that shape the daemon design:
   relative detents, the daemon tracks the volume level host-side and
   reports it via `GetStatus` for the GUI.
 
+## Security notes
+
+- **RUSTSEC-2024-0429 / GHSA-wrw7-89jp-8q8g** (glib `VariantStrIter` unsoundness, CVSS 0, no CVE): dismissed as tolerable risk (2026-09-12). Crash-only class (NULL deref in a GVariant string iterator), not reachable via this app's usage. No fix exists in the glib 0.18.x line — glib 0.20+ requires the gtk-rs 2.0 / Tauri webview-chain migration. Revisit when `tauri` upgrades its Linux GTK3 stack.
+
 ## Reverse engineering
 
 This repository contains the full reverse-engineering archive of the
