@@ -13,6 +13,7 @@ use crate::config;
 use crate::devices;
 use crate::led::LedController;
 use crate::hwinfo::HwInfo;
+use crate::hwinfo;
 
 use anyhow::Result;
 
@@ -156,6 +157,14 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
             // from the fresh detect.
             if let Some(ref mut d) = device {
                 d.firmware_version = state.hw_info.firmware_version.clone();
+                // Live read-only snapshot of the runtime state registers
+                // (mode state, LED shift pair, EQ indices, encoder positions).
+                // Best-effort: a timeout leaves fields None, never fails the
+                // whole response. Pure read — bit6 (EEPROM write) never set.
+                if let Some(path) = d.hidraw.clone() {
+                    let snap = hwinfo::snapshot(&path);
+                    d.hw_snapshot = if snap.is_empty() { None } else { Some(snap) };
+                }
             }
             Response::Device(device)
         }
