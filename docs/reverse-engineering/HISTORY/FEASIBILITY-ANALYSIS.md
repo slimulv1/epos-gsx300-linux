@@ -27,7 +27,7 @@
 | 4 | 2.0/7.1 Surround Toggle | ✅ | Low | **SOLVED (2026-09-09)**. Mode toggle is host-side software (PipeWire HRTF config swap). LED ring follows mode via vendor HID Report ID 0x02: `0x01`=blue (stereo), `0x02`=red (7.1). Implemented in `epos-gsx300-linux` daemon. |
 | 5 | Reverb Slider (7.1 only) | ⚠️ | High | Depends on host-side 7.1 processing chain. Alternative: PipeWire reverb DSP. |
 | 6 | Sound Test (A/B comparison) | ✅ | Low | Simple: play reference clip → toggle processing → play again. PipeWire passthrough. |
-| 7 | Smart Button (profile toggle) | ✅ | Low | **SOLVED (2026-09-10)**. HID protocol fully RE'd (`/dev/hidraw3`, ting Report ID 0x02 input: 0x01=stereo, 0x02=7.1, 0x04=long-press). Daemon dispatches 5 configurable actions via `smart_button.action`: `toggle_mode` (default, đúng EPOS Gaming Suite), `toggle_eq`, `cycle_preset`, `toggle_sidetone`, `toggle_noise_gate`. GUI dropdown trong Settings tab. Verified: click nút vật lý toggles mode + LED + config persistence. |
+| 7 | Smart Button (profile toggle) | ✅ | Low | **SOLVED (2026-09-10)**. HID protocol fully RE'd (`/dev/hidraw3`, Report ID 0x02 input: 0x01=stereo, 0x02=7.1, 0x04=long-press). Daemon dispatches 5 configurable actions via `smart_button.action`: `toggle_mode` (default, matching EPOS Gaming Suite), `toggle_eq`, `cycle_preset`, `toggle_sidetone`, `toggle_noise_gate`. GUI dropdown in the Settings tab. Verified: clicking the physical button toggles mode + LED + config persistence. |
 
 ### Tab 2: Microphone
 
