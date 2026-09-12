@@ -9,12 +9,21 @@
 //!   Report ID 0x01 (Consumer): volume dial — input bits 0x09E9 (up) / 0x09EA
 //!     (down) / 0x09CF (mute). Incremental detents only; NO absolute readback.
 //!   Report ID 0x02 (Vendor 0xFF13, 1-byte):
-//!     Output 2 bits → usages 0x05 (LED blue) / 0x06 (LED red)
-//!     Input  3 bits → usages 0x02 (stereo) / 0x03 (7.1) / 0x04 (long-press)
-//!     Remaining bits constant padding (must be zero).
-//!   Report ID 0x04 (Output 38B), 0x05 (Input 34B), 0x06 (Output 36B),
-//!     0x07 (Input 32B), 0x1A (Input 16B): vendor commands, not yet RE'd —
-//!     possibly profile write / mixer protocol used by EPOS Gaming Suite.
+//!     Output 2 bits → usages 0x05 (LED blue) / 0x06 (LED red). The WIRE byte
+//!     written is the logical value, offset by +4 from the usage id:
+//!       0x00 = off, 0x01 = blue, 0x02 = red, 0x03 = pink
+//!     (hardware-confirmed, AGENT-FINDINGS §3.1). Usage-id and wire-value are
+//!     two different numbering systems — do not mix them.
+//!     Input  3 bits → wire 0x01 (stereo) / 0x02 (7.1) / 0x04 (long-press),
+//!     hardware-confirmed (AGENT-FINDINGS §3.2). Remaining bits constant
+//!     padding (must be zero).
+//!   Report ID 0x04 (Output 38B) / 0x05 (Input 34B): **memory bus** — read
+//!     pages with `[flags, len, addr_hi, addr_lo]` payload (flags: 0x00=RAM,
+//!     0x20=EEPROM, 0x10=high page ≥0x10000). Read-only; NEVER set bit6
+//!     (EEPROM write = firmware flash = brick). See docs/reverse-engineering/.
+//!   Report ID 0x06 (Output 36B) / 0x07 (Input 32B) / 0x1A (Input 16B):
+//!     firmware update / profile-write protocol — **NEVER WRITE these reports**
+//!     (flash/brick risk). The write paths in this module hard-block them.
 //!
 //! Protocol is not publicly documented. This module uses the vendor Report ID 2
 //! as the simplest LED control path (2-bit output). Values are configurable in
@@ -174,9 +183,10 @@ impl LedController {
 
 /// Write vendor Report ID 0x02 (1-byte output)
 fn write_vendor_report(file: &mut File, byte: u8) -> Result<()> {
-    // The descriptor's output field is only 2 bits (usages 0x05/0x06).
-    // The firmware silently ignores any higher bits → clamp to 0x00..=0x03
-    // so a bad config value can never produce a no-op write.
+    // The descriptor's output field is only 2 bits (wire values 0x00..=0x03:
+    // off / blue / red / pink — see module doc). The firmware silently ignores
+    // any higher bits → clamp to 0x00..=0x03 so a bad config value can never
+    // produce a no-op write.
     let byte = byte & 0x03;
     let mut packet = vec![0u8; HID_OUTPUT_SIZE];
     packet[0] = REPORT_ID_VENDOR_LED;
@@ -188,7 +198,21 @@ fn write_vendor_report(file: &mut File, byte: u8) -> Result<()> {
 }
 
 /// Write consumer Report ID 0x04 (38-byte output, padded to 64)
+///
+/// SAFETY: Report 0x04 is the memory-bus interface. The payload layout is
+/// `[flags, len, addr_hi, addr_lo]` — flags 0x20/0x10 select EEPROM/high-page
+/// and MUST NOT contain bit6 (0x40 = EEPROM write enable). Only a pure-read
+/// request (bit6 clear) is ever allowed through this path. Report IDs 0x06 /
+/// 0x07 / 0x1A (firmware flash protocol) are hard-blocked by the daemon.
 fn write_primary_report(file: &mut File, payload: &[u8]) -> Result<()> {
+    // Memory-bus read-request guard: the first payload byte is the flags byte.
+    // bit6 (0x40) = EEPROM write (firmware flash) — refuse it unconditionally.
+    if payload.first().is_some_and(|f| f & 0x40 != 0) {
+        anyhow::bail!(
+            "Refusing report 0x04 payload with EEPROM write bit6 set \
+             (firmware flash = brick risk); dropping write"
+        );
+    }
     let mut packet = vec![0u8; HID_OUTPUT_SIZE];
     packet[0] = REPORT_ID_PRIMARY_CMD;
     let len = payload.len().min(HID_OUTPUT_SIZE - 1);

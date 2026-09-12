@@ -44,6 +44,15 @@ pub struct DeviceConfig {
     pub auto_detect: bool,
     pub usb_vid: String,
     pub usb_pid: String,
+    /// Last-known volume dial position (0-100), persisted host-side.
+    ///
+    /// The GSX 300 has NO absolute HID volume readback and NO NVM persistence
+    /// (verified in firmware RE / NVM-PERSISTENCE-REPORT) — the host config is
+    /// the only record of the dial position across daemon restarts. `None`
+    /// means "never persisted yet" → daemon falls back to the device power-on
+    /// default (100).
+    #[serde(default)]
+    pub volume: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +140,7 @@ impl Default for Config {
                 auto_detect: true,
                 usb_vid: "1395".into(),
                 usb_pid: "0098".into(),
+                volume: None,
             },
             audio: AudioConfig::default(),
             mode: AudioMode::Stereo,

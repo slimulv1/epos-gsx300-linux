@@ -55,15 +55,35 @@ Owner: Magnus (slimulv1). Repo: [epos-gsx300-linux](https://github.com/slimulv1/
 
 ### Report 0x02 — LED / mode (vendor 0xFF13, output)
 Firmware handler decoded @ $CA47 (entry `LDX #$02`)–$CA97. LED value byte = byte[6] & 0x1F.
-Decode:
-| Value | Meaning | Firmware path |
-|-------|---------|---------------|
-| 0x00 | Off | RTS (empty) |
-| 0x02 | Red-ish (surround) | CON path (byte[4]&0x0F) |
-| 0x05 | **Blue (stereo)** | $CA85: clear $1388/$1389 pair |
-| 0x06 | Red (7.1) | red path |
-| 0x03 | Pink (both bits) | — |
-| >0x03 | Clamped (firmware ignores) | — |
+Two distinct layers must not be confused:
+
+**Wire protocol (hardware-confirmed, AGENT-FINDINGS §3.1):** report 0x02, byte[1] raw value:
+
+| Wire value | LED (physical) |
+|------------|----------------|
+| 0x00 | Off |
+| 0x01 | Blue (stereo) |
+| 0x02 | Red (7.1) |
+| 0x03 | Pink (both bits) |
+
+> Values >0x03 are clamped by the daemon (& 0x03). The LED field is 2 bits wide in the
+> report descriptor; usage-ids 0x05/0x06 in some earlier docs are HID *usage numbers*
+> (usage-min offset +4), NOT wire values — the wire byte is 0x01/0x02.
+
+**Firmware internal LED dispatch value (RE decode, handler entry $CA47):** the firmware
+re-reads its own copy of the report (format gate byte[2]=0/[3]=0/[6]=2/[7]=0, mode gate
+$137D∈{3,4}) and dispatches on its internal value:
+
+| Int. value | Firmware path |
+|------------|---------------|
+| 0 | $CA85: clear $1388/$1389 pair (off) |
+| 2 | CON path (byte[4]&0x0F) — red-ish/surround |
+| 5 | $CA85: clear $1388/$1389 pair (blue path, mode≠4) |
+| ≥3 (dispatch) | rejected — `BCS` @$CA93, SMB0 $9F flag only |
+
+> Open question: hardware test confirms wire 0x03 = pink works, yet the internal
+> dispatch rejects values ≥3 at $CA93 — the wire→internal mapping (and the pink path)
+> is not fully closed; do NOT change the daemon clamps on this basis.
 
 **LED is a shift register, not direct GPIO:**
 - $1388/$1389 = 2-bit LED shift-register pair, built bit-serial:

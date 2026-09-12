@@ -12,6 +12,7 @@ use crate::audio::AudioPipeline;
 use crate::config;
 use crate::devices;
 use crate::led::LedController;
+use crate::hwinfo::HwInfo;
 
 use anyhow::Result;
 
@@ -45,6 +46,9 @@ pub struct IpcState {
     /// reports incremental up/down only — no absolute readback exists).
     /// Initialized to 100 = device power-on default (full volume).
     pub volume: std::sync::atomic::AtomicI32,
+    /// Firmware/board identity probed once from the read-only memory bus
+    /// at startup (firmware version string + chip ID).
+    pub hw_info: HwInfo,
 }
 
 pub async fn run_server(state: Arc<RwLock<IpcState>>) -> Result<()> {
@@ -146,7 +150,13 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
             }
         }
         Request::GetDevice => {
-            let device = devices::detect().await;
+            let mut device = devices::detect().await;
+            // Merge firmware identity probed read-only from the memory bus at
+            // startup (firmware version string + chip ID). Keep raw USB info
+            // from the fresh detect.
+            if let Some(ref mut d) = device {
+                d.firmware_version = state.hw_info.firmware_version.clone();
+            }
             Response::Device(device)
         }
 

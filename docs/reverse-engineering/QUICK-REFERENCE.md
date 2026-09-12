@@ -132,14 +132,29 @@ Device: `/dev/hidraw3` (VID `1395` PID `0098`), ep-gsx300 daemon.
 
 Firmware-decode (handler entry $CA47 `LDX #$02`, 2026-09-12): value = byte[6] & 0x1F
 
-| Byte | LED |
-|------|-----|
-| `0x00` | Off (empty handler) |
-| `0x02` | Red-ish / surround (CON path) |
-| `0x05` | **Blue** — stereo (2.0) [$CA85 clear $1388/$1389] |
-| `0x06` | **Red** — 7.1 |
+**Wire protocol (hardware-confirmed, AGENT-FINDINGS §3.1)** — report 0x02 byte[1]:
+
+| Wire value | LED (physical) |
+|------------|----------------|
+| `0x00` | Off |
+| `0x01` | **Blue** — stereo (2.0) |
+| `0x02` | **Red** — 7.1 |
 | `0x03` | **Pink** (both bits) |
-| `>0x03` | Ignored by firmware → daemon clamps & 0x03 |
+
+> Usage-ids 0x05/0x06 in older docs are HID *usage numbers*, NOT wire values.
+> Daemon clamps & 0x03 (2-bit field).
+
+**Firmware internal dispatch value (RE decode):**
+
+| Int. value | Firmware path |
+|------------|---------------|
+| `0` | Off — $CA85 clear $1388/$1389 |
+| `2` | CON path (byte[4]&0x0F), red-ish |
+| `5` | Blue path (mode≠4) — $CA85 clear pair |
+| `≥3` | Rejected at dispatch (`BCS` @$CA93) — SMB0 $9F flag only |
+
+> Open question: wire 0x03 = pink verified working on hardware, but internal dispatch
+> rejects ≥3 — wire→internal mapping not fully closed; daemon clamps left as-is.
 
 LED = 2-bit shift register $1388/$1389 built via CLC/BBR4/SEC/ROL chain.
 

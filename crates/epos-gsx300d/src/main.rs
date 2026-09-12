@@ -2,6 +2,7 @@ mod audio;
 mod config;
 mod devices;
 mod hid;
+mod hwinfo;
 mod ipc;
 mod led;
 
@@ -41,6 +42,21 @@ async fn main() -> Result<()> {
         );
     } else {
         info!("No EPOS GSX 300 detected — daemon will wait for hotplug");
+    }
+
+    // Probe firmware version + chip ID over the read-only memory bus
+    // (best-effort — the daemon runs fine without it). Pure read: report
+    // 0x04 with bit6 (EEPROM write) clear; never touches the flash protocol.
+    let hw_info = device
+        .as_ref()
+        .and_then(|d| d.hidraw.as_ref())
+        .map(hwinfo::probe)
+        .unwrap_or_default();
+    if let Some(ref v) = hw_info.firmware_version {
+        info!("Firmware version: {}", v);
+    }
+    if let Some(id) = hw_info.chip_id {
+        info!("Chip ID: {:#04x}", id);
     }
 
     // Initialize audio pipeline
@@ -84,7 +100,10 @@ async fn main() -> Result<()> {
         config: config.clone(),
         audio,
         led,
-        volume: std::sync::atomic::AtomicI32::new(100),
+        volume: std::sync::atomic::AtomicI32::new(
+            config.device.volume.unwrap_or(100).clamp(0, 100),
+        ),
+        hw_info,
     }));
 
     // Background task: handle smart button presses (mode sync) according to
@@ -211,6 +230,22 @@ async fn main() -> Result<()> {
                     let next = (cur + dir * 5).clamp(0, 100);
                     st.volume.store(next, std::sync::atomic::Ordering::Relaxed);
                     tracing::info!("Volume knob: {} → {}%", if dir > 0 { "up" } else { "down" }, next);
+                    drop(st);
+                    // Persist the dial position host-side after a short debounce.
+                    // The device keeps no NVM record of the volume (verified in
+                    // firmware RE / NVM-PERSISTENCE-REPORT) and exposes no
+                    // absolute readback, so ~/.config is the only source of truth
+                    // across daemon restarts.
+                    let s = s.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        let mut st = s.write().await;
+                        let v = st.volume.load(std::sync::atomic::Ordering::Relaxed);
+                        st.config.device.volume = Some(v);
+                        if let Err(e) = config::save(&st.config) {
+                            warn!("Failed to save volume to config: {}", e);
+                        }
+                    });
                 }
             }
         }
