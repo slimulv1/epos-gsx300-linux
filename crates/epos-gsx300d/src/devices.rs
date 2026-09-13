@@ -76,6 +76,7 @@ fn scan_usb_devices() -> Result<Vec<DeviceInfo>> {
                 hidraw,
                 input_event,
                 firmware_version: None,
+                chip_id: None,
                 hw_snapshot: None,
             });
         }

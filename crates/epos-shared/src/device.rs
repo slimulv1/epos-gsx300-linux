@@ -68,6 +68,7 @@ pub struct DeviceInfo {
     pub hidraw: Option<PathBuf>,
     pub input_event: Option<PathBuf>,
     pub firmware_version: Option<String>,
+    pub chip_id: Option<u8>,
     /// Live runtime snapshot (read-only memory-bus read at request time).
     pub hw_snapshot: Option<HwSnapshot>,
 }
@@ -83,6 +84,7 @@ impl Default for DeviceInfo {
             hidraw: None,
             input_event: None,
             firmware_version: None,
+            chip_id: None,
             hw_snapshot: None,
         }
     }

@@ -157,6 +157,7 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
             // from the fresh detect.
             if let Some(ref mut d) = device {
                 d.firmware_version = state.hw_info.firmware_version.clone();
+                d.chip_id = state.hw_info.chip_id;
                 // Live read-only snapshot of the runtime state registers
                 // (mode state, LED shift pair, EQ indices, encoder positions).
                 // Best-effort: a timeout leaves fields None, never fails the
