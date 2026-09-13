@@ -51,6 +51,20 @@ impl AudioPipeline {
         if changed {
             reload_pipewire().await;
         }
+        // WirePlumber's device.restore-routes replays the saved input
+        // channelVolume (stored as 1.0 in ~/.local/state/wireplumber/
+        // default-routes) when the ALSA capture node activates, usually a
+        // couple of seconds after this setup runs. That overwrites the
+        // numid=4 Mic Capture Volume we just set. Re-apply the gain once
+        // the node activation has settled so our value wins.
+        let gain = self.config.mic_gain;
+        let device = self.device.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            if let Some(dev) = device {
+                let _ = apply_mic_gain_oneshot(&dev, gain).await;
+            }
+        });
         Ok(())
     }
 
@@ -69,36 +83,7 @@ impl AudioPipeline {
             debug!("No device, skipping mic gain");
             return Ok(());
         };
-
-        let gain = self.config.mic_gain;
-        let card = device.alsa_card;
-
-        // Map 0-100% → amixer range. The GSX 300 mic has numid=4 "Mic Capture Volume"
-        // Range: -30dB to +5dB. amixer handles the percentage mapping.
-        debug!("Setting mic gain to {}% on card {}", gain, card);
-
-        let output = tokio::process::Command::new("amixer")
-            .args([
-                "-c", &card.to_string(),
-                "cset", "name='Mic Capture Volume'",
-                &format!("{}%", gain),
-            ])
-            .output()
-            .await;
-
-        match output {
-            Ok(o) if o.status.success() => {
-                info!("Mic gain set to {}%", gain);
-            }
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                warn!("amixer mic gain failed: {}", stderr.trim());
-            }
-            Err(e) => {
-                warn!("Failed to run amixer: {}", e);
-            }
-        }
-        Ok(())
+        apply_mic_gain_oneshot(device, self.config.mic_gain).await
     }
 
     // ─── 9-Band EQ ────────────────────────────────────────────
@@ -585,4 +570,51 @@ async fn reload_pipewire() {
         Ok(s) => warn!("PipeWire restart returned status {:?}", s.code()),
         Err(e) => warn!("Failed to restart pipewire: {}", e),
     }
+}
+
+/// Set the GSX 300 capture gain via amixer, standalone so it can be
+/// re-applied after WirePlumber restore-routes overwrites the element
+/// during node activation (see AudioPipeline::apply_full).
+async fn apply_mic_gain_oneshot(device: &DeviceInfo, gain: u32) -> Result<()> {
+    let card = device.alsa_card;
+
+    // The GSX 300 capture gain is the ALSA mixer element "Mic Capture
+    // Volume" (numid=4, 0-35, 100% = 5 dB). Note: `amixer scontrols`
+    // shows the SIMPLE name "Mic", but `amixer cset` matches the ELEMENT
+    // name — those are different namespaces. cset "Mic" fails, so the
+    // element name is the primary; "Mic" is kept as a fallback for
+    // firmwares/quirks that rename the element.
+    debug!("Setting mic gain to {}% on card {}", gain, card);
+
+    let mut last_stderr = String::new();
+    let mut success = false;
+    for control in ["Mic Capture Volume", "Mic"] {
+        let output = tokio::process::Command::new("amixer")
+            .args([
+                "-c", &card.to_string(),
+                "cset", &format!("name='{}'", control),
+                &format!("{}%", gain),
+            ])
+            .output()
+            .await;
+
+        match output {
+            Ok(o) if o.status.success() => {
+                info!("Mic gain set to {}% (control '{}')", gain, control);
+                success = true;
+                break;
+            }
+            Ok(o) => {
+                last_stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            }
+            Err(e) => {
+                last_stderr = e.to_string();
+            }
+        }
+    }
+
+    if !success {
+        warn!("amixer mic gain failed: {}", last_stderr);
+    }
+    Ok(())
 }

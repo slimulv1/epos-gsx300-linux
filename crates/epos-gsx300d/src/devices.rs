@@ -82,20 +82,36 @@ fn scan_usb_devices() -> Result<Vec<DeviceInfo>> {
     Ok(devices)
 }
 
-fn find_alsa_card(_vid: u16, _pid: u16) -> Option<u8> {
+fn find_alsa_card(vid: u16, pid: u16) -> Option<u8> {
     let proc_sound = std::path::PathBuf::from("/proc/asound");
     if !proc_sound.exists() {
         return None;
     }
 
-    // Read /proc/asound/cards to find matching card.
-    //
-    // IMPORTANT: match by device NAME, not by "USB Audio" — the system may
-    // host several USB audio devices (e.g. a Generic USB Audio card with its
-    // own 'Mic Capture Volume' control). Matching "USB Audio" blindly returns
-    // whichever card is enumerated first, so mic gain was applied to the WRONG
-    // device while amixer happily reported success. EPOS shows up as
-    // "EPOS GSX 300" / "Sennheiser EPOS GSX 300" in the cards file.
+    // Primary: match by USB vendor:product via /proc/asound/card*/usbid.
+    // This is robust against card-number churn at boot (USB sysfs settles
+    // before ALSA enumerates, so a name scan can race) and against other
+    // USB audio devices present on the system.
+    if let Ok(read_dir) = std::fs::read_dir(&proc_sound) {
+        for entry in read_dir.flatten() {
+            let dir_name = entry.file_name().to_string_lossy().to_string();
+            if !dir_name.starts_with("card") {
+                continue;
+            }
+            let card = dir_name.trim_start_matches("card").parse::<u8>().ok()?;
+            if let Ok(usbid) = std::fs::read_to_string(entry.path().join("usbid")) {
+                let usbid = usbid.trim().to_lowercase();
+                let target = format!("{:04x}:{:04x}", vid, pid);
+                if usbid == target {
+                    return Some(card);
+                }
+            }
+        }
+    }
+
+    // Fallback: match by device NAME — /proc/asound/cards lists
+    // "EPOS GSX 300" / "Sennheiser EPOS GSX 300". Never match plain
+    // "USB Audio" (wrong device → mic gain hits the wrong card).
     if let Ok(cards) = std::fs::read_to_string(proc_sound.join("cards")) {
         for line in cards.lines() {
             if line.contains("EPOS") || line.contains("GSX 300") {

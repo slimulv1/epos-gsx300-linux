@@ -36,7 +36,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use epos_shared::config::AudioMode;
 use epos_shared::led::{LedProbeConfig, LedReportPath};
@@ -62,15 +62,33 @@ impl LedController {
         let hidraw_path = Self::find_hidraw()?;
         info!("Found GSX 300 at {}", hidraw_path.display());
 
-        let file = OpenOptions::new()
-            .write(true)
-            .read(true)
-            .open(&hidraw_path)
-            .context("Failed to open hidraw device")?;
+        // Retry with backoff: at session boot the udev ACL (audio group) may
+        // not be granted yet when USB sysfs settles faster than udevd — same
+        // race seen with Lian Li/OpenRGB. EPERM/EACCES here is transient;
+        // give udev up to ~4s to catch up before failing for real.
+        let mut file = None;
+        for attempt in 0..10u32 {
+            match OpenOptions::new().write(true).read(true).open(&hidraw_path) {
+                Ok(f) => {
+                    file = Some(f);
+                    break;
+                }
+                Err(e) if (e.kind() == std::io::ErrorKind::PermissionDenied) && attempt < 9 =>
+                {
+                    warn!(
+                        "hidraw open denied (udev ACL race?), attempt {}/10: {}",
+                        attempt + 1,
+                        e
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                }
+                Err(e) => return Err(e).context("Failed to open hidraw device"),
+            }
+        }
 
         Ok(Self {
             _hidraw_path: hidraw_path,
-            file: Some(file),
+            file,
             probe_config,
             current_mode: None,
         })
