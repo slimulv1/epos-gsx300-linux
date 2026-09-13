@@ -8,7 +8,7 @@ import { invoke } from "@tauri-apps/api/core";
 const store = useDaemonStore();
 
 /* ─── Preset (active profile) ─── */
-const profileName = computed(() => store.status?.active_profile ?? "Flat");
+const profileName = computed(() => store.status?.active_profile ?? "FLAT");
 
 function onPresetChange(name: string) {
   store.setActiveProfile(name);

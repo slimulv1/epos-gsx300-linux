@@ -16,9 +16,10 @@ const dragging = ref<number | null>(null);
 const hovered = ref<number | null>(null);
 const tooltip = ref<{ x: number; y: number; freq: number; db: number } | null>(null);
 
-const MIN_DB = -12;
-const MAX_DB = 12;
-const PADDING = { top: 16, bottom: 24, left: 36, right: 16 };
+// Matches the EPOS Gaming Suite scale: ±6 dB every 3 dB, 9 bands 64..16k
+const MIN_DB = -6;
+const MAX_DB = 6;
+const PADDING = { top: 16, bottom: 24, left: 72, right: 24 };
 const DOT_RADIUS = 5;
 const HOVER_RADIUS = 8;
 const DISPLAY_STEP = 0.1; // min gain change that counts as a real edit
@@ -135,8 +136,16 @@ function draw() {
   const h = c.clientHeight;
   ctx.clearRect(0, 0, w, h);
 
-  // Dotted grid
-  ctx.fillStyle = "rgba(42, 58, 63, 0.6)";
+  // EPOS-style scale ticks: ±6 dB every 3 dB, formatted like the original
+  // suite (+06, +03, 00, -03, -06)
+  function fmtDb(db: number): string {
+    if (db > 0) return `+${String(db).padStart(2, "0")}`;
+    if (db < 0) return `-${String(-db).padStart(2, "0")}`;
+    return "00";
+  }
+
+  // Faint dotted grid (EPOS keeps grid lines barely visible)
+  ctx.fillStyle = "rgba(210, 220, 228, 0.08)";
   for (let db = MIN_DB; db <= MAX_DB; db += 3) {
     const y = dbToY(db, h);
     for (let x = PADDING.left; x <= w - PADDING.right; x += 12) {
@@ -146,8 +155,8 @@ function draw() {
     }
   }
 
-  // Vertical grid lines at each band position (EPOS-style layout)
-  ctx.strokeStyle = "rgba(42, 58, 63, 0.3)";
+  // Vertical grid lines at each band position (EPOS-style layout, faint)
+  ctx.strokeStyle = "rgba(210, 220, 228, 0.07)";
   ctx.lineWidth = 1;
   ctx.setLineDash([4, 4]);
   props.bands.forEach((b) => {
@@ -159,24 +168,23 @@ function draw() {
   });
   ctx.setLineDash([]);
 
-  // 0 dB line
-  ctx.strokeStyle = "rgba(42, 58, 63, 1)";
+  // 0 dB line (slightly more visible than the grid, still faint)
+  ctx.strokeStyle = "rgba(210, 220, 228, 0.14)";
   ctx.lineWidth = 1;
-  ctx.setLineDash([4, 4]);
+  ctx.setLineDash([6, 6]);
   ctx.beginPath();
   ctx.moveTo(PADDING.left, dbToY(0, h));
   ctx.lineTo(w - PADDING.right, dbToY(0, h));
   ctx.stroke();
   ctx.setLineDash([]);
 
-  // dB scale ticks on the left (EPOS-style: +12 .. -12 every 3 dB)
-  ctx.fillStyle = "rgba(138, 155, 160, 0.7)";
-  ctx.font = "10px var(--font-ui)";
+  // dB scale ticks on the left (EPOS format: +06 / +03 / 00 / -03 / -06)
+  ctx.fillStyle = "rgba(184, 198, 208, 0.85)";
+  ctx.font = "12px var(--font-ui)";
   ctx.textAlign = "right";
   ctx.textBaseline = "middle";
   for (let db = MIN_DB; db <= MAX_DB; db += 3) {
-    const label = db > 0 ? `+${db}` : `${db}`;
-    ctx.fillText(label, PADDING.left - 6, dbToY(db, h));
+    ctx.fillText(fmtDb(db), PADDING.left - 6, dbToY(db, h));
   }
   ctx.textBaseline = "alphabetic";
   ctx.textAlign = "center";
@@ -191,8 +199,9 @@ function draw() {
     ctx.fillText(label, x, h - 4);
   });
 
-  // EQ curve with glow
-  const points = props.bands.map((b) => ({
+  // EQ curve with glow — 9 band points (dots sit exactly on each band,
+  // leftmost dot = 64Hz, rightmost = 16kHz, matching the EPOS suite)
+  const points: { x: number; y: number }[] = props.bands.map((b) => ({
     x: freqToX(b.freq, w),
     y: dbToY(b.gain_db, h),
   }));
@@ -201,7 +210,7 @@ function draw() {
     // Glow layer
     ctx.save();
     ctx.shadowColor = "rgba(78, 205, 196, 0.4)";
-    ctx.shadowBlur = 10;
+    ctx.shadowBlur = 7;
     ctx.strokeStyle = "rgba(78, 205, 196, 0.3)";
     ctx.lineWidth = 6;
     ctx.beginPath();
@@ -225,7 +234,19 @@ function draw() {
     ctx.stroke();
   }
 
-  // Band dots
+  // White band dots with cyan glow (EPOS-style), 9 dots on the 9 bands
+  const c2d = ctx;
+  function dot(x: number, y: number) {
+    c2d.beginPath();
+    c2d.arc(x, y, DOT_RADIUS, 0, Math.PI * 2);
+    c2d.save();
+    c2d.shadowColor = "rgba(78, 205, 196, 0.8)";
+    c2d.shadowBlur = 5;
+    c2d.fillStyle = "#ffffff";
+    c2d.fill();
+    c2d.restore();
+  }
+
   props.bands.forEach((band, i) => {
     const x = freqToX(band.freq, w);
     const y = dbToY(band.gain_db, h);
@@ -239,13 +260,7 @@ function draw() {
       ctx.fill();
     }
 
-    ctx.beginPath();
-    ctx.arc(x, y, r, 0, Math.PI * 2);
-    ctx.fillStyle = dragging.value === i ? "#ffffff" : "#4ecdc4";
-    ctx.fill();
-    ctx.strokeStyle = "#4ecdc4";
-    ctx.lineWidth = 2;
-    ctx.stroke();
+    dot(x, y);
   });
 }
 
