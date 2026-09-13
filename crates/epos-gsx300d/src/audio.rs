@@ -156,9 +156,10 @@ impl AudioPipeline {
     // Kill existing process when settings change.
 
     pub async fn apply_sidetone(&mut self) -> Result<()> {
-        // Kill existing sidetone process
+        // Kill existing sidetone process (await reaps the child — avoids
+        // accumulating zombie pw-loopback processes on every toggle).
         if let Some(mut proc) = self.sidetone_proc.take() {
-            let _ = proc.start_kill();
+            let _ = proc.kill().await;
             info!("Killed old sidetone process");
         }
 

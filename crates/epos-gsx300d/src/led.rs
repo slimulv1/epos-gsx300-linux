@@ -160,7 +160,9 @@ impl LedController {
         }
 
         self.current_mode = Some(mode);
-        info!("LED ring set to {} for {}", match mode {
+        // Heartbeat re-asserts this every 2s — keep at debug level to avoid
+        // ~1400 journald lines/hour of identical noise.
+        debug!("LED ring set to {} for {}", match mode {
             AudioMode::Stereo => "blue",
             AudioMode::Surround71 => "red",
         }, mode.display_name());

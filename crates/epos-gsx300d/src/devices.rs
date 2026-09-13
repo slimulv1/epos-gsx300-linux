@@ -101,7 +101,12 @@ fn find_alsa_card(vid: u16, pid: u16) -> Option<u8> {
             if !dir_name.starts_with("card") {
                 continue;
             }
-            let card = dir_name.trim_start_matches("card").parse::<u8>().ok()?;
+            let card = match dir_name.trim_start_matches("card").parse::<u8>() {
+                    Ok(c) => c,
+                    // Non-numeric entries like the "cards" file must not
+                    // abort the whole scan — skip and keep iterating.
+                    Err(_) => continue,
+                };
             if let Ok(usbid) = std::fs::read_to_string(entry.path().join("usbid")) {
                 let usbid = usbid.trim().to_lowercase();
                 let target = format!("{:04x}:{:04x}", vid, pid);
