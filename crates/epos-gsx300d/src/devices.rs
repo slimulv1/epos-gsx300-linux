@@ -1,14 +1,16 @@
 use anyhow::Result;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 use epos_shared::device::DeviceInfo;
 
 /// Detect EPOS GSX 300 on USB bus
 pub async fn detect() -> Option<DeviceInfo> {
-    // Scan /sys/bus/usb/devices for matching VID:PID
+    // Scan /sys/bus/usb/devices for matching VID:PID.
+    // IMPORTANT: called every 5s by the hotplug loop, so log at debug
+    // level — info would spam ~100 lines/day.
     match scan_usb_devices() {
         Ok(devices) => {
             if let Some(dev) = devices.first() {
-                info!("Found EPOS GSX 300 at bus {}:{}", dev.usb_bus, dev.usb_addr);
+                debug!("EPOS GSX 300 present at bus {}:{}", dev.usb_bus, dev.usb_addr);
                 Some(dev.clone())
             } else {
                 None

@@ -32,6 +32,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
+use tracing::warn;
 use std::time::{Duration, Instant};
 
 /// Maximum time to wait for the firmware to answer a memory-bus request.
@@ -190,12 +191,44 @@ pub fn snapshot(hidraw: &PathBuf) -> HwSnapshot {
 
 /// Open the hidraw node non-blocking (read+write).
 fn open_hidraw(hidraw: &PathBuf) -> Option<File> {
-    File::options()
-        .read(true)
-        .write(true)
-        .custom_flags(O_NONBLOCK)
-        .open(hidraw)
-        .ok()
+    const RETRIES: u32 = 10;
+    const RETRY_DELAY: Duration = Duration::from_millis(400);
+
+    for attempt in 1..=RETRIES {
+        match File::options()
+            .read(true)
+            .write(true)
+            .custom_flags(O_NONBLOCK)
+            .open(hidraw)
+        {
+            Ok(f) => return Some(f),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    || e.raw_os_error() == Some(libc_eperm()) =>
+            {
+                // udev ACL race at boot / replug: the group ACL may not be
+                // granted yet. Retry with a short backoff like the LED path.
+                if attempt < RETRIES {
+                    warn!("hwinfo: hidraw open denied (udev ACL race?), attempt {attempt}/{RETRIES}: {e}");
+                }
+                std::thread::sleep(RETRY_DELAY);
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+// Detect EPERM without pulling in libc as a hard dependency.
+fn libc_eperm() -> i32 {
+    #[cfg(target_os = "linux")]
+    {
+        1 // EPERM
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
 }
 
 /// Read a NUL-padded C string from a raw byte buffer.

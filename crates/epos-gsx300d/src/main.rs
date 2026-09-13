@@ -329,6 +329,16 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
             info!("EPOS GSX 300 connected — applying config");
             let mut st = state.write().await;
             if let Some(ref d) = device {
+                // Re-probe hardware info: the boot-time probe can return
+                // empty if it ran during the udev ACL race; a reconnect is
+                // the right moment to fill in version/chip-ID.
+                if let Some(ref hid) = d.hidraw {
+                    let hw = hwinfo::probe(hid);
+                    if hw.firmware_version.is_some() || hw.chip_id.is_some() {
+                        info!("Hardware info refreshed after reconnect");
+                        st.hw_info = hw;
+                    }
+                }
                 st.audio.set_device(d);
                 if let Err(e) = st.audio.apply_full().await {
                     warn!("Failed to apply audio config on connect: {}", e);
