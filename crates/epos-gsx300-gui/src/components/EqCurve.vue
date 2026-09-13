@@ -19,7 +19,7 @@ const tooltip = ref<{ x: number; y: number; freq: number; db: number } | null>(n
 // Matches the EPOS Gaming Suite scale: ±6 dB every 3 dB, 9 bands 64..16k
 const MIN_DB = -6;
 const MAX_DB = 6;
-const PADDING = { top: 16, bottom: 24, left: 64, right: 64 };
+const PADDING = { top: 17, bottom: 70, left: 136, right: 140 };
 const DOT_RADIUS = 5;
 const DISPLAY_STEP = 0.1; // min gain change that counts as a real edit
 const EMIT_DEBOUNCE_MS = 250;
@@ -110,10 +110,12 @@ onUnmounted(() => {
 });
 
 function freqToX(freq: number, w: number): number {
-  const logMin = Math.log10(64);
-  const logMax = Math.log10(16000);
+  // Linear frequency spacing, matching the physical EPOS GSX 300 UI
+  // (measured from device reference screenshots: 9 bands evenly spaced).
+  const FREQS = [64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+  const i = FREQS.indexOf(freq);
   const usable = w - PADDING.left - PADDING.right;
-  return PADDING.left + ((Math.log10(freq) - logMin) / (logMax - logMin)) * usable;
+  return PADDING.left + (Math.max(0, i) / (FREQS.length - 1)) * usable;
 }
 
 function dbToY(db: number, h: number): number {
@@ -233,7 +235,7 @@ function draw() {
 
     // Tail endpoints: extend in the direction leaving the outermost band,
     // same length both sides (balanced), kept inside the padding
-    const TAIL_LEN = 60;
+    const TAIL_LEN = 30;
     const p0 = points[0];
     const p1 = points[1];
     const dl = Math.hypot(p0.x - p1.x, p0.y - p1.y) || 1;
