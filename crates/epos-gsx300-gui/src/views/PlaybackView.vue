@@ -36,7 +36,7 @@ const soundPlaying = ref(false);
 async function toggleSoundTest() {
   try {
     soundPlaying.value = (await invoke("play_test_tone", {
-      eqEnabeld: store.audio?.eq?.enabled ?? false,
+      eq_enabled: store.audio?.eq?.enabled ?? false,
     })) as boolean;
   } catch (e) {
     console.error("Sound test failed:", e);

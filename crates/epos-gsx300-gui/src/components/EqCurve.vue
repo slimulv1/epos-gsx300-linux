@@ -82,11 +82,17 @@ function resizeCanvas() {
   if (!c || !ct) return;
   const dpr = window.devicePixelRatio || 1;
   const w = ct.clientWidth;
-  const h = ct.clientHeight;
   c.width = w * dpr;
-  c.height = h * dpr;
   c.style.width = w + "px";
-  c.style.height = h + "px";
+  // CRITICAL: never set style.height from the container's clientHeight.
+  // The container's height is derived from the canvas (height: auto +
+  // padding + band-controls), so feeding it back as the canvas height
+  // creates a positive feedback loop where each ResizeObserver round
+  // grows the EQ section by ~109px — "infinite height growth".
+  // Keep the CSS-declared height (180px) and only mirror it into the
+  // backing store with the device-pixel-ratio applied.
+  const cssH = parseFloat(getComputedStyle(c).height) || 180;
+  c.height = cssH * dpr;
   const ctx = c.getContext("2d");
   if (ctx) ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   draw();
@@ -140,6 +146,19 @@ function draw() {
     }
   }
 
+  // Vertical grid lines at each band position (EPOS-style layout)
+  ctx.strokeStyle = "rgba(42, 58, 63, 0.3)";
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  props.bands.forEach((b) => {
+    const x = freqToX(b.freq, w);
+    ctx.beginPath();
+    ctx.moveTo(x, PADDING.top);
+    ctx.lineTo(x, h - PADDING.bottom);
+    ctx.stroke();
+  });
+  ctx.setLineDash([]);
+
   // 0 dB line
   ctx.strokeStyle = "rgba(42, 58, 63, 1)";
   ctx.lineWidth = 1;
@@ -149,6 +168,18 @@ function draw() {
   ctx.lineTo(w - PADDING.right, dbToY(0, h));
   ctx.stroke();
   ctx.setLineDash([]);
+
+  // dB scale ticks on the left (EPOS-style: +12 .. -12 every 3 dB)
+  ctx.fillStyle = "rgba(138, 155, 160, 0.7)";
+  ctx.font = "10px var(--font-ui)";
+  ctx.textAlign = "right";
+  ctx.textBaseline = "middle";
+  for (let db = MIN_DB; db <= MAX_DB; db += 3) {
+    const label = db > 0 ? `+${db}` : `${db}`;
+    ctx.fillText(label, PADDING.left - 6, dbToY(db, h));
+  }
+  ctx.textBaseline = "alphabetic";
+  ctx.textAlign = "center";
 
   // Band labels (x-axis)
   ctx.fillStyle = "rgba(138, 155, 160, 0.7)";

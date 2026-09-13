@@ -4,9 +4,14 @@ import { ref } from "vue";
 // Tauri invoke — loaded dynamically so browser dev mode can fall back
 let tauriInvoke: ((cmd: string, args?: Record<string, unknown>) => Promise<any>) | null = null;
 try {
-  // @tauri-apps/api is available in Tauri runtime; may throw in plain browser
-  const mod = await import("@tauri-apps/api/core");
-  tauriInvoke = mod.invoke;
+  // Use Tauri invoke only inside the real Tauri runtime. The module also
+  // resolves under plain `vite dev` (node_modules), so gate on the runtime
+  // marker — otherwise browser dev mode would take the invoke() path,
+  // fail against the missing backend, and never reach the HTTP bridge/mock.
+  if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+    const mod = await import("@tauri-apps/api/core");
+    tauriInvoke = mod.invoke;
+  }
 } catch {
   // Running outside Tauri (e.g. plain `vite dev`)
 }
