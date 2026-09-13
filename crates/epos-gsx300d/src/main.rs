@@ -104,6 +104,7 @@ async fn main() -> Result<()> {
             config.device.volume.unwrap_or(100).clamp(0, 100),
         ),
         hw_info,
+        device: None,
     }));
 
     // Background task: handle smart button presses (mode sync) according to
@@ -324,6 +325,13 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
 
         let device = devices::detect().await;
         let is_connected = device.is_some();
+
+        // Refresh the detect cache that GetStatus/GetDevice read — keeps the
+        // IPC handlers free of pw-dump subprocess spawns on every GUI poll.
+        {
+            let mut st = state.write().await;
+            st.device = device.clone();
+        }
 
         if is_connected && !was_connected {
             info!("EPOS GSX 300 connected — applying config");

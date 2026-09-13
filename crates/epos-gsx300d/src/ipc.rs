@@ -50,6 +50,10 @@ pub struct IpcState {
     /// Firmware/board identity probed once from the read-only memory bus
     /// at startup (firmware version string + chip ID).
     pub hw_info: HwInfo,
+    /// Last detected device, refreshed by the 5s hotplug loop. Cached so
+    /// GetStatus/GetDevice don't re-spawn pw-dump on every GUI poll (3s).
+    /// Use `devices::detect()` yourself if you need a genuinely fresh scan.
+    pub device: Option<epos_shared::DeviceInfo>,
 }
 
 pub async fn run_server(state: Arc<RwLock<IpcState>>) -> Result<()> {
@@ -136,7 +140,14 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
     match request {
         // --- Status ---
         Request::GetStatus => {
-            let device = devices::detect().await;
+            // Use the hotplug loop's 5s cache — avoids re-spawning pw-dump on
+            // every GUI poll. Fall back to a fresh scan only before the loop
+            // has seeded (first request racing startup).
+            let device = if state.device.is_some() {
+                state.device.clone()
+            } else {
+                devices::detect().await
+            };
             Response::Status {
                 daemon_version: env!("CARGO_PKG_VERSION").into(),
                 device_connected: device.is_some(),
@@ -151,7 +162,14 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
             }
         }
         Request::GetDevice => {
-            let mut device = devices::detect().await;
+            // Device identity comes from the 5s hotplug cache (fresh enough
+            // for a GUI poll); the live register snapshot below is re-read
+            // on every request so runtime state is never stale.
+            let mut device = if state.device.is_some() {
+                state.device.clone()
+            } else {
+                devices::detect().await
+            };
             // Merge firmware identity probed read-only from the memory bus at
             // startup (firmware version string + chip ID). Keep raw USB info
             // from the fresh detect.
