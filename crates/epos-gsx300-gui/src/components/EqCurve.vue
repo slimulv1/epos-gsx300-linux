@@ -19,9 +19,8 @@ const tooltip = ref<{ x: number; y: number; freq: number; db: number } | null>(n
 // Matches the EPOS Gaming Suite scale: ±6 dB every 3 dB, 9 bands 64..16k
 const MIN_DB = -6;
 const MAX_DB = 6;
-const PADDING = { top: 16, bottom: 24, left: 72, right: 24 };
+const PADDING = { top: 16, bottom: 24, left: 64, right: 64 };
 const DOT_RADIUS = 5;
-const HOVER_RADIUS = 8;
 const DISPLAY_STEP = 0.1; // min gain change that counts as a real edit
 const EMIT_DEBOUNCE_MS = 250;
 
@@ -111,8 +110,8 @@ onUnmounted(() => {
 });
 
 function freqToX(freq: number, w: number): number {
-  const logMin = Math.log10(20);
-  const logMax = Math.log10(20000);
+  const logMin = Math.log10(64);
+  const logMax = Math.log10(16000);
   const usable = w - PADDING.left - PADDING.right;
   return PADDING.left + ((Math.log10(freq) - logMin) / (logMax - logMin)) * usable;
 }
@@ -179,7 +178,7 @@ function draw() {
   ctx.setLineDash([]);
 
   // dB scale ticks on the left (EPOS format: +06 / +03 / 00 / -03 / -06)
-  ctx.fillStyle = "rgba(184, 198, 208, 0.85)";
+  ctx.fillStyle = "rgba(226, 236, 244, 0.98)";
   ctx.font = "12px var(--font-ui)";
   ctx.textAlign = "right";
   ctx.textBaseline = "middle";
@@ -199,68 +198,102 @@ function draw() {
     ctx.fillText(label, x, h - 4);
   });
 
-  // EQ curve with glow — 9 band points (dots sit exactly on each band,
-  // leftmost dot = 64Hz, rightmost = 16kHz, matching the EPOS suite)
+  // EQ curve with glow — uniform brightness from 64Hz to 16kHz, plus faint
+  // "running-light" tails that extend beyond the outermost bands and taper
+  // down to nothing (matches the device's light sweep)
   const points: { x: number; y: number }[] = props.bands.map((b) => ({
     x: freqToX(b.freq, w),
     y: dbToY(b.gain_db, h),
   }));
 
   if (points.length > 1) {
-    // Glow layer
-    ctx.save();
-    ctx.shadowColor = "rgba(78, 205, 196, 0.4)";
-    ctx.shadowBlur = 7;
-    ctx.strokeStyle = "rgba(78, 205, 196, 0.3)";
-    ctx.lineWidth = 6;
-    ctx.beginPath();
-    ctx.moveTo(points[0].x, points[0].y);
-    for (let i = 1; i < points.length; i++) {
-      const cpx = (points[i - 1].x + points[i].x) / 2;
-      ctx.bezierCurveTo(cpx, points[i - 1].y, cpx, points[i].y, points[i].x, points[i].y);
-    }
-    ctx.stroke();
-    ctx.restore();
-
-    // Main curve
-    ctx.strokeStyle = "#4ecdc4";
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(points[0].x, points[0].y);
-    for (let i = 1; i < points.length; i++) {
-      const cpx = (points[i - 1].x + points[i].x) / 2;
-      ctx.bezierCurveTo(cpx, points[i - 1].y, cpx, points[i].y, points[i].x, points[i].y);
-    }
-    ctx.stroke();
-  }
-
-  // White band dots with cyan glow (EPOS-style), 9 dots on the 9 bands
-  const c2d = ctx;
-  function dot(x: number, y: number) {
-    c2d.beginPath();
-    c2d.arc(x, y, DOT_RADIUS, 0, Math.PI * 2);
-    c2d.save();
-    c2d.shadowColor = "rgba(78, 205, 196, 0.8)";
-    c2d.shadowBlur = 5;
-    c2d.fillStyle = "#ffffff";
-    c2d.fill();
-    c2d.restore();
-  }
-
-  props.bands.forEach((band, i) => {
-    const x = freqToX(band.freq, w);
-    const y = dbToY(band.gain_db, h);
-    const r = hovered.value === i || dragging.value === i ? HOVER_RADIUS : DOT_RADIUS;
-
-    // Outer glow on hover
-    if (hovered.value === i || dragging.value === i) {
+    const strokeSmooth = (width: number, color: string, shadow: boolean) => {
+      ctx.save();
+      if (shadow) {
+        ctx.shadowColor = "rgba(78, 205, 196, 0.4)";
+        ctx.shadowBlur = 7;
+      }
+      ctx.strokeStyle = color;
+      ctx.lineWidth = width;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
       ctx.beginPath();
-      ctx.arc(x, y, r + 6, 0, Math.PI * 2);
+      ctx.moveTo(points[0].x, points[0].y);
+      for (let i = 1; i < points.length; i++) {
+        const cpx = (points[i - 1].x + points[i].x) / 2;
+        ctx.bezierCurveTo(cpx, points[i - 1].y, cpx, points[i].y, points[i].x, points[i].y);
+      }
+      ctx.stroke();
+      ctx.restore();
+    };
+
+    // 64Hz → 16kHz: uniform, full glow
+    strokeSmooth(6.5, "rgba(78, 205, 196, 0.34)", true);
+    strokeSmooth(2.2, "#4ecdc4", false);
+
+    // Tail endpoints: extend in the direction leaving the outermost band,
+    // same length both sides (balanced), kept inside the padding
+    const TAIL_LEN = 60;
+    const p0 = points[0];
+    const p1 = points[1];
+    const dl = Math.hypot(p0.x - p1.x, p0.y - p1.y) || 1;
+    const extL = { x: p0.x + ((p0.x - p1.x) / dl) * TAIL_LEN, y: p0.y + ((p0.y - p1.y) / dl) * TAIL_LEN };
+    const pn = points[points.length - 1];
+    const pm = points[points.length - 2];
+    const dr = Math.hypot(pn.x - pm.x, pn.y - pm.y) || 1;
+    const extR = { x: pn.x + ((pn.x - pm.x) / dr) * TAIL_LEN, y: pn.y + ((pn.y - pm.y) / dr) * TAIL_LEN };
+
+    // Draw one tail as 6 sub-strokes fading out toward the free end,
+    // with a visibility floor so the tail reads as full-length on both sides
+    const drawTail = (far: { x: number; y: number }, band: { x: number; y: number }) => {
+      const SUB = 6;
+      for (let i = 1; i <= SUB; i++) {
+        const f0 = (i - 1) / SUB;
+        const f1 = i / SUB;
+        const fade = 0.5 + 0.5 * f1; // 1.0 at band → 0.58 at free end (still visible)
+        const ax = far.x + (band.x - far.x) * f0;
+        const ay = far.y + (band.y - far.y) * f0;
+        const bx = far.x + (band.x - far.x) * f1;
+        const by = far.y + (band.y - far.y) * f1;
+        // Glow layer
+        ctx.save();
+        ctx.shadowColor = "rgba(78, 205, 196, 0.4)";
+        ctx.shadowBlur = 7;
+        ctx.strokeStyle = `rgba(78, 205, 196, ${(0.34 * fade * 0.75 + 0.04).toFixed(3)})`;
+        ctx.lineWidth = 1.5 + 5 * fade;
+        ctx.lineCap = "round";
+        ctx.beginPath();
+        ctx.moveTo(ax, ay);
+        ctx.lineTo(bx, by);
+        ctx.stroke();
+        ctx.restore();
+        // Main line
+        ctx.save();
+        ctx.strokeStyle = `rgba(78, 205, 196, ${(0.95 * fade).toFixed(3)})`;
+        ctx.lineWidth = 0.9 + 1.3 * fade;
+        ctx.lineCap = "round";
+        ctx.beginPath();
+        ctx.moveTo(ax, ay);
+        ctx.lineTo(bx, by);
+        ctx.stroke();
+        ctx.restore();
+      }
+    };
+
+    drawTail(extL, p0);
+    drawTail(extR, pn);
+  }
+
+  // No static band dots — hover/drag gets a soft highlight ring instead
+  props.bands.forEach((band, i) => {
+    if (hovered.value === i || dragging.value === i) {
+      const x = freqToX(band.freq, w);
+      const y = dbToY(band.gain_db, h);
+      ctx.beginPath();
+      ctx.arc(x, y, DOT_RADIUS + 6, 0, Math.PI * 2);
       ctx.fillStyle = "rgba(78, 205, 196, 0.15)";
       ctx.fill();
     }
-
-    dot(x, y);
   });
 }
 
