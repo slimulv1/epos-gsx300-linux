@@ -20,12 +20,17 @@ use crate::led::LedController;
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
+    #[cfg(not(feature = "tokio-console"))]
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "epos_gsx300d=info,warn".parse().unwrap()),
         )
         .init();
+
+    // tokio-console: console layer + default fmt layer (RUST_LOG) both attached
+    #[cfg(feature = "tokio-console")]
+    console_subscriber::Builder::default().with_default_env().init();
 
     info!("epos-gsx300d v{} starting...", env!("CARGO_PKG_VERSION"));
 

@@ -9,6 +9,10 @@ description = "EPOS GSX 300 audio daemon for Linux"
 name = "epos-gsx300d"
 path = "src/main.rs"
 
+[features]
+default = []
+tokio-console = ["dep:console-subscriber"]
+
 [dependencies]
 epos-shared = { path = "../epos-shared" }
 tokio.workspace = true
@@ -18,5 +22,6 @@ anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+console-subscriber = { workspace = true, optional = true }
 dirs = "6"
 signal-hook = "0.3"
