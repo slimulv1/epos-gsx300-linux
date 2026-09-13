@@ -2,12 +2,28 @@ use anyhow::Result;
 use tracing::{debug, warn};
 use epos_shared::device::DeviceInfo;
 
-/// Detect EPOS GSX 300 on USB bus
+/// Detect EPOS GSX 300 on USB bus — always a fresh scan including `pw-dump`.
 pub async fn detect() -> Option<DeviceInfo> {
+    detect_with_nodes(None, true).await
+}
+
+/// Like [`detect`], but reuses cached PipeWire node names (sink, source) when
+/// available so the 5s hotplug loop does NOT spawn `pw-dump` on every poll
+/// (~17k subprocesses/day).
+///
+/// - `cached`: known (sink, source) names → returned as-is, zero `pw-dump`.
+/// - `cached == None` + `needs_fresh == true`: device is present, we lack
+///   names → single fresh `pw-dump` lookup (once per (re)connect).
+/// - `cached == None` + `needs_fresh == false`: device is absent, names are
+///   meaningless → nothing spawns.
+pub async fn detect_with_nodes(
+    cached: Option<(String, String)>,
+    needs_fresh: bool,
+) -> Option<DeviceInfo> {
     // Scan /sys/bus/usb/devices for matching VID:PID.
     // IMPORTANT: called every 5s by the hotplug loop, so log at debug
     // level — info would spam ~100 lines/day.
-    match scan_usb_devices() {
+    match scan_usb_devices(cached, needs_fresh) {
         Ok(devices) => {
             if let Some(dev) = devices.first() {
                 debug!("EPOS GSX 300 present at bus {}:{}", dev.usb_bus, dev.usb_addr);
@@ -23,7 +39,33 @@ pub async fn detect() -> Option<DeviceInfo> {
     }
 }
 
-fn scan_usb_devices() -> Result<Vec<DeviceInfo>> {
+/// Cheap sysfs-only check: is an EPOS GSX 300 on the USB bus right now?
+/// No subprocess, no `pw-dump` — safe to call on every 5s hotplug tick.
+pub fn usb_present() -> bool {
+    let usb_dir = std::path::PathBuf::from("/sys/bus/usb/devices");
+    let Ok(entries) = std::fs::read_dir(&usb_dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let vendor = path.join("idVendor");
+        let product = path.join("idProduct");
+        if !vendor.exists() || !product.exists() {
+            continue;
+        }
+        if std::fs::read_to_string(&vendor).unwrap_or_default().trim() == "1395"
+            && std::fs::read_to_string(&product).unwrap_or_default().trim() == "0098"
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn scan_usb_devices(
+    cached_nodes: Option<(String, String)>,
+    needs_fresh: bool,
+) -> Result<Vec<DeviceInfo>> {
     let mut devices = Vec::new();
 
     // Scan /sys/bus/usb/devices/ for matching VID:PID
@@ -58,8 +100,13 @@ fn scan_usb_devices() -> Result<Vec<DeviceInfo>> {
             // Find ALSA card number
             let alsa_card = find_alsa_card(vid, pid).unwrap_or(0);
 
-            // Find PipeWire node names
-            let (sink, source) = find_pipewire_nodes(alsa_card);
+            // Find PipeWire node names — from cache when available (no pw-dump
+            // spawn), otherwise a fresh lookup (startup / reconnect).
+            let (sink, source) = match (&cached_nodes, needs_fresh) {
+                (Some((s, m)), _) => (s.clone(), m.clone()),
+                (None, true) => find_pipewire_nodes(alsa_card),
+                (None, false) => (String::new(), String::new()),
+            };
 
             // Find hidraw
             let hidraw = find_hidraw(vid, pid);

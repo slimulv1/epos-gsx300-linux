@@ -54,6 +54,10 @@ pub struct IpcState {
     /// GetStatus/GetDevice don't re-spawn pw-dump on every GUI poll (3s).
     /// Use `devices::detect()` yourself if you need a genuinely fresh scan.
     pub device: Option<epos_shared::DeviceInfo>,
+    /// Cached PipeWire node names (sink, source) for the EPOS card. Refreshed
+    /// by the hotplug loop only on (re)connect; lets the loop's `detect()`
+    /// skip the blocking `pw-dump` subprocess on every 5s poll.
+    pub pipewire_nodes: Option<(String, String)>,
 }
 
 pub async fn run_server(state: Arc<RwLock<IpcState>>) -> Result<()> {

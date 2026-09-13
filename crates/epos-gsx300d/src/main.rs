@@ -110,6 +110,7 @@ async fn main() -> Result<()> {
         ),
         hw_info,
         device: None,
+        pipewire_nodes: None,
     }));
 
     // Background task: handle smart button presses (mode sync) according to
@@ -328,20 +329,25 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-        let device = devices::detect().await;
+        // Reuse cached PipeWire node names — Detect without spawning pw-dump.
+        // A fresh `pw-dump` runs exactly once per (re)connect: when the device
+        // is on the USB bus (cheap sysfs check) and we don't know node names
+        // yet. With a cache present, or device absent, zero subprocesses.
+        let cached_nodes = state.read().await.pipewire_nodes.clone();
+        let device = if cached_nodes.is_none() && devices::usb_present() {
+            devices::detect().await
+        } else {
+            devices::detect_with_nodes(cached_nodes, false).await
+        };
         let is_connected = device.is_some();
-
-        // Refresh the detect cache that GetStatus/GetDevice read — keeps the
-        // IPC handlers free of pw-dump subprocess spawns on every GUI poll.
-        {
-            let mut st = state.write().await;
-            st.device = device.clone();
-        }
 
         if is_connected && !was_connected {
             info!("EPOS GSX 300 connected — applying config");
             let mut st = state.write().await;
+            // Names come from the fresh scan above (cache was empty when we
+            // entered this branch).
             if let Some(ref d) = device {
+                st.pipewire_nodes = Some((d.pipewire_sink.clone(), d.pipewire_source.clone()));
                 // Re-probe hardware info: the boot-time probe can return
                 // empty if it ran during the udev ACL race; a reconnect is
                 // the right moment to fill in version/chip-ID.
@@ -368,11 +374,30 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
                     info!("LED re-synced to {:?} after reconnect", desired_mode);
                 }
             }
+            st.device = device;
         } else if !is_connected && was_connected {
             info!("EPOS GSX 300 disconnected");
             let mut st = state.write().await;
+            st.device = None;
+            // Keep pipewire_nodes cached: names are harmless while absent, and
+            // usb_present() re-detection refreshes them on the next reconnect.
             // Kill any running sidetone process
             st.audio.set_device(&epos_shared::DeviceInfo::default());
+        } else {
+            // Steady state (connected or still absent): refresh the detect
+            // cache that GetStatus/GetDevice read. Reuses cached node names /
+            // zero pw-dump. Fill the node cache if this scan produced names.
+            let mut st = state.write().await;
+            if is_connected
+                && st.pipewire_nodes.is_none()
+                && !device.as_ref().is_some_and(|d| d.pipewire_sink.is_empty())
+            {
+                if let Some(ref d) = device {
+                    st.pipewire_nodes =
+                        Some((d.pipewire_sink.clone(), d.pipewire_source.clone()));
+                }
+            }
+            st.device = device;
         }
 
         was_connected = is_connected;
