@@ -24,7 +24,7 @@ const MAX_DB = 6;
 // frame — the running-light glow then ends ~30px inside the padding, never
 // touching the border. PADDING.bottom is reduced so the dB ladder on the
 // left stretches taller (more vertical room between the numbers).
-const PADDING = { top: 14, bottom: 60, left: 170, right: 174 };
+const PADDING = { top: 16, bottom: 50, left: 170, right: 174 };
 const DOT_RADIUS = 5;
 const DISPLAY_STEP = 0.1; // min gain change that counts as a real edit
 const EMIT_DEBOUNCE_MS = 250;
@@ -238,7 +238,7 @@ function draw() {
 
     // 64Hz → 16kHz: uniform, full glow
     strokeSmooth(6.5, "rgba(78, 205, 196, 0.34)", true);
-    strokeSmooth(2.2, "#4ecdc4", false);
+    strokeSmooth(3, "#4ecdc4", false);
 
     // Tail endpoints: extend in the direction leaving the outermost band,
     // same length both sides (balanced), kept inside the padding
@@ -424,29 +424,6 @@ watch(
     <div v-if="tooltip" class="tooltip" :style="{ left: tooltip.x + 'px', top: tooltip.y + 'px' }">
       {{ tooltip.freq >= 1000 ? `${tooltip.freq / 1000}k` : tooltip.freq }}Hz · {{ tooltip.db > 0 ? '+' : '' }}{{ tooltip.db }}dB
     </div>
-    <div class="band-controls">
-      <div
-        v-for="(band, i) in bands"
-        :key="band.freq"
-        class="band-slider"
-      >
-        <input
-          type="range"
-          :min="-12"
-          :max="12"
-          :step="0.5"
-          :value="band.gain_db"
-          orient="vertical"
-          :class="{ active: selectedBand === i }"
-          @input="onBandChange(i, ($event.target as HTMLInputElement).valueAsNumber)"
-          @change="flushEmit"
-          @focus="selectedBand = i"
-        />
-        <span class="band-value" :class="{ active: selectedBand === i }">
-          {{ band.gain_db > 0 ? '+' : '' }}{{ band.gain_db }}
-        </span>
-      </div>
-    </div>
   </div>
 </template>
 
@@ -461,7 +438,7 @@ watch(
 
 canvas {
   width: 100%;
-  height: 180px;
+  height: 300px;
   display: block;
   cursor: pointer;
   border-radius: 6px;
@@ -486,39 +463,5 @@ canvas:focus {
   white-space: nowrap;
   z-index: 10;
   transform: translateX(-50%);
-}
-
-/* Band sliders */
-.band-controls {
-  display: flex;
-  justify-content: space-around;
-  margin-top: 8px;
-}
-.band-slider {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 2px;
-}
-.band-slider input[type="range"] {
-  writing-mode: vertical-lr;
-  direction: rtl;
-  width: 20px;
-  height: 70px;
-  accent-color: var(--accent);
-}
-.band-slider input.active {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
-  border-radius: 4px;
-}
-.band-value {
-  font-size: 9px;
-  color: var(--faint);
-  font-family: var(--font-mono);
-}
-.band-value.active {
-  color: var(--accent);
-  font-weight: 600;
 }
 </style>
