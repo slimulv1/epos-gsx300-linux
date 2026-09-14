@@ -19,7 +19,12 @@ const tooltip = ref<{ x: number; y: number; freq: number; db: number } | null>(n
 // Matches the EPOS Gaming Suite scale: ±6 dB every 3 dB, 9 bands 64..16k
 const MIN_DB = -6;
 const MAX_DB = 6;
-const PADDING = { top: 17, bottom: 70, left: 136, right: 140 };
+// EPOS style: ±6 dB every 3 dB, 9 bands 64..16k, linear spacing.
+// PADDING.left/right inset the outermost bands (64 / 16k) well clear of the
+// frame — the running-light glow then ends ~30px inside the padding, never
+// touching the border. PADDING.bottom is reduced so the dB ladder on the
+// left stretches taller (more vertical room between the numbers).
+const PADDING = { top: 14, bottom: 60, left: 170, right: 174 };
 const DOT_RADIUS = 5;
 const DISPLAY_STEP = 0.1; // min gain change that counts as a real edit
 const EMIT_DEBOUNCE_MS = 250;
@@ -180,12 +185,14 @@ function draw() {
   ctx.setLineDash([]);
 
   // dB scale ticks on the left (EPOS format: +06 / +03 / 00 / -03 / -06)
+  // Drawn at a FIXED column (not PADDING.left - 6) so the curve glow that
+  // overhangs band 64 can never light up the numbers.
   ctx.fillStyle = "rgba(226, 236, 244, 0.98)";
   ctx.font = "12px var(--font-ui)";
   ctx.textAlign = "right";
   ctx.textBaseline = "middle";
   for (let db = MIN_DB; db <= MAX_DB; db += 3) {
-    ctx.fillText(fmtDb(db), PADDING.left - 6, dbToY(db, h));
+    ctx.fillText(fmtDb(db), 112, dbToY(db, h));
   }
   ctx.textBaseline = "alphabetic";
   ctx.textAlign = "center";
