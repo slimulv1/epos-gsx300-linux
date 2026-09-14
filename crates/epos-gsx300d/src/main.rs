@@ -227,12 +227,21 @@ async fn main() -> Result<()> {
                     // host-side because the HID descriptor exposes only
                     // incremental consumer detents (no absolute readback).
                     // Volume is reported via GetStatus for the GUI.
+                    // Each detent = 2% (measured on hardware, 2026-09-14).
                     let st = s.read().await;
                     let cur = st.volume.load(std::sync::atomic::Ordering::Relaxed);
-                    let next = (cur + dir * 5).clamp(0, 100);
+                    let next = (cur + dir * 2).clamp(0, 100);
                     st.volume.store(next, std::sync::atomic::Ordering::Relaxed);
-                    tracing::info!("Volume knob: {} → {}%", if dir > 0 { "up" } else { "down" }, next);
+                    // Mirror the dial onto the real PipeWire sink so the
+                    // displayed value always matches the actual output level.
+                    let sink = st
+                        .pipewire_nodes
+                        .as_ref()
+                        .map(|(snk, _)| snk.clone())
+                        .unwrap_or_default();
                     drop(st);
+                    apply_sink_volume(&sink, next).await;
+                    tracing::info!("Volume knob: {} → {}%", if dir > 0 { "up" } else { "down" }, next);
                     // Persist the dial position host-side after a short debounce.
                     // The device keeps no NVM record of the volume (verified in
                     // firmware RE / NVM-PERSISTENCE-REPORT) and exposes no
@@ -317,6 +326,31 @@ async fn main() -> Result<()> {
 }
 
 /// Background task: periodically check for device connect/disconnect
+/// Apply a host-side dial volume (0-100) to the EPOS PipeWire sink so the
+/// hardware dial value and the real sink output level always agree.
+async fn apply_sink_volume(sink: &str, percent: i32) {
+    if sink.is_empty() {
+        return;
+    }
+    let pct = format!("{}%", percent.clamp(0, 100));
+    match tokio::process::Command::new("pactl")
+        .args(["set-sink-volume", sink, &pct])
+        .output()
+        .await
+    {
+        Ok(out) if !out.status.success() => {
+            warn!(
+                "pactl set-sink-volume {} {}: {}",
+                sink,
+                pct,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Err(e) => warn!("pactl set-sink-volume {} failed: {}", sink, e),
+        _ => {}
+    }
+}
+
 async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
     // Seed with current state so the first poll doesn't re-apply config.
     let mut was_connected = devices::detect().await.is_some();
@@ -357,6 +391,16 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
                 if let Err(e) = st.audio.apply_full().await {
                     warn!("Failed to apply audio config on connect: {}", e);
                 }
+                // Restore host-side dial volume onto the real sink so the
+                // knob position matches the actual output level after (re)plug.
+                let vol = st.volume.load(std::sync::atomic::Ordering::Relaxed);
+                let sink = st
+                    .pipewire_nodes
+                    .as_ref()
+                    .map(|(snk, _)| snk.clone())
+                    .unwrap_or_default();
+                apply_sink_volume(&sink, vol).await;
+                info!("Volume restored to {}% on EPOS sink", vol);
                 // Re-open LED hidraw (device may have re-enumerated) and sync mode
                 let desired_mode = st.config.mode;
                 if let Some(ref mut led) = st.led {
@@ -390,6 +434,16 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
                 if let Some(ref d) = device {
                     st.pipewire_nodes =
                         Some((d.pipewire_sink.clone(), d.pipewire_source.clone()));
+                    // First connect after boot: push the saved dial volume
+                    // onto the sink once so display == actual output.
+                    let vol = st.volume.load(std::sync::atomic::Ordering::Relaxed);
+                    let sink = d.pipewire_sink.clone();
+                    drop(st);
+                    apply_sink_volume(&sink, vol).await;
+                    tracing::info!("Volume restored to {}% on EPOS sink (boot)", vol);
+                    let mut st = state.write().await;
+                    st.device = device;
+                    continue;
                 }
             }
             st.device = device;
