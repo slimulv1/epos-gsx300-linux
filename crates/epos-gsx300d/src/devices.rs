@@ -1,6 +1,6 @@
 use anyhow::Result;
-use tracing::{debug, warn};
 use epos_shared::device::DeviceInfo;
+use tracing::{debug, warn};
 
 /// Detect EPOS GSX 300 on USB bus — always a fresh scan including `pw-dump`.
 pub async fn detect() -> Option<DeviceInfo> {
@@ -26,7 +26,10 @@ pub async fn detect_with_nodes(
     match scan_usb_devices(cached, needs_fresh) {
         Ok(devices) => {
             if let Some(dev) = devices.first() {
-                debug!("EPOS GSX 300 present at bus {}:{}", dev.usb_bus, dev.usb_addr);
+                debug!(
+                    "EPOS GSX 300 present at bus {}:{}",
+                    dev.usb_bus, dev.usb_addr
+                );
                 Some(dev.clone())
             } else {
                 None
@@ -149,11 +152,11 @@ fn find_alsa_card(vid: u16, pid: u16) -> Option<u8> {
                 continue;
             }
             let card = match dir_name.trim_start_matches("card").parse::<u8>() {
-                    Ok(c) => c,
-                    // Non-numeric entries like the "cards" file must not
-                    // abort the whole scan — skip and keep iterating.
-                    Err(_) => continue,
-                };
+                Ok(c) => c,
+                // Non-numeric entries like the "cards" file must not
+                // abort the whole scan — skip and keep iterating.
+                Err(_) => continue,
+            };
             if let Ok(usbid) = std::fs::read_to_string(entry.path().join("usbid")) {
                 let usbid = usbid.trim().to_lowercase();
                 let target = format!("{:04x}:{:04x}", vid, pid);
@@ -189,7 +192,9 @@ fn find_pipewire_nodes(_card: u8) -> (String, String) {
     let dump = std::process::Command::new("pw-dump")
         .output()
         .ok()
-        .and_then(|o| (o.status.success()).then(|| String::from_utf8_lossy(&o.stdout).into_owned()));
+        .and_then(|o| {
+            (o.status.success()).then(|| String::from_utf8_lossy(&o.stdout).into_owned())
+        });
 
     let mut sink = "alsa_output.usb-*:*.analog-stereo".to_string();
     let mut source = "alsa_input.usb-*:*.mono-fallback".to_string();
@@ -223,7 +228,11 @@ fn find_pipewire_nodes(_card: u8) -> (String, String) {
                 } else if let Some(eq) = t.find(':') {
                     // JSON format: "key": "value"  or  "key": value
                     let k = t[..eq].trim().trim_matches('"').to_string();
-                    let v = t[eq + 1..].trim().trim_matches(',').trim_matches('"').to_string();
+                    let v = t[eq + 1..]
+                        .trim()
+                        .trim_matches(',')
+                        .trim_matches('"')
+                        .to_string();
                     props.push((k, v));
                 }
             }
@@ -258,10 +267,8 @@ fn find_input_event(vid: u16, pid: u16) -> Option<std::path::PathBuf> {
         let path = input_dir.join(format!("event{}", i));
         if path.exists() {
             // Check sysfs for matching device
-            let sysfs = std::path::PathBuf::from(format!(
-                "/sys/class/input/event{}/device/uevent",
-                i
-            ));
+            let sysfs =
+                std::path::PathBuf::from(format!("/sys/class/input/event{}/device/uevent", i));
             if let Ok(uevent) = std::fs::read_to_string(&sysfs) {
                 if uevent.contains(&format!("{:04X}", vid))
                     && uevent.contains(&format!("{:04X}", pid))

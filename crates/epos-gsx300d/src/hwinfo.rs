@@ -32,8 +32,8 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
-use tracing::warn;
 use std::time::{Duration, Instant};
+use tracing::warn;
 
 /// Maximum time to wait for the firmware to answer a memory-bus request.
 /// The device answers in a few ms; 2 s allows for USB scheduling hiccups.
@@ -237,7 +237,11 @@ fn c_string(raw: &[u8]) -> String {
         .take_while(|&&b| b != 0)
         .map(|&b| {
             // Keep printable ASCII, drop control bytes.
-            if (0x20..0x7F).contains(&b) { b as char } else { ' ' }
+            if (0x20..0x7F).contains(&b) {
+                b as char
+            } else {
+                ' '
+            }
         })
         .collect::<String>()
         .trim()

@@ -1,19 +1,19 @@
+use crate::audio::AudioPipeline;
+use crate::config;
+use crate::devices;
+use crate::hwinfo;
+use crate::hwinfo::HwInfo;
+use crate::led::LedController;
+use epos_shared::config::AudioConfig;
+use epos_shared::config::AudioMode;
+use epos_shared::ipc::{Request, Response};
+use epos_shared::Config;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::RwLock;
-use tracing::{info, error, warn};
-use epos_shared::Config;
-use epos_shared::config::AudioMode;
-use epos_shared::config::AudioConfig;
-use epos_shared::ipc::{Request, Response};
-use crate::audio::AudioPipeline;
-use crate::config;
-use crate::devices;
-use crate::led::LedController;
-use crate::hwinfo::HwInfo;
-use crate::hwinfo;
+use tracing::{error, info, warn};
 
 use anyhow::Result;
 
@@ -47,6 +47,11 @@ pub struct IpcState {
     /// reports incremental up/down only — no absolute readback exists).
     /// Initialized to 100 = device power-on default (full volume).
     pub volume: std::sync::atomic::AtomicI32,
+    /// Last volume value the daemon *commanded* onto the sink (mirrors
+    /// `volume`). The volume watcher compares the real sink level against this
+    /// so it can tell its own writes apart from external changes (keyboard, DE
+    /// controls, wpctl, pavucontrol, apps) and avoid clobbering them.
+    pub last_volume_target: std::sync::atomic::AtomicI32,
     /// Firmware/board identity probed once from the read-only memory bus
     /// at startup (firmware version string + chip ID).
     pub hw_info: HwInfo,
@@ -61,8 +66,7 @@ pub struct IpcState {
 }
 
 pub async fn run_server(state: Arc<RwLock<IpcState>>) -> Result<()> {
-    let runtime_dir = dirs::runtime_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let runtime_dir = dirs::runtime_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let socket_path = runtime_dir.join("epos-gsx300d.sock");
 
     // Remove stale socket
@@ -215,7 +219,10 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
         }
 
         // --- Noise Gate ---
-        Request::SetNoiseGate { enabled, threshold_db } => {
+        Request::SetNoiseGate {
+            enabled,
+            threshold_db,
+        } => {
             state.config.audio.noise_gate.enabled = enabled;
             state.config.audio.noise_gate.threshold_db = threshold_db;
             state.audio.update_config(&state.config.audio);
@@ -270,10 +277,14 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
                     warn!("Failed to set LED mode: {}", e);
                 }
             }
-            info!("Audio mode changed to {} (LED: {})", mode.display_name(), match mode {
-                AudioMode::Stereo => "blue",
-                AudioMode::Surround71 => "red",
-            });
+            info!(
+                "Audio mode changed to {} (LED: {})",
+                mode.display_name(),
+                match mode {
+                    AudioMode::Stereo => "blue",
+                    AudioMode::Surround71 => "red",
+                }
+            );
             Response::Ok
         }
         Request::ToggleMode => {
@@ -291,10 +302,14 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
                     warn!("Failed to toggle LED mode: {}", e);
                 }
             }
-            info!("Audio mode toggled to {} (LED: {})", new_mode.display_name(), match new_mode {
-                AudioMode::Stereo => "blue",
-                AudioMode::Surround71 => "red",
-            });
+            info!(
+                "Audio mode toggled to {} (LED: {})",
+                new_mode.display_name(),
+                match new_mode {
+                    AudioMode::Stereo => "blue",
+                    AudioMode::Surround71 => "red",
+                }
+            );
             Response::Mode(new_mode)
         }
 
@@ -345,7 +360,10 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
                         if let Err(e) = state.audio.apply_full().await {
                             warn!("Failed to apply fallback profile: {}", e);
                         }
-                        info!("Deleted active profile '{}' → fallback to '{}'", name, profile.name);
+                        info!(
+                            "Deleted active profile '{}' → fallback to '{}'",
+                            name, profile.name
+                        );
                     } else {
                         // No profiles left: reset to defaults.
                         state.config.audio = AudioConfig::default();
@@ -385,20 +403,18 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
         }
 
         // --- Lifecycle ---
-        Request::Reload => {
-            match config::load() {
-                Ok(new_config) => {
-                    state.config = new_config;
-                    if let Err(e) = state.audio.apply_full().await {
-                        warn!("Failed to apply reloaded config: {}", e);
-                    }
-                    Response::Ok
+        Request::Reload => match config::load() {
+            Ok(new_config) => {
+                state.config = new_config;
+                if let Err(e) = state.audio.apply_full().await {
+                    warn!("Failed to apply reloaded config: {}", e);
                 }
-                Err(e) => Response::Error {
-                    message: format!("Reload failed: {}", e),
-                },
+                Response::Ok
             }
-        }
+            Err(e) => Response::Error {
+                message: format!("Reload failed: {}", e),
+            },
+        },
         Request::Quit => {
             info!("Quit requested via IPC");
             std::process::exit(0);
@@ -443,10 +459,7 @@ pub async fn run_http_bridge(state: Arc<RwLock<IpcState>>) -> Result<()> {
     }
 }
 
-async fn handle_http_client(
-    mut stream: TcpStream,
-    state: Arc<RwLock<IpcState>>,
-) -> Result<()> {
+async fn handle_http_client(mut stream: TcpStream, state: Arc<RwLock<IpcState>>) -> Result<()> {
     // Read request head (until \r\n\r\n) — cap at 8 KiB to avoid abuse.
     let mut head = Vec::new();
     let mut buf = [0u8; 1024];
@@ -487,9 +500,11 @@ async fn handle_http_client(
         }
         if head.len() > 8192 {
             // Malformed / oversized request
-            let _ = stream.write_all(
-                b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-            ).await;
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await;
             return Ok(());
         }
     }
@@ -571,7 +586,5 @@ async fn process_http_body(
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }

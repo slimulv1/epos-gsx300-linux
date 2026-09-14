@@ -1,8 +1,8 @@
 use anyhow::Result;
-use tokio::process::Child;
-use tracing::{info, warn, debug};
 use epos_shared::config::{AudioConfig, VoiceMode};
 use epos_shared::device::DeviceInfo;
+use tokio::process::Child;
+use tracing::{debug, info, warn};
 
 /// Audio pipeline — manages PipeWire audio processing via subprocesses
 ///
@@ -237,7 +237,8 @@ impl AudioPipeline {
         if self.config.noise_gate.enabled {
             // Map threshold_db (-60..0) → VAD Threshold % (50..100):
             // lower dB threshold = more aggressive suppression.
-            let vad_threshold = 50.0 + ((-self.config.noise_gate.threshold_db).clamp(0.0, 60.0) / 60.0) * 50.0;
+            let vad_threshold =
+                50.0 + ((-self.config.noise_gate.threshold_db).clamp(0.0, 60.0) / 60.0) * 50.0;
             let filter_conf = format!(
                 r#"# EPOS GSX 300 noise gate (rnnoise via LADSPA filter-chain)
 # Applied to capture node: {source}
@@ -281,7 +282,10 @@ context.modules = [
 
             std::fs::create_dir_all(&conf_dir)?;
             std::fs::write(&conf_path, &filter_conf)?;
-            info!("Noise gate filter written (rnnoise, capture: {})", device.pipewire_source);
+            info!(
+                "Noise gate filter written (rnnoise, capture: {})",
+                device.pipewire_source
+            );
         }
 
         Ok(true)
@@ -319,27 +323,36 @@ context.modules = [
             VoiceMode::Off => None,
             VoiceMode::Warm => {
                 // Boost low-mid frequencies for warmth
-                Some(generate_voice_eq_conf("warm", device_source.as_deref(), &[
-                    (200, 4.0, 0.8),
-                    (350, 3.0, 1.0),
-                    (500, 2.0, 1.0),
-                    (4000, -1.0, 1.2),
-                    (8000, -2.0, 1.0),
-                ]))
+                Some(generate_voice_eq_conf(
+                    "warm",
+                    device_source.as_deref(),
+                    &[
+                        (200, 4.0, 0.8),
+                        (350, 3.0, 1.0),
+                        (500, 2.0, 1.0),
+                        (4000, -1.0, 1.2),
+                        (8000, -2.0, 1.0),
+                    ],
+                ))
             }
             VoiceMode::Clear => {
                 // Boost presence and clarity
-                Some(generate_voice_eq_conf("clear", device_source.as_deref(), &[
-                    (200, -2.0, 1.0),
-                    (500, -1.0, 1.0),
-                    (2500, 3.0, 1.0),
-                    (4000, 4.0, 0.8),
-                    (6000, 3.0, 1.2),
-                ]))
+                Some(generate_voice_eq_conf(
+                    "clear",
+                    device_source.as_deref(),
+                    &[
+                        (200, -2.0, 1.0),
+                        (500, -1.0, 1.0),
+                        (2500, 3.0, 1.0),
+                        (4000, 4.0, 0.8),
+                        (6000, 3.0, 1.2),
+                    ],
+                ))
             }
             VoiceMode::Custom => {
                 if let Some(ref bands) = self.config.voice_enhancer.custom_bands {
-                    let active_bands: Vec<(u32, f32, f32)> = bands.iter()
+                    let active_bands: Vec<(u32, f32, f32)> = bands
+                        .iter()
                         .filter(|b| b.gain_db.abs() >= 0.1)
                         .map(|b| (b.freq, b.gain_db, b.q))
                         .collect();
@@ -349,7 +362,11 @@ context.modules = [
                         None
                     } else {
                         info!("Custom voice: {} active band(s)", active_bands.len());
-                        Some(generate_voice_eq_conf("custom", device_source.as_deref(), &active_bands))
+                        Some(generate_voice_eq_conf(
+                            "custom",
+                            device_source.as_deref(),
+                            &active_bands,
+                        ))
                     }
                 } else {
                     None
@@ -361,7 +378,10 @@ context.modules = [
             Some(conf) => {
                 std::fs::create_dir_all(&conf_dir)?;
                 std::fs::write(&conf_path, &conf)?;
-                info!("Voice enhancer filter written ({:?})", self.config.voice_enhancer.mode);
+                info!(
+                    "Voice enhancer filter written ({:?})",
+                    self.config.voice_enhancer.mode
+                );
                 Ok(true)
             }
             None => {
@@ -427,7 +447,8 @@ fn generate_eq_filter_conf(bands: &[epos_shared::config::EqBand], device: &Devic
             links.push_str(&format!(
                 r#"
                     {{ output = "{p}:Out" input = "{name}:In" }}"#,
-                p = p, name = name
+                p = p,
+                name = name
             ));
         }
         prev = Some(name);
@@ -485,7 +506,11 @@ context.modules = [
 /// Generate voice enhancer EQ filter config (capture stream / mic).
 /// PipeWire filter-chain source: captures from the EPOS mic source,
 /// applies bq_peaking filters, exposes a virtual Audio/Source.
-fn generate_voice_eq_conf(mode_name: &str, device_source: Option<&str>, bands: &[(u32, f32, f32)]) -> String {
+fn generate_voice_eq_conf(
+    mode_name: &str,
+    device_source: Option<&str>,
+    bands: &[(u32, f32, f32)],
+) -> String {
     let mut nodes = String::new();
     let mut links = String::new();
     let mut prev: Option<String> = None;
@@ -503,17 +528,19 @@ fn generate_voice_eq_conf(mode_name: &str, device_source: Option<&str>, bands: &
                         label = bq_peaking
                         control = {{ "Freq" = {freq} "Q" = {q} "Gain" = {gain} }}
                     }}"#,
-            freq = freq, q = q, gain = gain,
+            freq = freq,
+            q = q,
+            gain = gain,
         ));
         if let Some(p) = prev.take() {
             links.push_str(&format!(
                 r#"
                     {{ output = "{p}:Out" input = "{name}:In" }}"#,
-                p = p, name = name
+                p = p,
+                name = name
             ));
         }
         prev = Some(name);
-        
     }
 
     let target = device_source
@@ -592,8 +619,10 @@ async fn apply_mic_gain_oneshot(device: &DeviceInfo, gain: u32) -> Result<()> {
     for control in ["Mic Capture Volume", "Mic"] {
         let output = tokio::process::Command::new("amixer")
             .args([
-                "-c", &card.to_string(),
-                "cset", &format!("name='{}'", control),
+                "-c",
+                &card.to_string(),
+                "cset",
+                &format!("name='{}'", control),
                 &format!("{}%", gain),
             ])
             .output()

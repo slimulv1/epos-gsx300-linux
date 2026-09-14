@@ -73,8 +73,7 @@ impl LedController {
                     file = Some(f);
                     break;
                 }
-                Err(e) if (e.kind() == std::io::ErrorKind::PermissionDenied) && attempt < 9 =>
-                {
+                Err(e) if (e.kind() == std::io::ErrorKind::PermissionDenied) && attempt < 9 => {
                     warn!(
                         "hidraw open denied (udev ACL race?), attempt {}/10: {}",
                         attempt + 1,
@@ -117,12 +116,8 @@ impl LedController {
     /// so skipping identical writes can leave the physical LED out of sync
     /// with the daemon/web UI.
     pub fn set_mode(&mut self, mode: AudioMode) -> Result<()> {
-
         let probe_config = self.probe_config.clone();
-        let file = self
-            .file
-            .as_mut()
-            .context("LED device not open")?;
+        let file = self.file.as_mut().context("LED device not open")?;
 
         match probe_config.use_report {
             LedReportPath::Vendor => {
@@ -162,10 +157,14 @@ impl LedController {
         self.current_mode = Some(mode);
         // Heartbeat re-asserts this every 2s — keep at debug level to avoid
         // ~1400 journald lines/hour of identical noise.
-        debug!("LED ring set to {} for {}", match mode {
-            AudioMode::Stereo => "blue",
-            AudioMode::Surround71 => "red",
-        }, mode.display_name());
+        debug!(
+            "LED ring set to {} for {}",
+            match mode {
+                AudioMode::Stereo => "blue",
+                AudioMode::Surround71 => "red",
+            },
+            mode.display_name()
+        );
         Ok(())
     }
 

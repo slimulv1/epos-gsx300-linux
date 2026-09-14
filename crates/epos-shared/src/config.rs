@@ -186,15 +186,51 @@ impl Default for AudioConfig {
 impl AudioConfig {
     pub fn default_bands() -> Vec<EqBand> {
         vec![
-            EqBand { freq: 64, gain_db: 0.0, q: 1.0 },
-            EqBand { freq: 125, gain_db: 0.0, q: 1.0 },
-            EqBand { freq: 250, gain_db: 0.0, q: 1.0 },
-            EqBand { freq: 500, gain_db: 0.0, q: 1.0 },
-            EqBand { freq: 1000, gain_db: 0.0, q: 1.0 },
-            EqBand { freq: 2000, gain_db: 0.0, q: 1.0 },
-            EqBand { freq: 4000, gain_db: 0.0, q: 1.0 },
-            EqBand { freq: 8000, gain_db: 0.0, q: 1.0 },
-            EqBand { freq: 16000, gain_db: 0.0, q: 1.0 },
+            EqBand {
+                freq: 64,
+                gain_db: 0.0,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 125,
+                gain_db: 0.0,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 250,
+                gain_db: 0.0,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 500,
+                gain_db: 0.0,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 1000,
+                gain_db: 0.0,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 2000,
+                gain_db: 0.0,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 4000,
+                gain_db: 0.0,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 8000,
+                gain_db: 0.0,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 16000,
+                gain_db: 0.0,
+                q: 1.0,
+            },
         ]
     }
 }
@@ -214,15 +250,51 @@ impl Profile {
         let mut audio = AudioConfig::default();
         audio.eq.enabled = true;
         audio.eq.bands = vec![
-            EqBand { freq: 64, gain_db: 0.0, q: 1.0 },
-            EqBand { freq: 125, gain_db: 1.0, q: 1.0 },
-            EqBand { freq: 250, gain_db: 4.5, q: 1.0 },
-            EqBand { freq: 500, gain_db: 0.5, q: 1.0 },
-            EqBand { freq: 1000, gain_db: -1.0, q: 1.0 },
-            EqBand { freq: 2000, gain_db: -0.5, q: 1.0 },
-            EqBand { freq: 4000, gain_db: 0.0, q: 1.0 },
-            EqBand { freq: 8000, gain_db: 2.5, q: 1.0 },
-            EqBand { freq: 16000, gain_db: 5.5, q: 1.0 },
+            EqBand {
+                freq: 64,
+                gain_db: 0.0,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 125,
+                gain_db: 1.0,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 250,
+                gain_db: 4.5,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 500,
+                gain_db: 0.5,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 1000,
+                gain_db: -1.0,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 2000,
+                gain_db: -0.5,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 4000,
+                gain_db: 0.0,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 8000,
+                gain_db: 2.5,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 16000,
+                gain_db: 5.5,
+                q: 1.0,
+            },
         ];
         Self {
             name: "MUSIC".into(),
@@ -237,15 +309,51 @@ impl Profile {
         let mut audio = AudioConfig::default();
         audio.eq.enabled = true;
         audio.eq.bands = vec![
-            EqBand { freq: 64, gain_db: 1.0, q: 1.0 },
-            EqBand { freq: 125, gain_db: 1.5, q: 1.0 },
-            EqBand { freq: 250, gain_db: 4.5, q: 1.0 },
-            EqBand { freq: 500, gain_db: 0.5, q: 1.0 },
-            EqBand { freq: 1000, gain_db: 0.0, q: 1.0 },
-            EqBand { freq: 2000, gain_db: 0.0, q: 1.0 },
-            EqBand { freq: 4000, gain_db: 0.5, q: 1.0 },
-            EqBand { freq: 8000, gain_db: 3.0, q: 1.0 },
-            EqBand { freq: 16000, gain_db: 6.0, q: 1.0 },
+            EqBand {
+                freq: 64,
+                gain_db: 1.0,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 125,
+                gain_db: 1.5,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 250,
+                gain_db: 4.5,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 500,
+                gain_db: 0.5,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 1000,
+                gain_db: 0.0,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 2000,
+                gain_db: 0.0,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 4000,
+                gain_db: 0.5,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 8000,
+                gain_db: 3.0,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 16000,
+                gain_db: 6.0,
+                q: 1.0,
+            },
         ];
         Self {
             name: "MOVIE".into(),
@@ -260,15 +368,51 @@ impl Profile {
         let mut audio = AudioConfig::default();
         audio.eq.enabled = true;
         audio.eq.bands = vec![
-            EqBand { freq: 64, gain_db: -1.0, q: 1.0 },
-            EqBand { freq: 125, gain_db: -1.0, q: 1.0 },
-            EqBand { freq: 250, gain_db: -4.5, q: 1.0 },
-            EqBand { freq: 500, gain_db: -2.5, q: 1.0 },
-            EqBand { freq: 1000, gain_db: 2.0, q: 1.0 },
-            EqBand { freq: 2000, gain_db: 3.5, q: 1.0 },
-            EqBand { freq: 4000, gain_db: 5.5, q: 1.0 },
-            EqBand { freq: 8000, gain_db: 6.0, q: 1.0 },
-            EqBand { freq: 16000, gain_db: 6.0, q: 1.0 },
+            EqBand {
+                freq: 64,
+                gain_db: -1.0,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 125,
+                gain_db: -1.0,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 250,
+                gain_db: -4.5,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 500,
+                gain_db: -2.5,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 1000,
+                gain_db: 2.0,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 2000,
+                gain_db: 3.5,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 4000,
+                gain_db: 5.5,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 8000,
+                gain_db: 6.0,
+                q: 1.0,
+            },
+            EqBand {
+                freq: 16000,
+                gain_db: 6.0,
+                q: 1.0,
+            },
         ];
         Self {
             name: "ESPORT (TREBLE)".into(),

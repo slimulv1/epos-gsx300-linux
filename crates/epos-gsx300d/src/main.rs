@@ -6,16 +6,16 @@ mod hwinfo;
 mod ipc;
 mod led;
 
-use anyhow::Result;
-use epos_shared::config::SmartButtonAction;
-use epos_shared::config::AudioMode;
-use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
-use tracing::{info, warn};
 use crate::audio::AudioPipeline;
 use crate::hid::{HidEvent, HidHandler};
 use crate::ipc::IpcState;
 use crate::led::LedController;
+use anyhow::Result;
+use epos_shared::config::AudioMode;
+use epos_shared::config::SmartButtonAction;
+use std::sync::Arc;
+use tokio::sync::{mpsc, RwLock};
+use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -101,6 +101,9 @@ async fn main() -> Result<()> {
         audio,
         led,
         volume: std::sync::atomic::AtomicI32::new(
+            config.device.volume.unwrap_or(100).clamp(0, 100),
+        ),
+        last_volume_target: std::sync::atomic::AtomicI32::new(
             config.device.volume.unwrap_or(100).clamp(0, 100),
         ),
         hw_info,
@@ -205,7 +208,10 @@ async fn main() -> Result<()> {
                             if let Err(e) = config::save(&st.config) {
                                 warn!("Failed to save config: {}", e);
                             }
-                            info!("Smart button: sidetone {}", if enabled { "ON" } else { "OFF" });
+                            info!(
+                                "Smart button: sidetone {}",
+                                if enabled { "ON" } else { "OFF" }
+                            );
                         }
                         SmartButtonAction::ToggleNoiseGate => {
                             let enabled = !st.config.audio.noise_gate.enabled;
@@ -218,7 +224,10 @@ async fn main() -> Result<()> {
                             if let Err(e) = config::save(&st.config) {
                                 warn!("Failed to save config: {}", e);
                             }
-                            info!("Smart button: noise gate {}", if enabled { "ON" } else { "OFF" });
+                            info!(
+                                "Smart button: noise gate {}",
+                                if enabled { "ON" } else { "OFF" }
+                            );
                         }
                     }
                 }
@@ -228,20 +237,44 @@ async fn main() -> Result<()> {
                     // incremental consumer detents (no absolute readback).
                     // Volume is reported via GetStatus for the GUI.
                     // Each detent = 2% (measured on hardware, 2026-09-14).
-                    let st = s.read().await;
-                    let cur = st.volume.load(std::sync::atomic::Ordering::Relaxed);
+                    // Resolve the EPOS sink name + current tracked value under a
+                    // short read lock, then drop it so the awaiting pactl call
+                    // never holds the state lock.
+                    let (sink, cur) = {
+                        let st = s.read().await;
+                        let cur = st.volume.load(std::sync::atomic::Ordering::Relaxed);
+                        let sink = st
+                            .pipewire_nodes
+                            .as_ref()
+                            .map(|(snk, _)| snk.clone())
+                            .unwrap_or_default();
+                        (sink, cur)
+                    };
                     let next = (cur + dir * 2).clamp(0, 100);
-                    st.volume.store(next, std::sync::atomic::Ordering::Relaxed);
-                    // Mirror the dial onto the real PipeWire sink so the
-                    // displayed value always matches the actual output level.
-                    let sink = st
-                        .pipewire_nodes
-                        .as_ref()
-                        .map(|(snk, _)| snk.clone())
-                        .unwrap_or_default();
-                    drop(st);
+                    // Record the value we are about to command so the volume
+                    // watcher does not misclassify the sink landing as an
+                    // *external* change and clobber it.
+                    {
+                        let st = s.write().await;
+                        st.last_volume_target
+                            .store(next, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    // Mirror the dial onto the real PipeWire sink so the displayed
+                    // value always matches the actual output level.
                     apply_sink_volume(&sink, next).await;
-                    tracing::info!("Volume knob: {} → {}%", if dir > 0 { "up" } else { "down" }, next);
+                    // Update the tracked value only AFTER the sink has been
+                    // commanded, so a watcher poll that runs mid-apply sees
+                    // "actual == tracked" (both still old) instead of a false
+                    // mismatch that would revert the dial.
+                    {
+                        let st = s.write().await;
+                        st.volume.store(next, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    tracing::info!(
+                        "Volume knob: {} → {}%",
+                        if dir > 0 { "up" } else { "down" },
+                        next
+                    );
                     // Persist the dial position host-side after a short debounce.
                     // The device keeps no NVM record of the volume (verified in
                     // firmware RE / NVM-PERSISTENCE-REPORT) and exposes no
@@ -287,6 +320,14 @@ async fn main() -> Result<()> {
         led_heartbeat_loop(state_clone).await;
     });
 
+    // Keep the tracked volume synced with the real EPOS sink level so external
+    // volume changes (keyboard, DE controls, wpctl, apps) are reflected in the
+    // GUI dial and don't get reverted by the next dial turn.
+    let state_clone = state.clone();
+    let _volume_watch_handle = tokio::spawn(async move {
+        volume_watch_loop(state_clone).await;
+    });
+
     // Graceful shutdown: SIGTERM/SIGINT → reset LED to blue, then exit.
     // (Drop impls do NOT run on signal kill, so we handle it explicitly.)
     {
@@ -317,15 +358,11 @@ async fn main() -> Result<()> {
 
     // Run Unix socket IPC server and HTTP bridge (web dev GUI) in parallel
     info!("Daemon ready, starting IPC server...");
-    let (_, _) = tokio::join!(
-        ipc::run_server(state.clone()),
-        ipc::run_http_bridge(state),
-    );
+    let (_, _) = tokio::join!(ipc::run_server(state.clone()), ipc::run_http_bridge(state),);
 
     Ok(())
 }
 
-/// Background task: periodically check for device connect/disconnect
 /// Apply a host-side dial volume (0-100) to the EPOS PipeWire sink so the
 /// hardware dial value and the real sink output level always agree.
 async fn apply_sink_volume(sink: &str, percent: i32) {
@@ -348,6 +385,103 @@ async fn apply_sink_volume(sink: &str, percent: i32) {
         }
         Err(e) => warn!("pactl set-sink-volume {} failed: {}", sink, e),
         _ => {}
+    }
+}
+
+/// Read the current EPOS sink volume (0-100) straight from PipeWire/PulseAudio.
+/// Returns None if the sink is gone or the query fails.
+async fn read_sink_volume(sink: &str) -> Option<i32> {
+    if sink.is_empty() {
+        return None;
+    }
+    let out = tokio::process::Command::new("pactl")
+        .args(["get-sink-volume", sink])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // "Volume: front-left: 19660 / 30% / -31.37 dB,   front-right: ... / 30% / ..."
+    // Take the first "/ N%" token — works for mono and stereo sinks.
+    let pct = text
+        .split('/')
+        .nth(1)?
+        .trim()
+        .trim_end_matches('%')
+        .parse::<i32>()
+        .ok()?;
+    Some(pct.clamp(0, 100))
+}
+
+/// Background task: keep the daemon's tracked volume in sync with the *actual*
+/// EPOS PipeWire sink level.
+///
+/// The hardware dial only emits incremental detents with no absolute readback,
+/// so the daemon tracks volume host-side (`volume`). But other actors — keyboard
+/// media keys, DE volume controls, pavucontrol, wpctl, applications — can change
+/// the sink volume directly without going through the daemon. If we ignored
+/// those, `GetStatus.volume` would drift from reality, and the next dial turn
+/// (which SETs an absolute % from the stale tracked value) would jump the real
+/// volume back to the stale number.
+///
+/// This loop polls the sink every second and adopts any change it did not make
+/// itself, so the dial display always reflects the true output level and the
+/// dial stays continuous with external adjustments.
+async fn volume_watch_loop(state: Arc<RwLock<IpcState>>) {
+    let interval = tokio::time::Duration::from_secs(1);
+    loop {
+        tokio::time::sleep(interval).await;
+        let sink = {
+            let st = state.read().await;
+            st.pipewire_nodes
+                .as_ref()
+                .map(|(s, _)| s.clone())
+                .unwrap_or_default()
+        };
+        if sink.is_empty() {
+            continue;
+        }
+        let actual = match read_sink_volume(&sink).await {
+            Some(v) => v,
+            None => continue,
+        };
+        let st = state.write().await;
+        let tracked = st.volume.load(std::sync::atomic::Ordering::Relaxed);
+        if actual == tracked {
+            continue;
+        }
+        let last_target = st
+            .last_volume_target
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if actual == last_target {
+            // The sink just landed on a value we commanded ourselves (or is still
+            // settling). Align the tracker without treating it as external.
+            st.volume
+                .store(actual, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
+        // Genuine external change — adopt it so the dial + next dial turn stay
+        // continuous with reality.
+        st.volume
+            .store(actual, std::sync::atomic::Ordering::Relaxed);
+        st.last_volume_target
+            .store(actual, std::sync::atomic::Ordering::Relaxed);
+        let s = state.clone();
+        let v = actual;
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let mut st = s.write().await;
+            st.config.device.volume = Some(v);
+            if let Err(e) = config::save(&st.config) {
+                warn!("Failed to save volume to config: {}", e);
+            }
+        });
+        tracing::info!(
+            "Volume externally set to {}% — synced daemon tracker",
+            actual
+        );
     }
 }
 
@@ -399,6 +533,8 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
                     .as_ref()
                     .map(|(snk, _)| snk.clone())
                     .unwrap_or_default();
+                st.last_volume_target
+                    .store(vol, std::sync::atomic::Ordering::Relaxed);
                 apply_sink_volume(&sink, vol).await;
                 info!("Volume restored to {}% on EPOS sink", vol);
                 // Re-open LED hidraw (device may have re-enumerated) and sync mode
@@ -432,12 +568,13 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
                 && !device.as_ref().is_some_and(|d| d.pipewire_sink.is_empty())
             {
                 if let Some(ref d) = device {
-                    st.pipewire_nodes =
-                        Some((d.pipewire_sink.clone(), d.pipewire_source.clone()));
+                    st.pipewire_nodes = Some((d.pipewire_sink.clone(), d.pipewire_source.clone()));
                     // First connect after boot: push the saved dial volume
                     // onto the sink once so display == actual output.
                     let vol = st.volume.load(std::sync::atomic::Ordering::Relaxed);
                     let sink = d.pipewire_sink.clone();
+                    st.last_volume_target
+                        .store(vol, std::sync::atomic::Ordering::Relaxed);
                     drop(st);
                     apply_sink_volume(&sink, vol).await;
                     tracing::info!("Volume restored to {}% on EPOS sink (boot)", vol);

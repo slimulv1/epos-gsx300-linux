@@ -75,7 +75,10 @@ impl HidHandler {
                 match file.read(&mut buf) {
                     Ok(0) => {
                         // EOF — device closed/unplugged. Re-scan from scratch.
-                        info!("HID stream closed on {} — re-scanning for device", path.display());
+                        info!(
+                            "HID stream closed on {} — re-scanning for device",
+                            path.display()
+                        );
                         break;
                     }
                     Ok(n) => {
@@ -109,11 +112,9 @@ impl HidHandler {
                                     debug!("HID 0x02 unknown value {:#04x}", val);
                                 }
                             }
-                            _ => debug!(
-                                "HID report {:#04x}: {:02x?}",
-                                rid,
-                                &buf[..n.min(buf.len())]
-                            ),
+                            _ => {
+                                debug!("HID report {:#04x}: {:02x?}", rid, &buf[..n.min(buf.len())])
+                            }
                         }
                     }
                     Err(e) => {

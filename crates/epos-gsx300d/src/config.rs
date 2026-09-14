@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
+use epos_shared::Config;
 use std::path::PathBuf;
 use tracing::info;
-use epos_shared::Config;
 
 /// Returns the config directory path (~/.config/epos-gsx300/)
 pub fn config_dir() -> PathBuf {

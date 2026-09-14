@@ -12,29 +12,53 @@ pub enum Request {
     GetDevice,
 
     // Audio
-    SetEq { eq: AudioConfig },
+    SetEq {
+        eq: AudioConfig,
+    },
     GetEq,
-    SetSidetone { enabled: bool, level: f32 },
-    SetNoiseGate { enabled: bool, threshold_db: f32 },
-    SetVoiceEnhancer { mode: String, custom_bands: Option<Vec<crate::EqBand>> },
-    SetMicGain { gain: u32 },
+    SetSidetone {
+        enabled: bool,
+        level: f32,
+    },
+    SetNoiseGate {
+        enabled: bool,
+        threshold_db: f32,
+    },
+    SetVoiceEnhancer {
+        mode: String,
+        custom_bands: Option<Vec<crate::EqBand>>,
+    },
+    SetMicGain {
+        gain: u32,
+    },
 
     // Audio mode / LED
     /// Get current audio mode (stereo/7.1)
     GetMode,
     /// Set audio mode — automatically changes LED ring color
-    SetMode { mode: AudioMode },
+    SetMode {
+        mode: AudioMode,
+    },
     /// Toggle between stereo and 7.1 (for smart button)
     ToggleMode,
 
     // Profiles
     GetProfiles,
-    SetActiveProfile { name: String },
-    CreateProfile { name: String, audio: AudioConfig },
-    DeleteProfile { name: String },
+    SetActiveProfile {
+        name: String,
+    },
+    CreateProfile {
+        name: String,
+        audio: AudioConfig,
+    },
+    DeleteProfile {
+        name: String,
+    },
 
     // Smart button
-    SetSmartButton { action: String },
+    SetSmartButton {
+        action: String,
+    },
 
     // Lifecycle
     Reload,
@@ -59,7 +83,9 @@ pub enum Response {
     Eq(AudioConfig),
     Mode(AudioMode),
     Profiles(Vec<crate::Profile>),
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 /// IPC event pushed from Daemon → GUI

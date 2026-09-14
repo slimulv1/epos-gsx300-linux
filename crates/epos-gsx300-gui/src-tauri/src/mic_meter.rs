@@ -1,11 +1,11 @@
 use pipewire as pw;
-use serde::Serialize;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use tauri::{Emitter};
 use pw::spa::param::format::{MediaSubtype, MediaType};
 use pw::spa::param::format_utils;
 use pw::spa::pod::Pod;
+use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use tauri::Emitter;
 
 /// Holds the live PipeWire capture stream worker.
 ///
@@ -60,9 +60,11 @@ fn resolve_epos_source() -> Result<Option<String>, String> {
     if !out.status.success() {
         return Ok(None);
     }
-    let data: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .map_err(|e| format!("pw-dump parse failed: {e}"))?;
-    let arr = data.as_array().ok_or("pw-dump: unexpected root (not an array)")?;
+    let data: serde_json::Value =
+        serde_json::from_slice(&out.stdout).map_err(|e| format!("pw-dump parse failed: {e}"))?;
+    let arr = data
+        .as_array()
+        .ok_or("pw-dump: unexpected root (not an array)")?;
     for obj in arr {
         if obj["type"].as_str() != Some("PipeWire:Interface:Node") {
             continue;
@@ -189,16 +191,28 @@ fn run_meter(app: tauri::AppHandle, stop: Arc<AtomicBool>, node: String) {
             match new {
                 StreamState::Streaming => user_data.was_streaming = true,
                 StreamState::Error(_) => {
-                    let _ = user_data
-                        .app
-                        .emit("mic-level", MicLevel { db: 0.0, peak_db: 0.0, clip: false, active: false });
+                    let _ = user_data.app.emit(
+                        "mic-level",
+                        MicLevel {
+                            db: 0.0,
+                            peak_db: 0.0,
+                            clip: false,
+                            active: false,
+                        },
+                    );
                     user_data.quit.quit();
                 }
                 StreamState::Unconnected if user_data.was_streaming => {
                     // Device unplugged after we were streaming.
-                    let _ = user_data
-                        .app
-                        .emit("mic-level", MicLevel { db: 0.0, peak_db: 0.0, clip: false, active: false });
+                    let _ = user_data.app.emit(
+                        "mic-level",
+                        MicLevel {
+                            db: 0.0,
+                            peak_db: 0.0,
+                            clip: false,
+                            active: false,
+                        },
+                    );
                     user_data.quit.quit();
                 }
                 _ => {}
@@ -235,9 +249,14 @@ fn run_meter(app: tauri::AppHandle, stop: Arc<AtomicBool>, node: String) {
             for i in 0..n_f32 {
                 let off = i * 4;
                 let a = f32::from_le_bytes(
-                    [samples[off], samples[off + 1], samples[off + 2], samples[off + 3]]
-                        .try_into()
-                        .unwrap(),
+                    [
+                        samples[off],
+                        samples[off + 1],
+                        samples[off + 2],
+                        samples[off + 3],
+                    ]
+                    .try_into()
+                    .unwrap(),
                 )
                 .abs();
                 if a > user_data.peak {
@@ -250,12 +269,13 @@ fn run_meter(app: tauri::AppHandle, stop: Arc<AtomicBool>, node: String) {
                         p = 1e-9;
                     }
                     let db_full = (20.0 * p.log10()).max(-60.0); // absolute dBFS
-                    // Adaptive noise-floor follower (both directions): only
-                    // chases while the input sits within 8 dB of the reference
-                    // (idle hiss fluctuation). Real audio sits > 8 dB above the
-                    // floor and must never drag the reference upward.
+                                                                 // Adaptive noise-floor follower (both directions): only
+                                                                 // chases while the input sits within 8 dB of the reference
+                                                                 // (idle hiss fluctuation). Real audio sits > 8 dB above the
+                                                                 // floor and must never drag the reference upward.
                     if (db_full - user_data.quiet_db).abs() < 8.0 {
-                        user_data.quiet_db += (db_full - user_data.quiet_db) * 0.01; // ~3 s
+                        user_data.quiet_db += (db_full - user_data.quiet_db) * 0.01;
+                        // ~3 s
                     }
                     let db = (db_full - user_data.quiet_db).max(0.0);
                     // Peak-hold: rise instantly, fall ~16 dB/s (0.35 dB per chunk).

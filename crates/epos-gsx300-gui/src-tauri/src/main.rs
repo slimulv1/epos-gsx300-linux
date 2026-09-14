@@ -29,7 +29,10 @@ struct ToneState(Mutex<Option<Child>>);
 /// Returns the NEW state: true = now playing, false = stopped.
 #[tauri::command]
 fn play_test_tone(eq_enabled: bool, state: State<'_, ToneState>) -> Result<bool, String> {
-    let mut guard = state.0.lock().map_err(|_| "tone state poisoned".to_string())?;
+    let mut guard = state
+        .0
+        .lock()
+        .map_err(|_| "tone state poisoned".to_string())?;
 
     // Already playing → stop it
     if let Some(mut child) = guard.take() {
