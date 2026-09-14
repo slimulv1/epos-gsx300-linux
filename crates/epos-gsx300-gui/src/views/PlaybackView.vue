@@ -1,17 +1,28 @@
 <script setup lang="ts">
-import { ref, computed } from "vue";
+import { ref, computed, onMounted, onBeforeUnmount } from "vue";
 import { useDaemonStore } from "../stores/daemon";
 import EqCurve from "../components/EqCurve.vue";
-import { Play, Square } from "lucide-vue-next";
+import { Play, Square, ChevronDown } from "lucide-vue-next";
 import { invoke } from "@tauri-apps/api/core";
 
 const store = useDaemonStore();
 
-/* ─── Preset (active profile) ─── */
+/* ─── Preset (active profile) — dropdown góc trên phải ─── */
 const profileName = computed(() => store.status?.active_profile ?? "FLAT");
+const menuOpen = ref(false);
+const menuRef = ref<HTMLElement | null>(null);
 
-function onPresetChange(name: string) {
+function onDocMouseDown(e: MouseEvent) {
+  if (menuRef.value && !menuRef.value.contains(e.target as Node)) {
+    menuOpen.value = false;
+  }
+}
+onMounted(() => document.addEventListener("mousedown", onDocMouseDown));
+onBeforeUnmount(() => document.removeEventListener("mousedown", onDocMouseDown));
+
+function pickProfile(name: string) {
   store.setActiveProfile(name);
+  menuOpen.value = false;
 }
 
 /* ─── EQ ─── */
@@ -77,21 +88,28 @@ async function confirmSave() {
 
 <template>
   <div class="playback-view" :class="{ disabled: disconnected }">
-    <!-- Preset bar -->
-    <div class="preset-bar">
-      <select
-        class="preset-select"
-        :value="profileName"
-        @change="onPresetChange(($event.target as HTMLSelectElement).value)"
+    <!-- Profile dropdown — góc trên bên phải -->
+    <div class="profile-menu" ref="menuRef">
+      <button
+        class="profile-btn"
         :disabled="disconnected"
+        @click="menuOpen = !menuOpen"
       >
-        <option v-for="p in store.profiles" :key="p.name" :value="p.name">
-          {{ p.name }}
-        </option>
-      </select>
-      <button class="epos-btn epos-btn--accent" title="Save preset" :disabled="disconnected" @click="openSave">
-        SAVE
+        {{ profileName }} <ChevronDown :size="12" class="chev" :class="{ open: menuOpen }" />
       </button>
+      <div v-if="menuOpen" class="profile-list">
+        <button
+          v-for="p in store.profiles"
+          :key="p.name"
+          class="profile-item"
+          :class="{ active: p.name === profileName }"
+          @click="pickProfile(p.name)"
+        >
+          {{ p.name }}
+        </button>
+        <div class="profile-sep" />
+        <button class="profile-item profile-save" @click="openSave">+ SAVE PRESET</button>
+      </div>
     </div>
 
     <!-- Mode toggle -->
@@ -189,25 +207,89 @@ async function confirmSave() {
   pointer-events: none;
 }
 
-/* Preset bar */
-.preset-bar {
-  display: flex;
-  gap: 8px;
+/* Profile dropdown — góc trên bên phải (như GSX 300 thật) */
+.playback-view {
+  position: relative;
 }
-.preset-select {
-  flex: 1;
-  padding: 8px 12px;
-  background: var(--panel);
-  border: 1px solid var(--border);
+.profile-menu {
+  position: absolute;
+  top: 0;
+  right: 0;
+  z-index: 40;
+}
+.profile-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  background: transparent;
+  border: 1px solid transparent;
   border-radius: 6px;
-  color: var(--text);
+  color: #fff;
   font-size: var(--fs-sm);
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
   font-family: var(--font-ui);
   cursor: pointer;
 }
-.preset-select:focus {
-  border-color: var(--accent);
-  outline: none;
+.profile-btn:hover {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: var(--border);
+}
+.profile-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.profile-btn .chev {
+  transition: transform var(--time-fast) var(--ease);
+}
+.profile-btn .chev.open {
+  transform: rotate(180deg);
+}
+.profile-list {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 180px;
+  background: #000;
+  border: 1px solid #2a2f35;
+  border-radius: 8px;
+  padding: 4px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.7);
+}
+.profile-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 8px 12px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: #fff;
+  font-size: var(--fs-sm);
+  font-family: var(--font-ui);
+  letter-spacing: 0.5px;
+  cursor: pointer;
+}
+.profile-item:hover {
+  background: #1a1f24;
+}
+.profile-item.active {
+  color: var(--accent);
+  background: #101418;
+}
+.profile-sep {
+  height: 1px;
+  margin: 4px 8px;
+  background: #262b31;
+}
+.profile-save {
+  color: var(--muted);
+}
+.profile-save:hover {
+  color: var(--accent);
+  background: #1a1f24;
 }
 
 /* Mode pill */

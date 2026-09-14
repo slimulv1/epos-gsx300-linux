@@ -219,8 +219,8 @@ function draw() {
     const strokeSmooth = (width: number, color: string, shadow: boolean) => {
       ctx.save();
       if (shadow) {
-        ctx.shadowColor = "rgba(78, 205, 196, 0.4)";
-        ctx.shadowBlur = 7;
+        ctx.shadowColor = "rgba(78, 205, 196, 0.45)";
+        ctx.shadowBlur = 4.5;
       }
       ctx.strokeStyle = color;
       ctx.lineWidth = width;
@@ -236,9 +236,9 @@ function draw() {
       ctx.restore();
     };
 
-    // 64Hz → 16kHz: uniform, full glow
-    strokeSmooth(6.5, "rgba(78, 205, 196, 0.34)", true);
-    strokeSmooth(3, "#4ecdc4", false);
+    // 64Hz → 16kHz: uniform body, tight glow (device-accurate, not a wide haze)
+    strokeSmooth(3.5, "rgba(78, 205, 196, 0.28)", true);
+    strokeSmooth(2.2, "#4ecdc4", false);
 
     // Tail endpoints: extend in the direction leaving the outermost band,
     // same length both sides (balanced), kept inside the padding
@@ -266,10 +266,10 @@ function draw() {
         const by = far.y + (band.y - far.y) * f1;
         // Glow layer
         ctx.save();
-        ctx.shadowColor = "rgba(78, 205, 196, 0.4)";
-        ctx.shadowBlur = 7;
-        ctx.strokeStyle = `rgba(78, 205, 196, ${(0.34 * fade * 0.75 + 0.04).toFixed(3)})`;
-        ctx.lineWidth = 1.5 + 5 * fade;
+        ctx.shadowColor = "rgba(78, 205, 196, 0.45)";
+        ctx.shadowBlur = 4.5;
+        ctx.strokeStyle = `rgba(78, 205, 196, ${(0.28 * fade * 0.75 + 0.04).toFixed(3)})`;
+        ctx.lineWidth = 1 + 2.5 * fade;
         ctx.lineCap = "round";
         ctx.beginPath();
         ctx.moveTo(ax, ay);
@@ -279,7 +279,7 @@ function draw() {
         // Main line
         ctx.save();
         ctx.strokeStyle = `rgba(78, 205, 196, ${(0.95 * fade).toFixed(3)})`;
-        ctx.lineWidth = 0.9 + 1.3 * fade;
+        ctx.lineWidth = 0.9 + 1.1 * fade;
         ctx.lineCap = "round";
         ctx.beginPath();
         ctx.moveTo(ax, ay);
@@ -293,7 +293,22 @@ function draw() {
     drawTail(extR, pn);
   }
 
-  // No static band dots — hover/drag gets a soft highlight ring instead
+  // Band position dots: bright markers on the curve (device-accurate) —
+  // one glowing dot at each 64..16k notch to show where each band sits
+  ctx.save();
+  for (const band of props.bands) {
+    const x = freqToX(band.freq, w);
+    const y = dbToY(band.gain_db, h);
+    ctx.shadowColor = "rgba(78, 205, 196, 0.95)";
+    ctx.shadowBlur = 5;
+    ctx.fillStyle = "rgba(235, 255, 252, 0.97)";
+    ctx.beginPath();
+    ctx.arc(x, y, 3.2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+
+  // Hover/drag gets a soft highlight ring around the band dot
   props.bands.forEach((band, i) => {
     if (hovered.value === i || dragging.value === i) {
       const x = freqToX(band.freq, w);
