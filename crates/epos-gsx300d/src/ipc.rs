@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{debug, info, warn};
 
 use anyhow::Result;
 
@@ -88,12 +88,12 @@ pub async fn run_server(state: Arc<RwLock<IpcState>>) -> Result<()> {
                 let state = state.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_client(stream, state).await {
-                        error!("Client handler error: {}", e);
+                        debug!("Client handler ended: {}", e);
                     }
                 });
             }
             Err(e) => {
-                error!("Accept error: {}", e);
+                warn!("Accept error: {}", e);
             }
         }
     }
@@ -448,12 +448,12 @@ pub async fn run_http_bridge(state: Arc<RwLock<IpcState>>) -> Result<()> {
                 let state = state.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_http_client(stream, state).await {
-                        error!("HTTP handler error: {}", e);
+                        debug!("HTTP handler ended: {}", e);
                     }
                 });
             }
             Err(e) => {
-                error!("HTTP accept error: {}", e);
+                warn!("HTTP accept error: {}", e);
             }
         }
     }
