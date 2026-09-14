@@ -1,6 +1,7 @@
 <script setup lang="ts">
+import { ref, onMounted, onBeforeUnmount } from "vue";
 import { useDaemonStore } from "../stores/daemon";
-import { Usb, MonitorSpeaker, Radio, Cpu, Volume2 } from "lucide-vue-next";
+import { Usb, MonitorSpeaker, Radio, Cpu, Volume2, ChevronDown } from "lucide-vue-next";
 
 const store = useDaemonStore();
 
@@ -11,6 +12,31 @@ const actionLabels: Record<string, string> = {
   toggle_sidetone: "Toggle sidetone",
   toggle_noise_gate: "Toggle noise gate",
 };
+
+const menuOpen = ref(false);
+const actionMenuRef = ref<HTMLElement | null>(null);
+
+function currentAction(): string {
+  return store.status?.smart_button_action ?? "toggle_mode";
+}
+
+function pickAction(key: string) {
+  store.setSmartButton(key);
+  menuOpen.value = false;
+}
+
+function toggleMenu() {
+  menuOpen.value = !menuOpen.value;
+}
+
+function onDocClick(e: MouseEvent) {
+  if (menuOpen.value && actionMenuRef.value && !actionMenuRef.value.contains(e.target as Node)) {
+    menuOpen.value = false;
+  }
+}
+
+onMounted(() => document.addEventListener("mousedown", onDocClick));
+onBeforeUnmount(() => document.removeEventListener("mousedown", onDocClick));
 </script>
 
 <template>
@@ -71,15 +97,26 @@ const actionLabels: Record<string, string> = {
     <div class="section-card">
       <h3 class="section-title">SMART BUTTON</h3>
       <p class="hint">What happens when you press the dial on the GSX 300.</p>
-      <select
-        class="action-select"
-        :value="store.status?.smart_button_action ?? 'toggle_mode'"
-        @change="store.setSmartButton(($event.target as HTMLSelectElement).value)"
-      >
-        <option v-for="(label, key) in actionLabels" :key="key" :value="key">
-          {{ label }}
-        </option>
-      </select>
+      <div class="action-menu" :class="{ open: menuOpen }" ref="actionMenuRef">
+        <button type="button" class="action-btn" @click="toggleMenu">
+          <span>{{ actionLabels[currentAction()] }}</span>
+          <ChevronDown :size="14" class="action-caret" />
+        </button>
+        <transition name="drop">
+          <div v-if="menuOpen" class="action-list">
+            <button
+              v-for="(label, key) in actionLabels"
+              :key="key"
+              type="button"
+              class="action-item"
+              :class="{ active: key === currentAction() }"
+              @click="pickAction(key)"
+            >
+              {{ label }}
+            </button>
+          </div>
+        </transition>
+      </div>
     </div>
   </div>
 </template>
@@ -190,24 +227,84 @@ const actionLabels: Record<string, string> = {
   font-size: var(--fs-xs);
 }
 
-/* Smart button select */
-.action-select {
+/* Smart button dropdown — black bg, white text */
+.action-menu {
+  position: relative;
+}
+.action-btn {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   width: 100%;
   padding: 10px 12px;
-  background: var(--panel-2);
+  background: #000;
   border: 1px solid var(--border);
   border-radius: 8px;
-  color: var(--text);
+  color: #fff;
   font-size: var(--fs-sm);
   font-family: var(--font-ui);
   cursor: pointer;
+  text-align: left;
 }
-.action-select:hover {
+.action-btn:hover {
   border-color: var(--accent-dim);
 }
-.action-select:focus {
+.action-btn:focus-visible {
   outline: none;
   border-color: var(--accent);
+}
+.action-caret {
+  color: var(--accent);
+  flex-shrink: 0;
+  transition: transform 0.15s ease;
+}
+.action-menu.open .action-caret,
+.action-btn[aria-expanded="true"] .action-caret {
+  transform: rotate(180deg);
+}
+.action-list {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 50;
+  background: #000;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.7);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+}
+.action-item {
+  display: block;
+  width: 100%;
+  padding: 9px 12px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: #fff;
+  font-size: var(--fs-sm);
+  font-family: var(--font-ui);
+  text-align: left;
+  cursor: pointer;
+}
+.action-item:hover {
+  background: rgba(78, 205, 196, 0.12);
+}
+.action-item.active {
+  color: var(--accent);
+  background: rgba(78, 205, 196, 0.08);
+}
+.drop-enter-active,
+.drop-leave-active {
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+.drop-enter-from,
+.drop-leave-to {
+  opacity: 0;
+  transform: translateY(-4px);
 }
 
 /* Responsive: narrow window */
