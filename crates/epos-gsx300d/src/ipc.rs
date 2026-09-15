@@ -13,6 +13,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::RwLock;
+use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 use anyhow::Result;
@@ -71,6 +72,11 @@ pub struct IpcState {
     /// switches inside the 2s poll window, or a knob turn queued behind a
     /// save), silently discarding the newest change.
     pub last_written: std::sync::Mutex<Option<Vec<u8>>>,
+    /// Shared wake-up for the debounced PipeWire-reload worker. Mutation arms
+    /// that change on-disk audio config (EQ / noise gate / voice / profile)
+    /// notify it so the actual `systemctl restart pipewire` runs *outside* the
+    /// IPC lock (see `pipewire_reload_worker` in main.rs).
+    pub reload_notify: Arc<Notify>,
 }
 
 pub async fn run_server(state: Arc<RwLock<IpcState>>) -> Result<()> {
@@ -150,6 +156,9 @@ async fn send_response(writer: &mut (impl AsyncWriteExt + Unpin), resp: &Respons
 }
 
 async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Response {
+    // Clone the shared reload signal up-front; mutation arms notify it so the
+    // actual PipeWire restart runs off the IPC lock.
+    let reload_notify = state.read().await.reload_notify.clone();
     match request {
         // --- Status ---
         Request::GetStatus => {
@@ -216,8 +225,13 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
             state.config.audio.eq = eq.eq;
             let audio_cfg = state.config.audio.clone();
             state.audio.update_config(&audio_cfg);
-            if let Err(e) = state.audio.apply_eq().await {
-                warn!("Failed to apply EQ: {}", e);
+            match state.audio.apply_eq().await {
+                Ok(changed) => {
+                    if changed {
+                        reload_notify.notify_one();
+                    }
+                }
+                Err(e) => warn!("Failed to apply EQ: {}", e),
             }
             Response::Ok
         }
@@ -245,8 +259,13 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
             state.config.audio.noise_gate.threshold_db = threshold_db;
             let audio_cfg = state.config.audio.clone();
             state.audio.update_config(&audio_cfg);
-            if let Err(e) = state.audio.apply_noise_gate().await {
-                warn!("Failed to apply noise gate: {}", e);
+            match state.audio.apply_noise_gate().await {
+                Ok(changed) => {
+                    if changed {
+                        reload_notify.notify_one();
+                    }
+                }
+                Err(e) => warn!("Failed to apply noise gate: {}", e),
             }
             Response::Ok
         }
@@ -265,8 +284,13 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
             state.config.audio.voice_enhancer.custom_bands = custom_bands;
             let audio_cfg = state.config.audio.clone();
             state.audio.update_config(&audio_cfg);
-            if let Err(e) = state.audio.apply_voice_enhancer().await {
-                warn!("Failed to apply voice enhancer: {}", e);
+            match state.audio.apply_voice_enhancer().await {
+                Ok(changed) => {
+                    if changed {
+                        reload_notify.notify_one();
+                    }
+                }
+                Err(e) => warn!("Failed to apply voice enhancer: {}", e),
             }
             Response::Ok
         }
@@ -350,8 +374,13 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
                 // would be silently ignored.
                 let audio_cfg = state.config.audio.clone();
                 state.audio.update_config(&audio_cfg);
-                if let Err(e) = state.audio.apply_full().await {
-                    warn!("Failed to apply profile: {}", e);
+                match state.audio.apply_full().await {
+                    Ok(changed) => {
+                        if changed {
+                            reload_notify.notify_one();
+                        }
+                    }
+                    Err(e) => warn!("Failed to apply profile: {}", e),
                 }
                 Response::Ok
             } else {
@@ -390,8 +419,13 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
                         state.config.active_profile = profile.name.clone();
                         let audio_cfg = state.config.audio.clone();
                         state.audio.update_config(&audio_cfg);
-                        if let Err(e) = state.audio.apply_full().await {
-                            warn!("Failed to apply fallback profile: {}", e);
+                        match state.audio.apply_full().await {
+                            Ok(changed) => {
+                                if changed {
+                                    reload_notify.notify_one();
+                                }
+                            }
+                            Err(e) => warn!("Failed to apply fallback profile: {}", e),
                         }
                         info!(
                             "Deleted active profile '{}' → fallback to '{}'",
@@ -403,8 +437,13 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
                         state.config.active_profile = String::from("Flat");
                         let audio_cfg = state.config.audio.clone();
                         state.audio.update_config(&audio_cfg);
-                        if let Err(e) = state.audio.apply_full().await {
-                            warn!("Failed to apply default audio: {}", e);
+                        match state.audio.apply_full().await {
+                            Ok(changed) => {
+                                if changed {
+                                    reload_notify.notify_one();
+                                }
+                            }
+                            Err(e) => warn!("Failed to apply default audio: {}", e),
                         }
                         info!("Deleted last profile '{}' → reset to defaults", name);
                     }
@@ -442,8 +481,13 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
             match config::load() {
                 Ok(new_config) => {
                     state.config = new_config;
-                    if let Err(e) = state.audio.apply_full().await {
-                        warn!("Failed to apply reloaded config: {}", e);
+                    match state.audio.apply_full().await {
+                        Ok(changed) => {
+                            if changed {
+                                reload_notify.notify_one();
+                            }
+                        }
+                        Err(e) => warn!("Failed to apply reloaded config: {}", e),
                     }
                     Response::Ok
                 }
@@ -454,6 +498,10 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
         },
         Request::Quit => {
             info!("Quit requested via IPC");
+            // Kill the sidetone loopback child before exiting — std::process::exit
+            // bypasses Drop, so the orphaned pw-loopback would keep running.
+            let mut state = state.write().await;
+            state.audio.kill_sidetone().await;
             std::process::exit(0);
         }
     }
@@ -600,7 +648,7 @@ async fn process_http_body(
     // Persist config after mutations (same rule as Unix socket)
     if matches!(response, Response::Ok) && is_mutation {
         let st = state.read().await;
-        if let Err(e) = config::save(&st.config) {
+        if let Err(e) = crate::save_config(&st) {
             warn!("Failed to save config (http): {}", e);
         }
     }

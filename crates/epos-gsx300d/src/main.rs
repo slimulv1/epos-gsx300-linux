@@ -14,7 +14,8 @@ use anyhow::Result;
 use epos_shared::config::AudioMode;
 use epos_shared::config::SmartButtonAction;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use std::time::Duration;
+use tokio::sync::{mpsc, Notify, RwLock};
 use tracing::{info, warn};
 
 #[tokio::main]
@@ -110,6 +111,7 @@ async fn main() -> Result<()> {
         device: None,
         pipewire_nodes: None,
         last_written: std::sync::Mutex::new(None),
+        reload_notify: Arc::new(Notify::new()),
     }));
 
     // Background task: handle smart button presses (mode sync) according to
@@ -188,8 +190,13 @@ async fn main() -> Result<()> {
                                     st.config.active_profile = name.clone();
                                     let audio_cfg = st.config.audio.clone();
                                     st.audio.update_config(&audio_cfg);
-                                    if let Err(e) = st.audio.apply_full().await {
-                                        warn!("Failed to apply profile: {}", e);
+                                    match st.audio.apply_full().await {
+                                        Ok(changed) => {
+                                            if changed {
+                                                st.reload_notify.notify_one();
+                                            }
+                                        }
+                                        Err(e) => warn!("Failed to apply profile: {}", e),
                                     }
                                     if let Err(e) = save_config(&st) {
                                         warn!("Failed to save config: {}", e);
@@ -329,6 +336,14 @@ async fn main() -> Result<()> {
         volume_watch_loop(state_clone).await;
     });
 
+    // Debounced PipeWire-reload worker: any handler that changed on-disk audio
+    // config notifies it; the actual `systemctl restart pipewire` runs here, off
+    // the IPC lock, so audio tweaks never block the GUI's GetStatus poll.
+    let state_clone = state.clone();
+    let _reload_handle = tokio::spawn(async move {
+        pipewire_reload_worker(state_clone).await;
+    });
+
     // Graceful shutdown: SIGTERM/SIGINT → reset LED to blue, then exit.
     // (Drop impls do NOT run on signal kill, so we handle it explicitly.)
     {
@@ -352,6 +367,9 @@ async fn main() -> Result<()> {
                     // after the daemon stops.
                     let _ = led.set_mode(AudioMode::Stereo);
                 }
+                // Kill the sidetone loopback child — std::process::exit bypasses
+                // Drop, so without this the orphaned pw-loopback keeps mixing mic.
+                st.audio.kill_sidetone().await;
                 std::process::exit(0);
             }
         });
@@ -523,8 +541,13 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
                     }
                 }
                 st.audio.set_device(d);
-                if let Err(e) = st.audio.apply_full().await {
-                    warn!("Failed to apply audio config on connect: {}", e);
+                match st.audio.apply_full().await {
+                    Ok(changed) => {
+                        if changed {
+                            st.reload_notify.notify_one();
+                        }
+                    }
+                    Err(e) => warn!("Failed to apply audio config on connect: {}", e),
                 }
                 // Restore host-side dial volume onto the real sink so the
                 // knob position matches the actual output level after (re)plug.
@@ -604,6 +627,26 @@ fn save_config(st: &IpcState) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Background worker: debounced `systemctl --user restart pipewire`.
+///
+/// Handlers that change on-disk audio config (EQ / noise gate / voice / profile
+/// switches) call `reload_notify.notify_one()` instead of restarting PipeWire
+/// inline. This worker coalesces those notifications and performs the restart
+/// once, off the IPC lock — so a fast slider drag or a burst of profile
+/// switches triggers a single reload, and the GUI's 3s GetStatus poll never
+/// stalls waiting on a 1–3s blocking restart.
+async fn pipewire_reload_worker(state: Arc<RwLock<IpcState>>) {
+    let notify = state.read().await.reload_notify.clone();
+    loop {
+        notify.notified().await;
+        // Coalesce rapid changes (e.g. an EQ slider drag) into a single reload:
+        // keep waiting up to 250ms for more notifications before firing.
+        while let Ok(()) = tokio::time::timeout(Duration::from_millis(250), notify.notified()).await {}
+        info!("PipeWire reload (debounced) triggered by audio config change");
+        audio::reload_pipewire().await;
+    }
+}
+
 /// Polls the config file mtime every 2s. When it changes, reloads and applies:
 /// - audio changes  → update_config + apply_full (EQ / voice / noise / sidetone / mic gain)
 /// - mode changes   → re-sync LED ring
@@ -668,8 +711,13 @@ async fn config_watch_loop(state: Arc<RwLock<IpcState>>) {
         if audio_changed {
             let audio_cfg = st.config.audio.clone();
             st.audio.update_config(&audio_cfg);
-            if let Err(e) = st.audio.apply_full().await {
-                warn!("Failed to apply reloaded audio config: {}", e);
+            match st.audio.apply_full().await {
+                Ok(changed) => {
+                    if changed {
+                        st.reload_notify.notify_one();
+                    }
+                }
+                Err(e) => warn!("Failed to apply reloaded audio config: {}", e),
             }
             info!("Config hot-reload: audio settings applied");
         }

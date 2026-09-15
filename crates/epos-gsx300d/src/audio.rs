@@ -40,17 +40,17 @@ impl AudioPipeline {
         self.config = config.clone();
     }
 
-    /// Apply all audio settings to the device
-    pub async fn apply_full(&mut self) -> Result<()> {
+    /// Apply the full audio config (EQ, mic gain, sidetone, noise gate, voice).
+    /// Returns whether any on-disk PipeWire config changed (i.e. a reload is
+    /// needed). The actual `systemctl restart pipewire` is performed by the
+    /// debounced [`pipewire_reload_worker`] so it never runs under the IPC lock.
+    pub async fn apply_full(&mut self) -> Result<bool> {
         self.apply_mic_gain().await?;
         let mut changed = false;
         changed |= self.write_eq_conf()?;
         self.apply_sidetone().await?;
         changed |= self.write_noise_gate_conf()?;
         changed |= self.write_voice_conf()?;
-        if changed {
-            reload_pipewire().await;
-        }
         // WirePlumber's device.restore-routes replays the saved input
         // channelVolume (stored as 1.0 in ~/.local/state/wireplumber/
         // default-routes) when the ALSA capture node activates, usually a
@@ -65,7 +65,7 @@ impl AudioPipeline {
                 let _ = apply_mic_gain_oneshot(&dev, gain).await;
             }
         });
-        Ok(())
+        Ok(changed)
     }
 
     /// Apply configuration and device together
@@ -73,7 +73,11 @@ impl AudioPipeline {
     pub async fn apply(&mut self, config: &AudioConfig, device: &DeviceInfo) -> Result<()> {
         self.config = config.clone();
         self.device = Some(device.clone());
-        self.apply_full().await
+        // apply_full now returns whether on-disk config changed; callers that
+        // care use the debounced reload worker. `apply` is retained for API
+        // symmetry and discards that flag.
+        self.apply_full().await?;
+        Ok(())
     }
 
     // ─── Mic Gain ─────────────────────────────────────────────
@@ -141,12 +145,9 @@ impl AudioPipeline {
     }
 
     /// Apply EQ from config — write config + restart PipeWire if changed.
-    pub async fn apply_eq(&mut self) -> Result<()> {
-        if self.write_eq_conf()? {
-            // PipeWire needs a restart to load the new filter-chain module
-            reload_pipewire().await;
-        }
-        Ok(())
+    /// Returns true if the on-disk EQ config changed (reload needed).
+    pub async fn apply_eq(&mut self) -> Result<bool> {
+        self.write_eq_conf()
     }
 
     // ─── Sidetone ─────────────────────────────────────────────
@@ -290,11 +291,9 @@ context.modules = [
     }
 
     /// Apply noise gate from config — write config + restart PipeWire if changed.
-    pub async fn apply_noise_gate(&self) -> Result<()> {
-        if self.write_noise_gate_conf()? {
-            reload_pipewire().await;
-        }
-        Ok(())
+    /// Returns true if the on-disk noise-gate config changed (reload needed).
+    pub async fn apply_noise_gate(&self) -> Result<bool> {
+        self.write_noise_gate_conf()
     }
 
     // ─── Voice Enhancer ───────────────────────────────────────
@@ -394,21 +393,18 @@ context.modules = [
         }
     }
 
-    /// Apply voice enhancer — write config + restart PipeWire if changed.
-    pub async fn apply_voice_enhancer(&self) -> Result<()> {
-        if self.write_voice_conf()? {
-            reload_pipewire().await;
-        }
-        Ok(())
+    /// Apply voice enhancer — write the filter config. Returns true if the
+    /// on-disk config changed (the debounced worker performs the PipeWire reload).
+    pub async fn apply_voice_enhancer(&self) -> Result<bool> {
+        self.write_voice_conf()
     }
-}
 
-impl Drop for AudioPipeline {
-    fn drop(&mut self) {
-        // Kill sidetone process on shutdown
+    /// Kill the sidetone loopback child (used on shutdown, since
+    /// `std::process::exit` bypasses `Drop`).
+    pub async fn kill_sidetone(&mut self) {
         if let Some(mut proc) = self.sidetone_proc.take() {
-            let _ = proc.start_kill();
-            info!("Killed sidetone process on shutdown");
+            let _ = proc.kill().await;
+            info!("Killed sidetone process on exit");
         }
     }
 }
@@ -586,7 +582,7 @@ context.modules = [
 
 /// Reload PipeWire so filter-chain module configs take effect.
 /// Restarts the user pipewire service (fast — <1s) to load new .conf.d files.
-async fn reload_pipewire() {
+pub(crate) async fn reload_pipewire() {
     let status = tokio::process::Command::new("systemctl")
         .args(["--user", "restart", "pipewire"])
         .status()
@@ -645,4 +641,15 @@ async fn apply_mic_gain_oneshot(device: &DeviceInfo, gain: u32) -> Result<()> {
         warn!("amixer mic gain failed: {}", last_stderr);
     }
     Ok(())
+}
+
+impl Drop for AudioPipeline {
+    fn drop(&mut self) {
+        // Kill sidetone process on shutdown so an orphaned pw-loopback doesn't
+        // keep mixing mic into playback after the daemon exits.
+        if let Some(mut proc) = self.sidetone_proc.take() {
+            let _ = proc.start_kill();
+            info!("Killed sidetone process on shutdown");
+        }
+    }
 }
