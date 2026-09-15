@@ -211,7 +211,7 @@ fn find_pipewire_nodes(_card: u8) -> (String, String) {
                 continue;
             }
             if in_node {
-                if t == "}" || t == "}" || t.starts_with(']') {
+                if t == "}" || t.starts_with(']') {
                     // node object boundary — evaluate collected props
                     let desc = props.iter().find(|(k, _)| k == "node.description");
                     let name = props.iter().find(|(k, _)| k == "node.name");
