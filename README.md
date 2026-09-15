@@ -9,7 +9,7 @@ archive of the device (firmware, HID protocol, hardware internals).
 ## Features
 
 - 9-band parametric EQ with draggable curve (real-time PipeWire filter-chain)
-- Preset system (Flat, Music, Movie, eSport + custom)
+- Preset system (Flat, Music, Movie, ESPORT TREBLE)
 - Sidetone (mic monitoring)
 - Voice enhancer (Warm / Clear / **Custom** — custom bands built from current EQ)
 - Noise gate (rnnoise, real-time neural noise suppression, threshold-tunable)
@@ -24,7 +24,7 @@ archive of the device (firmware, HID protocol, hardware internals).
 .
 ├── crates/
 │   ├── epos-gsx300d/       Rust daemon — audio DSP + device control
-│   │   └── src/            (audio, hid, led, devices, ipc, mic_meter)
+│   │   └── src/            (audio, hid, led, devices, ipc, mic_meter, config)
 │   ├── epos-gsx300-gui/    Tauri 2.x + Vue 3 desktop app (Pinia + Naive UI)
 │   └── epos-shared/        Shared crate — IPC types, device IDs, config schema
 ├── docs/
@@ -135,11 +135,15 @@ codec. Key facts that shape the daemon design:
 - **Sidetone** (REVERBERATION in the GUI) is the one device-resident
   DSP feature and is controlled via vendor HID commands.
 - **HID protocol** (fully decoded, see `src/led.rs` header): Report 0x01
-  = volume dial (incremental detents only, no absolute readback), 0x02 =
-  LED / button state (2-bit output, 3-bit input), 0x04/0x05/0x06/0x07/
-  0x1A = undisclosed vendor commands. Because the dial exposes only
-  relative detents, the daemon tracks the volume level host-side and
-  reports it via `GetStatus` for the GUI.
+  = volume dial (incremental detents only, **±2% per detent**, measured on
+  hardware; no absolute readback), 0x02 = LED / button state (2-bit output,
+  3-bit input), 0x04/0x05/0x06/0x07/0x1A = undisclosed vendor commands.
+  Because the dial exposes only relative detents, the daemon **writes the
+  EPOS PipeWire sink directly** (`pactl set-sink-volume`, ±2% per turn) and
+  runs a `volume_watch_loop` that polls the sink and syncs **external** volume
+  changes (keyboard media keys, DE controls, `wpctl`) back into `st.volume`,
+  so `GetStatus` always reports the true sink volume — knob and host stay in
+  lock-step.
 
 ## Security notes
 
@@ -193,7 +197,7 @@ alongside `epos-eq-*` and `epos-voice-*` filter nodes.
 - **Audio**: PipeWire filter-chain (EQ / voice enhancer / noise gate)
 - **USB**: udev rules (no root needed) + rusb + hidapi
 - **IPC**: Unix socket (daemon ↔ GUI) + HTTP bridge (127.0.0.1:9898)
-- **Config**: JSON at `~/.config/epos-gsx300/config.json` (auto-reload on save)
+- **Config**: JSON at `~/.config/epos-gsx300/config.json` (external edits are hot-reloaded; the daemon's own saves don't trigger a redundant reload)
 
 ## License
 
