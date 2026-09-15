@@ -109,6 +109,7 @@ async fn main() -> Result<()> {
         hw_info,
         device: None,
         pipewire_nodes: None,
+        last_written: std::sync::Mutex::new(None),
     }));
 
     // Background task: handle smart button presses (mode sync) according to
@@ -143,7 +144,7 @@ async fn main() -> Result<()> {
                                 },
                             };
                             st.config.mode = new_mode;
-                            if let Err(e) = config::save(&st.config) {
+                            if let Err(e) = save_config(&st) {
                                 warn!("Failed to save config: {}", e);
                             }
                             if let Some(ref mut led) = st.led {
@@ -161,7 +162,7 @@ async fn main() -> Result<()> {
                             if let Err(e) = st.audio.apply_eq().await {
                                 warn!("Failed to toggle EQ: {}", e);
                             }
-                            if let Err(e) = config::save(&st.config) {
+                            if let Err(e) = save_config(&st) {
                                 warn!("Failed to save config: {}", e);
                             }
                             info!("Smart button: EQ {}", if enabled { "ON" } else { "OFF" });
@@ -190,7 +191,7 @@ async fn main() -> Result<()> {
                                     if let Err(e) = st.audio.apply_full().await {
                                         warn!("Failed to apply profile: {}", e);
                                     }
-                                    if let Err(e) = config::save(&st.config) {
+                                    if let Err(e) = save_config(&st) {
                                         warn!("Failed to save config: {}", e);
                                     }
                                     info!("Smart button: profile → {}", name);
@@ -205,7 +206,7 @@ async fn main() -> Result<()> {
                             if let Err(e) = st.audio.apply_sidetone().await {
                                 warn!("Failed to toggle sidetone: {}", e);
                             }
-                            if let Err(e) = config::save(&st.config) {
+                            if let Err(e) = save_config(&st) {
                                 warn!("Failed to save config: {}", e);
                             }
                             info!(
@@ -221,7 +222,7 @@ async fn main() -> Result<()> {
                             if let Err(e) = st.audio.apply_noise_gate().await {
                                 warn!("Failed to toggle noise gate: {}", e);
                             }
-                            if let Err(e) = config::save(&st.config) {
+                            if let Err(e) = save_config(&st) {
                                 warn!("Failed to save config: {}", e);
                             }
                             info!(
@@ -286,7 +287,7 @@ async fn main() -> Result<()> {
                         let mut st = s.write().await;
                         let v = st.volume.load(std::sync::atomic::Ordering::Relaxed);
                         st.config.device.volume = Some(v);
-                        if let Err(e) = config::save(&st.config) {
+                        if let Err(e) = save_config(&st) {
                             warn!("Failed to save volume to config: {}", e);
                         }
                     });
@@ -474,7 +475,7 @@ async fn volume_watch_loop(state: Arc<RwLock<IpcState>>) {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             let mut st = s.write().await;
             st.config.device.volume = Some(v);
-            if let Err(e) = config::save(&st.config) {
+            if let Err(e) = save_config(&st) {
                 warn!("Failed to save volume to config: {}", e);
             }
         });
@@ -592,13 +593,25 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
 
 /// Background task: watch config file for external edits and hot-apply them.
 ///
+/// Persists the daemon's config to disk and records the exact bytes written so
+/// `config_watch_loop` can recognize the daemon's own atomic `save()` and skip
+/// it — instead of reloading and reverting newer in-memory state.
+fn save_config(st: &IpcState) -> Result<(), anyhow::Error> {
+    config::save(&st.config)?;
+    if let Ok(bytes) = std::fs::read(config::config_path()) {
+        *st.last_written.lock().unwrap() = Some(bytes);
+    }
+    Ok(())
+}
+
 /// Polls the config file mtime every 2s. When it changes, reloads and applies:
 /// - audio changes  → update_config + apply_full (EQ / voice / noise / sidetone / mic gain)
 /// - mode changes   → re-sync LED ring
 /// - anything else  (e.g. smart button action) → just update in-memory config
 ///
-/// The daemon's own atomic `save()` writes are skipped via content comparison,
-/// so we only react to edits made *outside* the daemon.
+/// The daemon's own atomic `save()` writes are recognized by comparing the
+/// on-disk bytes against the snapshot recorded at write time, so we only react
+/// to edits made *outside* the daemon.
 async fn config_watch_loop(state: Arc<RwLock<IpcState>>) {
     let path = config::config_path();
     let mut last_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
@@ -612,6 +625,26 @@ async fn config_watch_loop(state: Arc<RwLock<IpcState>>) {
         }
         last_mtime = mtime;
 
+        // Read the raw file bytes before parsing so we can recognize the
+        // daemon's own atomic write. If they match what we last wrote, this
+        // mtime change came from a daemon `save()` — skip it. This prevents a
+        // spurious hot-reload from reverting in-memory state that has advanced
+        // past the on-disk snapshot (e.g. two rapid profile switches inside the
+        // 2s poll window, or a knob turn queued behind a save).
+        let disk_bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        {
+            let s = state.read().await;
+            if *s.last_written.lock().unwrap() == Some(disk_bytes.clone()) {
+                // This mtime change came from the daemon's own atomic `save()`;
+                // skip it so we don't revert in-memory state that has advanced
+                // past the on-disk snapshot.
+                continue;
+            }
+        }
+
         let new_config = match config::load() {
             Ok(c) => c,
             Err(e) => {
@@ -622,16 +655,6 @@ async fn config_watch_loop(state: Arc<RwLock<IpcState>>) {
         };
 
         let mut st = state.write().await;
-
-        // Skip if the change was the daemon's own atomic write (content identical).
-        let same_content = serde_json::to_value(&st.config)
-            .ok()
-            .zip(serde_json::to_value(&new_config).ok())
-            .map(|(a, b)| a == b)
-            .unwrap_or(false);
-        if same_content {
-            continue;
-        }
 
         let audio_changed = serde_json::to_value(&st.config.audio)
             .ok()
@@ -662,6 +685,7 @@ async fn config_watch_loop(state: Arc<RwLock<IpcState>>) {
         if !audio_changed && !mode_changed {
             info!("Config hot-reload: non-audio settings updated");
         }
+        *st.last_written.lock().unwrap() = Some(disk_bytes);
     }
 }
 

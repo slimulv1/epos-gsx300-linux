@@ -63,6 +63,14 @@ pub struct IpcState {
     /// by the hotplug loop only on (re)connect; lets the loop's `detect()`
     /// skip the blocking `pw-dump` subprocess on every 5s poll.
     pub pipewire_nodes: Option<(String, String)>,
+    /// Raw bytes of the config file as last written by the daemon itself.
+    /// `config_watch_loop` compares the on-disk bytes against this so it can
+    /// tell the daemon's own atomic `save()` apart from a genuine external
+    /// edit — without this, a hot-reload would revert in-memory state that
+    /// has advanced past the on-disk snapshot (e.g. two rapid profile
+    /// switches inside the 2s poll window, or a knob turn queued behind a
+    /// save), silently discarding the newest change.
+    pub last_written: std::sync::Mutex<Option<Vec<u8>>>,
 }
 
 pub async fn run_server(state: Arc<RwLock<IpcState>>) -> Result<()> {
@@ -117,10 +125,7 @@ async fn handle_client(stream: UnixStream, state: Arc<RwLock<IpcState>>) -> Resu
 
         let is_mutation = request_is_mutation(&request);
 
-        let response = {
-            let mut st = state.write().await;
-            handle_request(request, &mut st).await
-        };
+        let response = handle_request(request, state.clone()).await;
 
         send_response(&mut writer, &response).await?;
 
@@ -128,7 +133,7 @@ async fn handle_client(stream: UnixStream, state: Arc<RwLock<IpcState>>) -> Resu
         // (the GUI polls GetStatus every 3s) must not churn the file.
         if matches!(response, Response::Ok) && is_mutation {
             let st = state.read().await;
-            if let Err(e) = config::save(&st.config) {
+            if let Err(e) = crate::save_config(&st) {
                 warn!("Failed to save config: {}", e);
             }
         }
@@ -144,10 +149,11 @@ async fn send_response(writer: &mut (impl AsyncWriteExt + Unpin), resp: &Respons
     Ok(())
 }
 
-async fn handle_request(request: Request, state: &mut IpcState) -> Response {
+async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Response {
     match request {
         // --- Status ---
         Request::GetStatus => {
+            let state = state.read().await;
             // Use the hotplug loop's 5s cache — avoids re-spawning pw-dump on
             // every GUI poll. Fall back to a fresh scan only before the loop
             // has seeded (first request racing startup).
@@ -173,21 +179,25 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
             // Device identity comes from the 5s hotplug cache (fresh enough
             // for a GUI poll); the live register snapshot below is re-read
             // on every request so runtime state is never stale.
-            let mut device = if state.device.is_some() {
-                state.device.clone()
-            } else {
-                devices::detect().await
+            // Clone the cached device + firmware identity under a short read
+            // lock, then DROP the lock before the blocking ~80ms HID read so a
+            // GetDevice can't stall the rest of the IPC surface (the GUI's 3s
+            // GetStatus poll shares the same lock).
+            let (mut device, hw_info) = {
+                let state = state.read().await;
+                (state.device.clone(), state.hw_info.clone())
             };
             // Merge firmware identity probed read-only from the memory bus at
             // startup (firmware version string + chip ID). Keep raw USB info
             // from the fresh detect.
             if let Some(ref mut d) = device {
-                d.firmware_version = state.hw_info.firmware_version.clone();
-                d.chip_id = state.hw_info.chip_id;
+                d.firmware_version = hw_info.firmware_version.clone();
+                d.chip_id = hw_info.chip_id;
                 // Live read-only snapshot of the runtime state registers
                 // (mode state, LED shift pair, EQ indices, encoder positions).
                 // Best-effort: a timeout leaves fields None, never fails the
                 // whole response. Pure read — bit6 (EEPROM write) never set.
+                // Runs WITHOUT the IPC lock held.
                 if let Some(path) = d.hidraw.clone() {
                     let snap = hwinfo::snapshot(&path);
                     d.hw_snapshot = if snap.is_empty() { None } else { Some(snap) };
@@ -197,10 +207,15 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
         }
 
         // --- EQ ---
-        Request::GetEq => Response::Eq(state.config.audio.clone()),
+        Request::GetEq => {
+            let state = state.read().await;
+            Response::Eq(state.config.audio.clone())
+        },
         Request::SetEq { eq } => {
+            let mut state = state.write().await;
             state.config.audio.eq = eq.eq;
-            state.audio.update_config(&state.config.audio);
+            let audio_cfg = state.config.audio.clone();
+            state.audio.update_config(&audio_cfg);
             if let Err(e) = state.audio.apply_eq().await {
                 warn!("Failed to apply EQ: {}", e);
             }
@@ -209,9 +224,11 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
 
         // --- Sidetone ---
         Request::SetSidetone { enabled, level } => {
+            let mut state = state.write().await;
             state.config.audio.sidetone.enabled = enabled;
             state.config.audio.sidetone.level = level;
-            state.audio.update_config(&state.config.audio);
+            let audio_cfg = state.config.audio.clone();
+            state.audio.update_config(&audio_cfg);
             if let Err(e) = state.audio.apply_sidetone().await {
                 warn!("Failed to apply sidetone: {}", e);
             }
@@ -223,9 +240,11 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
             enabled,
             threshold_db,
         } => {
+            let mut state = state.write().await;
             state.config.audio.noise_gate.enabled = enabled;
             state.config.audio.noise_gate.threshold_db = threshold_db;
-            state.audio.update_config(&state.config.audio);
+            let audio_cfg = state.config.audio.clone();
+            state.audio.update_config(&audio_cfg);
             if let Err(e) = state.audio.apply_noise_gate().await {
                 warn!("Failed to apply noise gate: {}", e);
             }
@@ -234,6 +253,7 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
 
         // --- Voice Enhancer ---
         Request::SetVoiceEnhancer { mode, custom_bands } => {
+            let mut state = state.write().await;
             use epos_shared::config::VoiceMode;
             let voice_mode = match mode.as_str() {
                 "warm" => VoiceMode::Warm,
@@ -243,7 +263,8 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
             };
             state.config.audio.voice_enhancer.mode = voice_mode;
             state.config.audio.voice_enhancer.custom_bands = custom_bands;
-            state.audio.update_config(&state.config.audio);
+            let audio_cfg = state.config.audio.clone();
+            state.audio.update_config(&audio_cfg);
             if let Err(e) = state.audio.apply_voice_enhancer().await {
                 warn!("Failed to apply voice enhancer: {}", e);
             }
@@ -252,6 +273,7 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
 
         // --- Mic ---
         Request::SetMicGain { gain } => {
+            let mut state = state.write().await;
             state.config.audio.mic_gain = gain;
             // Sync into the pipeline's config copy — apply_mic_gain reads
             // self.config.mic_gain, and without this the handler applied the
@@ -265,12 +287,13 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
         }
 
         // --- Audio Mode / LED ---
-        Request::GetMode => Response::Mode(state.config.mode),
+        Request::GetMode => {
+            let state = state.read().await;
+            Response::Mode(state.config.mode)
+        },
         Request::SetMode { mode } => {
+            let mut state = state.write().await;
             state.config.mode = mode;
-            if let Err(e) = config::save(&state.config) {
-                warn!("Failed to save config: {}", e);
-            }
             // Update LED color
             if let Some(ref mut led) = state.led {
                 if let Err(e) = led.set_mode(mode) {
@@ -288,14 +311,12 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
             Response::Ok
         }
         Request::ToggleMode => {
+            let mut state = state.write().await;
             let new_mode = match state.config.mode {
                 AudioMode::Stereo => AudioMode::Surround71,
                 AudioMode::Surround71 => AudioMode::Stereo,
             };
             state.config.mode = new_mode;
-            if let Err(e) = config::save(&state.config) {
-                warn!("Failed to save config: {}", e);
-            }
             // Update LED color
             if let Some(ref mut led) = state.led {
                 if let Err(e) = led.set_mode(new_mode) {
@@ -314,11 +335,21 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
         }
 
         // --- Profiles ---
-        Request::GetProfiles => Response::Profiles(state.config.profiles.clone()),
+        Request::GetProfiles => {
+            let state = state.read().await;
+            Response::Profiles(state.config.profiles.clone())
+        },
         Request::SetActiveProfile { name } => {
+            let mut state = state.write().await;
             if let Some(profile) = state.config.profiles.iter().find(|p| p.name == name) {
                 state.config.audio = profile.audio.clone();
                 state.config.active_profile = name;
+                // Sync the selected profile into the pipeline's own config copy
+                // BEFORE applying — apply_full() reads self.config, so without
+                // this the OLD pipeline config would be applied and the switch
+                // would be silently ignored.
+                let audio_cfg = state.config.audio.clone();
+                state.audio.update_config(&audio_cfg);
                 if let Err(e) = state.audio.apply_full().await {
                     warn!("Failed to apply profile: {}", e);
                 }
@@ -330,6 +361,7 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
             }
         }
         Request::CreateProfile { name, audio } => {
+            let mut state = state.write().await;
             let now = chrono_now();
             state.config.profiles.push(epos_shared::Profile {
                 name: name.clone(),
@@ -340,6 +372,7 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
             Response::Ok
         }
         Request::DeleteProfile { name } => {
+            let mut state = state.write().await;
             let before = state.config.profiles.len();
             state.config.profiles.retain(|p| p.name != name);
             if state.config.profiles.len() < before {
@@ -388,6 +421,7 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
 
         // --- Smart Button ---
         Request::SetSmartButton { action } => {
+            let mut state = state.write().await;
             use epos_shared::config::SmartButtonAction;
             let btn_action = match action.as_str() {
                 "toggle_mode" => SmartButtonAction::ToggleMode,
@@ -403,17 +437,20 @@ async fn handle_request(request: Request, state: &mut IpcState) -> Response {
         }
 
         // --- Lifecycle ---
-        Request::Reload => match config::load() {
-            Ok(new_config) => {
-                state.config = new_config;
-                if let Err(e) = state.audio.apply_full().await {
-                    warn!("Failed to apply reloaded config: {}", e);
+        Request::Reload => {
+            let mut state = state.write().await;
+            match config::load() {
+                Ok(new_config) => {
+                    state.config = new_config;
+                    if let Err(e) = state.audio.apply_full().await {
+                        warn!("Failed to apply reloaded config: {}", e);
+                    }
+                    Response::Ok
                 }
-                Response::Ok
+                Err(e) => Response::Error {
+                    message: format!("Reload failed: {}", e),
+                },
             }
-            Err(e) => Response::Error {
-                message: format!("Reload failed: {}", e),
-            },
         },
         Request::Quit => {
             info!("Quit requested via IPC");
@@ -558,10 +595,7 @@ async fn process_http_body(
 
     let is_mutation = request_is_mutation(&request);
 
-    let response = {
-        let mut st = state.write().await;
-        handle_request(request, &mut st).await
-    };
+    let response = handle_request(request, state.clone()).await;
 
     // Persist config after mutations (same rule as Unix socket)
     if matches!(response, Response::Ok) && is_mutation {
