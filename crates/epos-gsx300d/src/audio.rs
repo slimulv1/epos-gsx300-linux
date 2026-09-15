@@ -182,9 +182,7 @@ impl AudioPipeline {
         cmd.arg("--capture").arg(&device.pipewire_source);
         cmd.arg("--playback").arg(&device.pipewire_sink);
         cmd.arg("--capture-props");
-        cmd.arg(format!(
-            "audio.position=[MONO] stream.dont-remix=true node.passive=true"
-        ));
+        cmd.arg("audio.position=[MONO] stream.dont-remix=true node.passive=true");
         cmd.arg("--playback-props");
         // Set volume for sidetone level (0.0 to 1.0)
         let vol = level.clamp(0.0, 1.0);
@@ -439,7 +437,7 @@ fn generate_eq_filter_conf(bands: &[epos_shared::config::EqBand], device: &Devic
                         label = bq_peaking
                         control = {{ "Freq" = {freq} "Q" = {q} "Gain" = {gain} }}
                     }}"#,
-            freq = band.freq as u32,
+            freq = band.freq,
             q = band.q,
             gain = band.gain_db,
         ));

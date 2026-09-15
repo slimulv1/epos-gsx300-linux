@@ -58,7 +58,7 @@ impl HwSnapshot {
 }
 
 /// Detected device information
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeviceInfo {
     pub usb_bus: u8,
     pub usb_addr: u8,
@@ -71,23 +71,6 @@ pub struct DeviceInfo {
     pub chip_id: Option<u8>,
     /// Live runtime snapshot (read-only memory-bus read at request time).
     pub hw_snapshot: Option<HwSnapshot>,
-}
-
-impl Default for DeviceInfo {
-    fn default() -> Self {
-        Self {
-            usb_bus: 0,
-            usb_addr: 0,
-            alsa_card: 0,
-            pipewire_sink: String::new(),
-            pipewire_source: String::new(),
-            hidraw: None,
-            input_event: None,
-            firmware_version: None,
-            chip_id: None,
-            hw_snapshot: None,
-        }
-    }
 }
 
 impl DeviceInfo {
