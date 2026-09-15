@@ -112,6 +112,7 @@ async fn main() -> Result<()> {
         pipewire_nodes: None,
         last_written: std::sync::Mutex::new(None),
         reload_notify: Arc::new(Notify::new()),
+        volume_save_notify: Arc::new(Notify::new()),
     }));
 
     // Background task: handle smart button presses (mode sync) according to
@@ -288,16 +289,11 @@ async fn main() -> Result<()> {
                     // firmware RE / NVM-PERSISTENCE-REPORT) and exposes no
                     // absolute readback, so ~/.config is the only source of truth
                     // across daemon restarts.
-                    let s = s.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        let mut st = s.write().await;
-                        let v = st.volume.load(std::sync::atomic::Ordering::Relaxed);
-                        st.config.device.volume = Some(v);
-                        if let Err(e) = save_config(&st) {
-                            warn!("Failed to save volume to config: {}", e);
-                        }
-                    });
+                    // Persist the dial position host-side, debounced. Notify the
+                    // shared volume-save worker instead of spawning a per-event
+                    // task — a fast knob drag would otherwise queue one save task
+                    // per detent (audit F5).
+                    s.read().await.volume_save_notify.notify_one();
                 }
             }
         }
@@ -342,6 +338,14 @@ async fn main() -> Result<()> {
     let state_clone = state.clone();
     let _reload_handle = tokio::spawn(async move {
         pipewire_reload_worker(state_clone).await;
+    });
+
+    // Debounced volume-save worker: the knob handler and the external-volume
+    // watcher notify it; the actual config write runs here, coalesced, so a burst
+    // of dial turns produces one save instead of one-per-detent (audit F5).
+    let state_clone = state.clone();
+    let _volume_save_handle = tokio::spawn(async move {
+        volume_save_worker(state_clone).await;
     });
 
     // Graceful shutdown: SIGTERM/SIGINT → reset LED to blue, then exit.
@@ -487,16 +491,9 @@ async fn volume_watch_loop(state: Arc<RwLock<IpcState>>) {
             .store(actual, std::sync::atomic::Ordering::Relaxed);
         st.last_volume_target
             .store(actual, std::sync::atomic::Ordering::Relaxed);
-        let s = state.clone();
-        let v = actual;
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let mut st = s.write().await;
-            st.config.device.volume = Some(v);
-            if let Err(e) = save_config(&st) {
-                warn!("Failed to save volume to config: {}", e);
-            }
-        });
+        // Notify the shared debounced volume-save worker instead of spawning a
+        // per-event save task (audit F5).
+        st.volume_save_notify.notify_one();
         tracing::info!(
             "Volume externally set to {}% — synced daemon tracker",
             actual
@@ -525,20 +522,26 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
 
         if is_connected && !was_connected {
             info!("EPOS GSX 300 connected — applying config");
+            // Re-probe hardware info BEFORE taking the write lock: hwinfo::probe
+            // does a blocking HID read (~tens of ms) and the lock guards all IPC,
+            // so doing it inside would stall GetStatus/GetDevice for the whole
+            // probe (audit F4). `device` is owned by this loop, not the lock.
+            let hw = device
+                .as_ref()
+                .and_then(|d| d.hidraw.as_ref())
+                .map(hwinfo::probe)
+                .unwrap_or_default();
             let mut st = state.write().await;
             // Names come from the fresh scan above (cache was empty when we
             // entered this branch).
             if let Some(ref d) = device {
                 st.pipewire_nodes = Some((d.pipewire_sink.clone(), d.pipewire_source.clone()));
-                // Re-probe hardware info: the boot-time probe can return
-                // empty if it ran during the udev ACL race; a reconnect is
-                // the right moment to fill in version/chip-ID.
-                if let Some(ref hid) = d.hidraw {
-                    let hw = hwinfo::probe(hid);
-                    if hw.firmware_version.is_some() || hw.chip_id.is_some() {
-                        info!("Hardware info refreshed after reconnect");
-                        st.hw_info = hw;
-                    }
+                // Fill in version/chip-ID from the pre-lock probe above (the
+                // boot-time probe can return empty if it ran during the udev ACL
+                // race; a reconnect is the right moment to fill it in).
+                if hw.firmware_version.is_some() || hw.chip_id.is_some() {
+                    info!("Hardware info refreshed after reconnect");
+                    st.hw_info = hw;
                 }
                 st.audio.set_device(d);
                 match st.audio.apply_full().await {
@@ -607,7 +610,9 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
                     continue;
                 }
             }
-            st.device = device;
+            if st.device != device {
+                st.device = device;
+            }
         }
 
         was_connected = is_connected;
@@ -644,6 +649,30 @@ async fn pipewire_reload_worker(state: Arc<RwLock<IpcState>>) {
         while let Ok(()) = tokio::time::timeout(Duration::from_millis(250), notify.notified()).await {}
         info!("PipeWire reload (debounced) triggered by audio config change");
         audio::reload_pipewire().await;
+    }
+}
+
+/// Background worker: debounced persist of the dial volume to config.
+///
+/// Both the knob handler (`VolumeChanged`) and the external-volume watcher call
+/// `volume_save_notify.notify_one()` instead of each spawning their own 2s-
+/// debounced save task. A fast knob drag or a held media key would otherwise
+/// spawn dozens of overlapping `save_config` tasks writing `config.json`
+/// concurrently (audit F5). This coalesces them into a single save after 2s of
+/// quiet, always committing the latest volume.
+async fn volume_save_worker(state: Arc<RwLock<IpcState>>) {
+    let notify = state.read().await.volume_save_notify.clone();
+    loop {
+        notify.notified().await;
+        // Coalesce rapid changes (fast knob drag / held media key) into a single
+        // save: keep consuming notifications for 2s before committing.
+        while let Ok(()) = tokio::time::timeout(Duration::from_secs(2), notify.notified()).await {}
+        let mut st = state.write().await;
+        let v = st.volume.load(std::sync::atomic::Ordering::Relaxed);
+        st.config.device.volume = Some(v);
+        if let Err(e) = save_config(&st) {
+            warn!("Failed to save volume to config: {}", e);
+        }
     }
 }
 

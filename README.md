@@ -24,7 +24,7 @@ archive of the device (firmware, HID protocol, hardware internals).
 .
 ├── crates/
 │   ├── epos-gsx300d/       Rust daemon — audio DSP + device control
-│   │   └── src/            (audio, hid, led, devices, ipc, mic_meter, config)
+│   │   └── src/            (audio, hid, led, devices, ipc, config)
 │   ├── epos-gsx300-gui/    Tauri 2.x + Vue 3 desktop app (Pinia + Naive UI)
 │   └── epos-shared/        Shared crate — IPC types, device IDs, config schema
 ├── docs/

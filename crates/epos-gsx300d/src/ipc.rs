@@ -77,6 +77,12 @@ pub struct IpcState {
     /// notify it so the actual `systemctl restart pipewire` runs *outside* the
     /// IPC lock (see `pipewire_reload_worker` in main.rs).
     pub reload_notify: Arc<Notify>,
+    /// Shared wake-up for the debounced volume-save worker. The knob handler and
+    /// the external-volume watcher both notify it instead of each spawning their
+    /// own 2s-debounced save task — a fast knob drag or a held media key would
+    /// otherwise queue dozens of concurrent `save_config` writes (see
+    /// `volume_save_worker` in main.rs, audit F5).
+    pub volume_save_notify: Arc<Notify>,
 }
 
 pub async fn run_server(state: Arc<RwLock<IpcState>>) -> Result<()> {
@@ -162,15 +168,20 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
     match request {
         // --- Status ---
         Request::GetStatus => {
-            let state = state.read().await;
-            // Use the hotplug loop's 5s cache — avoids re-spawning pw-dump on
-            // every GUI poll. Fall back to a fresh scan only before the loop
-            // has seeded (first request racing startup).
-            let device = if state.device.is_some() {
-                state.device.clone()
-            } else {
-                devices::detect().await
+            // Read the cached device without holding the lock across the (blocking)
+            // fallback scan. `devices::detect()` spawns a pw-dump subprocess, so
+            // running it under the read lock would stall other IPC during the
+            // startup race (audit F8).
+            let device = {
+                let state = state.read().await;
+                if state.device.is_some() {
+                    state.device.clone()
+                } else {
+                    drop(state);
+                    devices::detect().await
+                }
             };
+            let state = state.read().await;
             Response::Status {
                 daemon_version: env!("CARGO_PKG_VERSION").into(),
                 device_connected: device.is_some(),

@@ -20,11 +20,12 @@ pub async fn detect_with_nodes(
     cached: Option<(String, String)>,
     needs_fresh: bool,
 ) -> Option<DeviceInfo> {
-    // Scan /sys/bus/usb/devices for matching VID:PID.
-    // IMPORTANT: called every 5s by the hotplug loop, so log at debug
-    // level — info would spam ~100 lines/day.
-    match scan_usb_devices(cached, needs_fresh) {
-        Ok(devices) => {
+    // The scan touches sysfs and may spawn a blocking `pw-dump` subprocess
+    // (when node names aren't cached). Run it on a blocking thread instead of
+    // stalling the async worker — the 5s hotplug loop calls this every tick and
+    // GetStatus's startup-race fallback calls it too (audit F4).
+    match tokio::task::spawn_blocking(move || scan_usb_devices(cached, needs_fresh)).await {
+        Ok(Ok(devices)) => {
             if let Some(dev) = devices.first() {
                 debug!(
                     "EPOS GSX 300 present at bus {}:{}",
@@ -35,8 +36,12 @@ pub async fn detect_with_nodes(
                 None
             }
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             warn!("USB scan failed: {}", e);
+            None
+        }
+        Err(e) => {
+            warn!("USB scan task panicked: {}", e);
             None
         }
     }

@@ -11,7 +11,7 @@ pub const PRODUCT_ID: u16 = 0x0098;
 /// All values are `Option`: a missing value means that memory region could
 /// not be read (device gone, permission denied, timeout) — never a failure
 /// of the whole snapshot. Reading never sets bit6; it is pure observation.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct HwSnapshot {
     /// Audio mode state machine register $137D (0-5; LED processing gated to {3,4}).
     pub mode_state: Option<u8>,
@@ -58,7 +58,7 @@ impl HwSnapshot {
 }
 
 /// Detected device information
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DeviceInfo {
     pub usb_bus: u8,
     pub usb_addr: u8,
