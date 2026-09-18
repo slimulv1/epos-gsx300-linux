@@ -238,8 +238,12 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
             state.audio.update_config(&audio_cfg);
             match state.audio.apply_eq().await {
                 Ok(changed) => {
+                    // DSP confs are seeded per-role (pipewire-epos@eq) by
+                    // write_instance_conf, which restarts only that instance.
+                    // MAIN is never touched → Discord keeps both sink (epos-eq-input
+                    // fail-closed anchor) and mic links while EQ is applied.
                     if changed {
-                        reload_notify.notify_one();
+                        debug!("EQ conf changed — instance-only restart (main untouched)");
                     }
                 }
                 Err(e) => warn!("Failed to apply EQ: {}", e),
@@ -271,10 +275,11 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
             let audio_cfg = state.config.audio.clone();
             state.audio.update_config(&audio_cfg);
             match state.audio.apply_noise_gate().await {
-                Ok(changed) => {
-                    if changed {
-                        reload_notify.notify_one();
-                    }
+                Ok(_changed) => {
+                    // apply_noise_gate → write_voice_conf seeds the per-role
+                    // voice instance conf + restarts that INSTANCE (fail-closed).
+                    // Do NOT restart main pipewire → Discord sink/source links
+                    // stay pinned.
                 }
                 Err(e) => warn!("Failed to apply noise gate: {}", e),
             }
@@ -296,10 +301,12 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
             let audio_cfg = state.config.audio.clone();
             state.audio.update_config(&audio_cfg);
             match state.audio.apply_voice_enhancer().await {
-                Ok(changed) => {
-                    if changed {
-                        reload_notify.notify_one();
-                    }
+                Ok(_changed) => {
+                    // DSP confs are seeded per-role (pipewire-epos@voice) by
+                    // write_instance_conf, which restarts only that instance.
+                    // MAIN is never touched → Discord keeps mic link to the
+                    // static Audio/Source anchor epos-voice-output (MAIN conf.d
+                    // 51-epos-voice-enhancer.conf in this daemon's install).
                 }
                 Err(e) => warn!("Failed to apply voice enhancer: {}", e),
             }

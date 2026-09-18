@@ -31,3 +31,5 @@ crates/epos-gsx300-gui/.vite/
 
 # Raw firmware dumps (copyrighted Sennheiser/EPOS firmware — keep local)
 docs/reverse-engineering/dumps/*.bin
+# stray session transcripts accidentally copied into the repo
+session-*.md
