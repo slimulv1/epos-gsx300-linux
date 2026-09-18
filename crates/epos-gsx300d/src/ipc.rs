@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
-use tokio::sync::RwLock;
 use tokio::sync::Notify;
+use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use anyhow::Result;
@@ -230,7 +230,7 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
         Request::GetEq => {
             let state = state.read().await;
             Response::Eq(state.config.audio.clone())
-        },
+        }
         Request::SetEq { eq } => {
             let mut state = state.write().await;
             state.config.audio.eq = eq.eq;
@@ -325,7 +325,7 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
         Request::GetMode => {
             let state = state.read().await;
             Response::Mode(state.config.mode)
-        },
+        }
         Request::SetMode { mode } => {
             let mut state = state.write().await;
             state.config.mode = mode;
@@ -373,7 +373,7 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
         Request::GetProfiles => {
             let state = state.read().await;
             Response::Profiles(state.config.profiles.clone())
-        },
+        }
         Request::SetActiveProfile { name } => {
             let mut state = state.write().await;
             if let Some(profile) = state.config.profiles.iter().find(|p| p.name == name) {
@@ -506,7 +506,7 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
                     message: format!("Reload failed: {}", e),
                 },
             }
-        },
+        }
         Request::Quit => {
             info!("Quit requested via IPC");
             // Kill the sidetone loopback child before exiting — std::process::exit

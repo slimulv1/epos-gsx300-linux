@@ -7,6 +7,16 @@
 #   ./scripts/install.sh --udev       install udev rule (needs sudo)
 #   ./scripts/install.sh --system     system-wide install into /usr/local
 #   ./scripts/install.sh --uninstall  remove everything installed by this script
+#
+# Option B (3i): also installs the per-role epos PipeWire instances
+# (pipewire-epos@{eq,voice,sidetone}) + the static fail-closed null-sink
+# anchor in MAIN (40-epos-eq-virtualsink.conf) and migrates the OLD
+# daemon-generated main-pipewire DSP confs (50-epos-eq / 51-epos-voice /
+# 93-epos-noisegate) out of the way.
+#
+# IMPORTANT (ONE-TIME, do when you are ready to restart your audio session):
+#   The MAIN pipewire graph is restarted exactly once at install to load the
+#   null-sink anchor. Nothing here restarts main automatically.
 
 set -euo pipefail
 
@@ -15,6 +25,9 @@ BIN_NAME="epos-gsx300d"
 GUI_BIN="epos-gsx300-gui"
 UDEV_RULE="70-epos-gsx300.rules"
 SERVICE="epos-gsx300d.service"
+EPOS_PW_SERVICE="pipewire-epos@.service"
+EQ_NULL_SINK_CONF="40-epos-eq-virtualsink.conf"
+EQ_ROUTE_CONF="51-epos-eq-route.conf"
 DESKTOP_FILE="epos-gsx300-gui.desktop"
 ICON_SIZE=128
 
@@ -26,6 +39,16 @@ APPS_DIR="$PREFIX/share/applications"
 ICONS_DIR="$PREFIX/share/icons/hicolor"
 UDEV_DIR="/etc/udev/rules.d"
 RUST_LOG_DEFAULT="${RUST_LOG_DEFAULT:-info}"
+
+# Option B paths
+PW_CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/pipewire/pipewire.conf.d"
+WP_CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/wireplumber/wireplumber.conf.d"
+EPOS_CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/pipewire-epos"
+# OLD daemon-managed DSP confs from the pre-Option-B design — removing them
+# prevents double-processing (old main chains + new epos instances) after the
+# one-time main restart. The daemon no longer writes these files.
+OLD_MAIN_DSP_CONFS=( "50-epos-eq.conf" "51-epos-voice-enhancer.conf" "93-epos-noisegate.conf" )
+EPOS_INSTANCE_ROLES=( eq voice sidetone )
 
 banner() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok()     { printf '\033[1;32m  ✔\033[0m %s\n' "$*"; }
@@ -44,6 +67,63 @@ _need_build() {
     fi
 }
 
+# Migrate away the OLD daemon-managed main-pipewire DSP confs. They take
+# effect only on the next MAIN restart (conf.d is read at startup), which is
+# the same one-time restart that loads the null-sink anchor.
+_cleanup_old_main_dsp_confs() {
+    local removed=0 f
+    for f in "${OLD_MAIN_DSP_CONFS[@]}"; do
+        if [[ -f "$PW_CONF_DIR/$f" ]]; then
+            rm -f "$PW_CONF_DIR/$f"
+            warn "removed OLD main-pipewire DSP conf (migrated to epos instances): $f"
+            removed=1
+        fi
+    done
+    [[ $removed -eq 1 ]] && \
+        warn "old chains remain loaded in the RUNNING main instance until its one-time restart"
+}
+
+# Install the per-role epos PipeWire instances + MAIN null-sink anchor.
+# Instances are only *enabled* (start with the next graphical session), NOT
+# started now: the eq instance binds epos-eq-input.monitor which does not
+# exist until the one-time main restart, so starting it here would crash-loop.
+_install_pw_epos() {
+    mkdir -p "$SERVICE_DIR" "$PW_CONF_DIR" "$EPOS_CONF_DIR"
+    mkdir -p "$WP_CONF_DIR"
+
+    install -m 0644 "$ROOT/systemd/$EPOS_PW_SERVICE" "$SERVICE_DIR/$EPOS_PW_SERVICE"
+    ok "instance template -> $SERVICE_DIR/$EPOS_PW_SERVICE"
+
+    install -m 0644 "$ROOT/systemd/$EQ_NULL_SINK_CONF" "$PW_CONF_DIR/$EQ_NULL_SINK_CONF"
+    ok "MAIN fail-closed null-sink anchor -> $PW_CONF_DIR/$EQ_NULL_SINK_CONF"
+
+    if [[ -f "$ROOT/systemd/$EQ_ROUTE_CONF" ]]; then
+        # Optional WirePlumber routing rule — installed but INACTIVE by
+        # default (see header comment; validation-phase opt-in).
+        install -m 0644 "$ROOT/systemd/$EQ_ROUTE_CONF" "$WP_CONF_DIR/$EQ_ROUTE_CONF"
+        ok "WirePlumber EQ routing rule (inactive placeholder) -> $WP_CONF_DIR/$EQ_ROUTE_CONF"
+    fi
+
+    _cleanup_old_main_dsp_confs
+
+    systemctl --user daemon-reload
+    for role in "${EPOS_INSTANCE_ROLES[@]}"; do
+        systemctl --user enable "pipewire-epos@$role.service" 2>/dev/null || true
+    done
+    ok "epos instances enabled for next graphical session (eq voice sidetone)"
+}
+
+_post_install_main_restart_note() {
+    banner "ONE-TIME main audio restart REQUIRED (do this when ready — it restarts your audio session briefly):"
+    printf '        systemctl --user restart pipewire wireplumber\n'
+    printf '        systemctl --user start  pipewire-epos@eq pipewire-epos@voice pipewire-epos@sidetone\n'
+    printf '\n'
+    printf '  - Loads %s (the fail-closed EQ null-sink anchor).\n' "$EQ_NULL_SINK_CONF"
+    printf '  - Drops the OLD daemon DSP chains (if any) from the running main instance.\n'
+    printf '  - Starts EQ/voice/sidetone DSP instances (Option B, 3i).\n'
+    printf '  - After this, DSP changes only restart pipewire-epos@* instances — never main.\n'
+}
+
 _install_user() {
     _need_build
     mkdir -p "$BIN_DIR"
@@ -57,9 +137,13 @@ _install_user() {
         "$ROOT/systemd/$SERVICE" > "$SERVICE_DIR/$SERVICE"
     ok "service -> $SERVICE_DIR/$SERVICE"
 
+    _install_pw_epos
+
     systemctl --user daemon-reload
     systemctl --user enable --now "$SERVICE" 2>/dev/null || true
     ok "systemd user service enabled + started"
+
+    _post_install_main_restart_note
 
     banner "Next: install the udev rule (one-time, needs sudo):"
     printf '        sudo ./scripts/install.sh --udev\n'
@@ -120,16 +204,28 @@ _install_system() {
     ok "binary -> /usr/local/bin/$BIN_NAME"
     install -m 0644 "$ROOT/systemd/$SERVICE" "/usr/lib/systemd/user/$SERVICE"
     ok "service -> /usr/lib/systemd/user/$SERVICE"
+    install -m 0644 "$ROOT/systemd/$EPOS_PW_SERVICE" "/usr/lib/systemd/user/$EPOS_PW_SERVICE"
+    ok "instance template -> /usr/lib/systemd/user/$EPOS_PW_SERVICE"
     "$0" --udev
     systemctl --user daemon-reload
     systemctl --user enable --now "$SERVICE" 2>/dev/null || true
+    for role in "${EPOS_INSTANCE_ROLES[@]}"; do
+        systemctl --user enable "pipewire-epos@$role.service" 2>/dev/null || true
+    done
     ok "service enabled"
+    _post_install_main_restart_note
 }
 
 _uninstall() {
     systemctl --user disable --now "$SERVICE" 2>/dev/null || true
-    rm -f "$BIN_DIR/$BIN_NAME" "$SERVICE_DIR/$SERVICE"
-    ok "removed daemon binary + service"
+    for role in "${EPOS_INSTANCE_ROLES[@]}"; do
+        systemctl --user disable --now "pipewire-epos@$role.service" 2>/dev/null || true
+    done
+    rm -f "$BIN_DIR/$BIN_NAME" "$SERVICE_DIR/$SERVICE" "$SERVICE_DIR/$EPOS_PW_SERVICE"
+    rm -f "$PW_CONF_DIR/$EQ_NULL_SINK_CONF"
+    rm -f "$WP_CONF_DIR/$EQ_ROUTE_CONF"
+    rm -rf "$EPOS_CONF_DIR"
+    ok "removed daemon binary + services + epos instance confs + null-sink anchor"
 
     rm -f "$BIN_DIR/$GUI_BIN" "$APPS_DIR/$DESKTOP_FILE"
     rm -f "$ICONS_DIR/${ICON_SIZE}x${ICON_SIZE}/apps/epos-gsx300.png"
@@ -141,17 +237,19 @@ _uninstall() {
     ok "removed default config (if present)"
 }
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --udev)      _install_udev ;;
-        --gui)       _install_gui ;;
-        --system)    _install_system ;;
-        --uninstall) _uninstall ;;
-        *)           _install_user ;;
-    esac
-    shift
-done
-
-[[ $# -eq 0 ]] && _install_user
+if [[ $# -eq 0 ]]; then
+    _install_user
+else
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --udev)      _install_udev ;;
+            --gui)       _install_gui ;;
+            --system)    _install_system ;;
+            --uninstall) _uninstall ;;
+            *)           die "unknown option: $1" ;;
+        esac
+        shift
+    done
+fi
 
 banner "Done."

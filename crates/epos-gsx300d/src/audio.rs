@@ -1,23 +1,65 @@
 use anyhow::Result;
 use epos_shared::config::{AudioConfig, VoiceMode};
 use epos_shared::device::DeviceInfo;
-use tokio::process::Child;
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
-/// Audio pipeline — manages PipeWire audio processing via subprocesses
+/// Option B (3i): EPOS DSP lives in per-role software-only PipeWire instances
+/// (`pipewire-epos@eq`, `pipewire-epos@voice`, `pipewire-epos@sidetone`).
+/// The daemon regenerates each instance's own `pipewire.conf` and restarts
+/// ONLY that instance — the main pipewire graph (A2+ speakers) is never
+/// touched at runtime.
 ///
-/// Strategy (based on PipeWire research):
-/// - EQ: WirePlumber parametric filter via wpctl / SPA config hot-reload
-/// - Sidetone: pw-loopback capture→playback with volume control
-/// - Noise gate: WirePlumber rnnoise filter
-/// - Voice enhancer: Capture stream EQ (warm=bass boost, clear=presence boost)
-/// - Mic gain: amixer ALSA mixer control
+/// Evidence (2026-09-16, verified live):
+/// - filter-chain with module-level `remote.name = "pipewire-0"` publishes
+///   its capture/playback nodes into the MAIN instance (cross-instance works)
+/// - playback side auto-links to the EPOS hardware sink via WirePlumber
+/// - fail-closed: killing an instance vanishes its sink → pinned streams stay
+///   silent, nothing leaks to A2+
+/// - sidetone = module-loopback inside the instance (volume prop)
+/// - rnnoise LADSPA port names are "Input"/"Output" (not In/Out)
 pub struct AudioPipeline {
     config: AudioConfig,
     device: Option<DeviceInfo>,
-    sidetone_proc: Option<Child>,
-    #[allow(dead_code)]
-    eq_filter_path: Option<std::path::PathBuf>,
+    pub restarts: Arc<RestartBus>,
+}
+
+/// Debounced restart bus: audio handlers record which epos instance(s) changed
+/// and notify; the worker in main.rs performs the actual restarts (union,
+/// dedup, parallel for profile-wide changes) off the IPC lock.
+pub struct RestartBus {
+    pub notify: Notify,
+    pending: Mutex<BTreeSet<String>>,
+}
+
+impl RestartBus {
+    pub fn new() -> Self {
+        Self {
+            notify: Notify::new(),
+            pending: Mutex::new(BTreeSet::new()),
+        }
+    }
+
+    /// Request a restart of one epos instance ("eq" | "voice" | "sidetone").
+    pub fn request(&self, name: &str) {
+        assert!(matches!(name, "eq" | "voice" | "sidetone"));
+        self.pending.lock().unwrap().insert(name.to_string());
+        self.notify.notify_one();
+    }
+
+    /// Drain a deduplicated snapshot; requests arriving later remain pending.
+    pub fn drain(&self) -> BTreeSet<String> {
+        std::mem::take(&mut *self.pending.lock().unwrap())
+    }
+}
+
+impl Default for RestartBus {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AudioPipeline {
@@ -25,8 +67,7 @@ impl AudioPipeline {
         Self {
             config: config.clone(),
             device: None,
-            sidetone_proc: None,
-            eq_filter_path: None,
+            restarts: Arc::new(RestartBus::new()),
         }
     }
 
@@ -41,16 +82,13 @@ impl AudioPipeline {
     }
 
     /// Apply the full audio config (EQ, mic gain, sidetone, noise gate, voice).
-    /// Returns whether any on-disk PipeWire config changed (i.e. a reload is
-    /// needed). The actual `systemctl restart pipewire` is performed by the
-    /// debounced [`pipewire_reload_worker`] so it never runs under the IPC lock.
+    /// Returns which of the three epos instances need a restart.
     pub async fn apply_full(&mut self) -> Result<bool> {
         self.apply_mic_gain().await?;
         let mut changed = false;
         changed |= self.write_eq_conf()?;
-        self.apply_sidetone().await?;
-        changed |= self.write_noise_gate_conf()?;
         changed |= self.write_voice_conf()?;
+        changed |= self.write_sidetone_conf()?;
         // WirePlumber's device.restore-routes replays the saved input
         // channelVolume (stored as 1.0 in ~/.local/state/wireplumber/
         // default-routes) when the ALSA capture node activates, usually a
@@ -60,7 +98,7 @@ impl AudioPipeline {
         let gain = self.config.mic_gain;
         let device = self.device.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            tokio::time::sleep(Duration::from_secs(4)).await;
             if let Some(dev) = device {
                 let _ = apply_mic_gain_oneshot(&dev, gain).await;
             }
@@ -73,9 +111,6 @@ impl AudioPipeline {
     pub async fn apply(&mut self, config: &AudioConfig, device: &DeviceInfo) -> Result<()> {
         self.config = config.clone();
         self.device = Some(device.clone());
-        // apply_full now returns whether on-disk config changed; callers that
-        // care use the debounced reload worker. `apply` is retained for API
-        // symmetry and discards that flag.
         self.apply_full().await?;
         Ok(())
     }
@@ -90,337 +125,282 @@ impl AudioPipeline {
         apply_mic_gain_oneshot(device, self.config.mic_gain).await
     }
 
-    // ─── 9-Band EQ ────────────────────────────────────────────
+    // ─── EPOS instance confs (Option B) ───────────────────────
     //
-    // PipeWire EQ strategy: Write a filter-chain module config that
-    // applies parametric EQ on the EPOS sink node. Uses PipeWire's
-    // built-in bq_peaking filters (Audio EQ Cookbook) with Freq/Q/Gain.
-    //
-    // The config is written to:
-    //   ~/.config/pipewire/pipewire.conf.d/50-epos-eq.conf
-    //
-    // Loaded by the main pipewire instance; requires a pipewire restart.
+    // Each role owns ONE self-contained pipewire.conf under
+    // ~/.config/pipewire-epos/<role>/pipewire.conf. The daemon regenerates the
+    // whole file (base skeleton + generated DSP module) atomically, skips the
+    // restart when the bytes are unchanged, and restarts only that instance.
 
-    /// Write or remove the EQ filter-chain config. Returns true if the
-    /// on-disk config actually changed (caller decides whether to reload).
-    fn write_eq_conf(&self) -> Result<bool> {
-        let conf_dir = dirs::config_dir()
+    fn instance_conf_path(role: &str) -> std::path::PathBuf {
+        dirs::config_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
-            .join("pipewire")
-            .join("pipewire.conf.d");
-        let conf_path = conf_dir.join("50-epos-eq.conf");
+            .join("pipewire-epos")
+            .join(role)
+            .join("pipewire.conf")
+    }
 
-        if !self.config.eq.enabled {
-            if conf_path.exists() {
-                std::fs::remove_file(&conf_path)?;
-                info!("EQ filter config removed");
-                return Ok(true);
+    /// Atomically write a generated instance conf. Returns true if the file
+    /// actually changed (caller decides whether to restart that instance).
+    fn write_instance_conf(&self, role: &str, conf: &str) -> Result<bool> {
+        let path = Self::instance_conf_path(role);
+        if let Ok(existing) = std::fs::read(&path) {
+            if existing == conf.as_bytes() {
+                debug!("{role} instance conf unchanged — skip restart");
+                return Ok(false);
             }
-            return Ok(false);
         }
-
-        let Some(ref device) = self.device else {
-            debug!("No device, skipping EQ");
-            return Ok(false);
-        };
-
-        let filter_conf = generate_eq_filter_conf(&self.config.eq.bands, device);
-
-        // All bands flat → remove config instead of writing a stub that
-        // PipeWire rejects ("Invalid argument" → crash loop).
-        if filter_conf.is_empty() {
-            if conf_path.exists() {
-                std::fs::remove_file(&conf_path)?;
-                info!("EQ filter config removed (all bands flat)");
-                return Ok(true);
-            }
-            return Ok(false);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
-
-        std::fs::create_dir_all(&conf_dir)?;
-        std::fs::write(&conf_path, &filter_conf)?;
-        info!("EQ filter config written to {}", conf_path.display());
-
+        let tmp = path.with_extension("conf.tmp");
+        std::fs::write(&tmp, conf)?;
+        std::fs::rename(&tmp, &path)?;
+        info!("{} instance conf written to {}", role, path.display());
+        self.restarts.request(role);
         Ok(true)
     }
 
-    /// Apply EQ from config — write config + restart PipeWire if changed.
-    /// Returns true if the on-disk EQ config changed (reload needed).
+    /// Stable device node names for the conf templates. Falls back to the
+    /// serial-embedded ALSA patterns when the cache is empty (device absent
+    /// at write time — the names are constant across reboots).
+    fn node_names(&self) -> (String, String) {
+        match &self.device {
+            Some(d) if !d.pipewire_sink.is_empty() && !d.pipewire_source.is_empty() => {
+                (d.pipewire_sink.clone(), d.pipewire_source.clone())
+            }
+            _ => (
+                "alsa_output.usb-Sennheiser_EPOS_GSX_300_A003200202602692-00.analog-stereo"
+                    .to_string(),
+                "alsa_input.usb-Sennheiser_EPOS_GSX_300_A003200202602692-00.mono-fallback"
+                    .to_string(),
+            ),
+        }
+    }
+
+    // ─── 9-Band EQ (pipewire-epos@eq) ─────────────────────────
+    //
+    // The EQ instance ALWAYS runs a filter-chain: flat bands → passthrough
+    // (copy) so the epos-eq-input sink keeps existing and headset audio keeps
+    // flowing when EQ is off. The chain is published into MAIN as an
+    // Audio/Sink named `epos-eq-input`; apps target it; playback auto-links
+    // to the EPOS hardware sink. Kill the instance → sink vanishes → pinned
+    // streams go silent (fail-closed), A2+ untouched.
+
+    fn write_eq_conf(&self) -> Result<bool> {
+        let (sink, _src) = self.node_names();
+        let bands = if self.config.eq.enabled {
+            self.config.eq.bands.as_slice()
+        } else {
+            &[]
+        };
+        let eq_conf = generate_eq_instance_conf(bands, &sink);
+        self.write_instance_conf("eq", &eq_conf)
+    }
+
+    /// Apply EQ from config — write the eq instance conf.
+    /// Returns true if the on-disk conf changed (restart needed).
     pub async fn apply_eq(&mut self) -> Result<bool> {
         self.write_eq_conf()
     }
 
-    // ─── Sidetone ─────────────────────────────────────────────
+    // ─── Voice + Noise Gate (pipewire-epos@voice) ──────────────
     //
-    // Sidetone = mix mic capture into playback so user hears themselves.
-    // Strategy: spawn pw-loopback from EPOS source → EPOS sink.
-    // Kill existing process when settings change.
+    // One filter-chain owns the whole mic path: capture EPOS source → rnnoise
+    // (if enabled) → voice EQ bands (if mode != off) → virtual Audio/Source
+    // `epos-voice-output` in MAIN (Discord etc. keep using the same name).
+    // Nothing enabled → passthrough copy so the source always exists.
 
-    pub async fn apply_sidetone(&mut self) -> Result<()> {
-        // Kill existing sidetone process (await reaps the child — avoids
-        // accumulating zombie pw-loopback processes on every toggle).
-        if let Some(mut proc) = self.sidetone_proc.take() {
-            let _ = proc.kill().await;
-            info!("Killed old sidetone process");
-        }
-
-        if !self.config.sidetone.enabled {
-            info!("Sidetone disabled");
-            return Ok(());
-        }
-
-        let Some(ref device) = self.device else {
-            debug!("No device, skipping sidetone");
-            return Ok(());
-        };
-
-        let level = self.config.sidetone.level;
-
-        // Build pw-loopback command:
-        // pw-loopback captures from mic source and plays to headset sink
-        // The volume prop controls the sidetone level
-        let mut cmd = tokio::process::Command::new("pw-loopback");
-        cmd.arg("--capture").arg(&device.pipewire_source);
-        cmd.arg("--playback").arg(&device.pipewire_sink);
-        cmd.arg("--capture-props");
-        cmd.arg("audio.position=[MONO] stream.dont-remix=true node.passive=true");
-        cmd.arg("--playback-props");
-        // Set volume for sidetone level (0.0 to 1.0)
-        let vol = level.clamp(0.0, 1.0);
-        cmd.arg(format!(
-            "audio.position=[MONO] channelmix.normalize=false volume={:.2}",
-            vol
-        ));
-
-        match cmd.spawn() {
-            Ok(child) => {
-                self.sidetone_proc = Some(child);
-                info!("Sidetone started at level {:.0}%", level * 100.0);
-            }
-            Err(e) => {
-                warn!("Failed to spawn pw-loopback for sidetone: {}", e);
-            }
-        }
-
-        Ok(())
-    }
-
-    // ─── Noise Gate ───────────────────────────────────────────
-    //
-    // Noise gate via WirePlumber rnnoise filter on the capture node.
-    // Writes a filter config that WirePlumber loads automatically.
-
-    /// Write or remove the noise-gate filter-chain config.
-    /// Returns true if the on-disk config actually changed.
-    fn write_noise_gate_conf(&self) -> Result<bool> {
-        let conf_dir = dirs::config_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
-            .join("pipewire")
-            .join("pipewire.conf.d");
-        let conf_path = conf_dir.join("93-epos-noisegate.conf");
-
-        if !self.config.noise_gate.enabled {
-            if conf_path.exists() {
-                std::fs::remove_file(&conf_path)?;
-                info!("Noise gate filter config removed");
-                return Ok(true);
-            }
-            return Ok(false);
-        }
-
-        let Some(ref device) = self.device else {
-            debug!("No device, skipping noise gate");
-            return Ok(false);
-        };
-
-        if self.config.noise_gate.enabled {
-            // Map threshold_db (-60..0) → VAD Threshold % (50..100):
-            // lower dB threshold = more aggressive suppression.
-            let vad_threshold =
-                50.0 + ((-self.config.noise_gate.threshold_db).clamp(0.0, 60.0) / 60.0) * 50.0;
-            let filter_conf = format!(
-                r#"# EPOS GSX 300 noise gate (rnnoise via LADSPA filter-chain)
-# Applied to capture node: {source}
-# Requires librnnoise_ladspa.so in LADSPA_PATH (e.g. ~/.local/lib/ladspa)
-context.modules = [
-    {{
-        name = libpipewire-module-filter-chain
-        flags = [ nofail ]
-        args = {{
-            node.description = "EPOS GSX 300 Noise Gate"
-            media.name       = "EPOS GSX 300 Noise Gate"
-            filter.graph = {{
-                nodes = [
-                    {{
-                        type   = ladspa
-                        name   = rnnoise
-                        plugin = "librnnoise_ladspa"
-                        label  = noise_suppressor_mono
-                        control = {{
-                            "VAD Threshold (%)" {vad_threshold:.1}
-                        }}
-                    }}
-                ]
-            }}
-            audio.position = [ MONO ]
-            capture.props = {{
-                node.name   = "epos-noisegate-capture"
-                target.object = "{source}"
-                node.passive = true
-            }}
-            playback.props = {{
-                node.name   = "epos-noisegate-output"
-                media.class = Audio/Source
-            }}
-        }}
-    }}
-]
-"#,
-                source = device.pipewire_source
-            );
-
-            std::fs::create_dir_all(&conf_dir)?;
-            std::fs::write(&conf_path, &filter_conf)?;
-            info!(
-                "Noise gate filter written (rnnoise, capture: {})",
-                device.pipewire_source
-            );
-        }
-
-        Ok(true)
-    }
-
-    /// Apply noise gate from config — write config + restart PipeWire if changed.
-    /// Returns true if the on-disk noise-gate config changed (reload needed).
-    pub async fn apply_noise_gate(&self) -> Result<bool> {
-        self.write_noise_gate_conf()
-    }
-
-    // ─── Voice Enhancer ───────────────────────────────────────
-    //
-    // Voice enhancer = EQ on the capture (mic) stream.
-    // Warm = boost low frequencies (200-500 Hz)
-    // Clear = boost presence (2k-6k Hz)
-    //
-    // Uses a PipeWire filter-chain source module (libpipewire-module-filter-chain)
-    // written to ~/.config/pipewire/pipewire.conf.d/51-epos-voice-enhancer.conf
-
-    /// Write or remove the voice-enhancer filter-chain config.
-    /// Returns true if the on-disk config actually changed.
     fn write_voice_conf(&self) -> Result<bool> {
-        let conf_dir = dirs::config_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
-            .join("pipewire")
-            .join("pipewire.conf.d");
-        let conf_path = conf_dir.join("51-epos-voice-enhancer.conf");
-
-        let device_source = self.device.as_ref().map(|d| d.pipewire_source.clone());
-
-        let filter_conf = match self.config.voice_enhancer.mode {
-            VoiceMode::Off => None,
-            VoiceMode::Warm => {
-                // Boost low-mid frequencies for warmth
-                Some(generate_voice_eq_conf(
-                    "warm",
-                    device_source.as_deref(),
-                    &[
-                        (200, 4.0, 0.8),
-                        (350, 3.0, 1.0),
-                        (500, 2.0, 1.0),
-                        (4000, -1.0, 1.2),
-                        (8000, -2.0, 1.0),
-                    ],
-                ))
-            }
-            VoiceMode::Clear => {
-                // Boost presence and clarity
-                Some(generate_voice_eq_conf(
-                    "clear",
-                    device_source.as_deref(),
-                    &[
-                        (200, -2.0, 1.0),
-                        (500, -1.0, 1.0),
-                        (2500, 3.0, 1.0),
-                        (4000, 4.0, 0.8),
-                        (6000, 3.0, 1.2),
-                    ],
-                ))
-            }
-            VoiceMode::Custom => {
-                if let Some(ref bands) = self.config.voice_enhancer.custom_bands {
-                    let active_bands: Vec<(u32, f32, f32)> = bands
-                        .iter()
-                        .filter(|b| b.gain_db.abs() >= 0.1)
-                        .map(|b| (b.freq, b.gain_db, b.q))
-                        .collect();
-                    if active_bands.is_empty() {
-                        // All gains 0 → behave like Off: remove config instead of
-                        // writing a useless passthrough filter with no target.
-                        None
-                    } else {
-                        info!("Custom voice: {} active band(s)", active_bands.len());
-                        Some(generate_voice_eq_conf(
-                            "custom",
-                            device_source.as_deref(),
-                            &active_bands,
-                        ))
-                    }
-                } else {
-                    None
-                }
-            }
+        let (_sink, source) = self.node_names();
+        let (noise_gate, voice_mode, voice_bands) = {
+            let ng = &self.config.noise_gate;
+            let ve = self.config.voice_enhancer.clone();
+            let bands = match &ve.mode {
+                VoiceMode::Warm => vec![
+                    (200u32, 4.0f32, 0.8f32),
+                    (350, 3.0, 1.0),
+                    (500, 2.0, 1.0),
+                    (4000, -1.0, 1.2),
+                    (8000, -2.0, 1.0),
+                ],
+                VoiceMode::Clear => vec![
+                    (200, -2.0, 1.0),
+                    (500, -1.0, 1.0),
+                    (2500, 3.0, 1.0),
+                    (4000, 4.0, 0.8),
+                    (6000, 3.0, 1.2),
+                ],
+                VoiceMode::Custom => ve
+                    .custom_bands
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|b| b.gain_db.abs() >= 0.1)
+                    .map(|b| (b.freq, b.gain_db, b.q))
+                    .collect(),
+                VoiceMode::Off => Vec::new(),
+            };
+            (
+                ng.enabled,
+                ve.mode.clone(),
+                bands
+                    .into_iter()
+                    .filter(|(_f, g, _q)| g.abs() >= 0.1)
+                    .collect::<Vec<_>>(),
+            )
         };
-
-        match filter_conf {
-            Some(conf) => {
-                std::fs::create_dir_all(&conf_dir)?;
-                std::fs::write(&conf_path, &conf)?;
-                info!(
-                    "Voice enhancer filter written ({:?})",
-                    self.config.voice_enhancer.mode
-                );
-                Ok(true)
-            }
-            None => {
-                if conf_path.exists() {
-                    std::fs::remove_file(&conf_path)?;
-                    info!("Voice enhancer disabled, config removed");
-                    Ok(true)
-                } else {
-                    Ok(false)
-                }
-            }
-        }
+        let vad_threshold = if noise_gate {
+            50.0 + ((-self.config.noise_gate.threshold_db).clamp(0.0, 60.0) / 60.0) * 50.0
+        } else {
+            0.0
+        };
+        let voice_conf = generate_voice_instance_conf(
+            &source,
+            noise_gate,
+            vad_threshold,
+            &voice_mode,
+            &voice_bands,
+        );
+        self.write_instance_conf("voice", &voice_conf)
     }
 
-    /// Apply voice enhancer — write the filter config. Returns true if the
-    /// on-disk config changed (the debounced worker performs the PipeWire reload).
+    /// Apply noise gate — regenerates the voice instance conf.
+    pub async fn apply_noise_gate(&self) -> Result<bool> {
+        self.write_voice_conf()
+    }
+
+    /// Apply voice enhancer — regenerates the voice instance conf.
     pub async fn apply_voice_enhancer(&self) -> Result<bool> {
         self.write_voice_conf()
     }
 
-    /// Kill the sidetone loopback child (used on shutdown, since
-    /// `std::process::exit` bypasses `Drop`).
-    pub async fn kill_sidetone(&mut self) {
-        if let Some(mut proc) = self.sidetone_proc.take() {
-            let _ = proc.kill().await;
-            info!("Killed sidetone process on exit");
+    // ─── Sidetone (pipewire-epos@sidetone) ─────────────────────
+    //
+    // module-loopback inside the instance: capture EPOS source (MONO, no
+    // remix) → play EPOS sink (stereo, volume prop). Keep the instance bare
+    // (no module) when disabled → zero links, mic untouched.
+
+    fn write_sidetone_conf(&self) -> Result<bool> {
+        if !self.config.sidetone.enabled {
+            // Disabled → write a bare instance conf (no DSP module).
+            let conf = instance_base_conf("sidetone", "");
+            return self.write_instance_conf("sidetone", &conf);
         }
+        let (sink, source) = self.node_names();
+        let level = self.config.sidetone.level.clamp(0.0, 1.0);
+        let module = format!(
+            r#"
+    {{ name = libpipewire-module-loopback
+      args = {{
+        remote.name = "pipewire-0"
+        node.description = "EPOS GSX 300 Sidetone"
+        media.name = "EPOS GSX 300 Sidetone"
+        capture.props = {{
+            node.name = "epos-sidetone-capture"
+            target.object = "{source}"
+            remote.name = "pipewire-0"
+            audio.position = [ MONO ]
+            stream.dont-remix = true
+            node.passive = true
+        }}
+        playback.props = {{
+            node.name = "epos-sidetone-output"
+            target.object = "{sink}"
+            remote.name = "pipewire-0"
+            audio.position = [ FL FR ]
+            channelmix.normalize = false
+            volume = {vol:.2}
+        }}
+      }} }}
+"#,
+            source = source,
+            sink = sink,
+            vol = level,
+        );
+        let conf = instance_base_conf("sidetone", &module);
+        self.write_instance_conf("sidetone", &conf)
     }
+
+    /// Apply sidetone — regenerate the sidetone instance conf.
+    /// Returns true if the conf changed (restart needed).
+    pub async fn apply_sidetone(&mut self) -> Result<bool> {
+        self.write_sidetone_conf()
+    }
+
+    /// In Option B the sidetone lives inside the pipewire-epos@sidetone
+    /// instance (systemd Restart=always), not a daemon-owned child, so there
+    /// is nothing to reap on shutdown. Kept as a no-op for call-site
+    /// compatibility (`kill_sidetone().await`).
+    pub async fn kill_sidetone(&mut self) {}
 }
 
-// ─── Config Generators ────────────────────────────────────────
+// ─── Config Generators (Option B instances) ──────────────────
 
-/// Generate PipeWire filter-chain config for the EPOS sink (playback EQ).
-/// Uses PipeWire's built-in bq_peaking filters with Freq/Q/Gain controls.
-fn generate_eq_filter_conf(bands: &[epos_shared::config::EqBand], device: &DeviceInfo) -> String {
+/// Shared skeleton for an epos-instance pipewire.conf. `extra_modules` are
+/// appended inside the single `context.modules` array (a conf file may only
+/// define one such array; generated DSP modules live here).
+fn instance_base_conf(role: &str, extra_modules: &str) -> String {
+    format!(
+        r#"# EPOS GSX 300 — {role} PipeWire instance (auto-generated by epos-gsx300d)
+# Option B (3i): software-only instance, runs OUTSIDE the main pipewire graph.
+# Restarted by the daemon on {role} changes — the main instance (A2+) is
+# never touched at runtime.
+
+context.properties = {{
+  core.name = pipewire-epos-{role}
+  remote.name = pipewire-epos-{role}
+  core.daemon = true
+  link-factory.enabled = false
+  default.clock.rate         = 48000
+  default.clock.allowed-rates = [ 48000 ]
+  default.clock.quantum      = 256
+  default.clock.min-quantum  = 256
+  default.clock.max-quantum  = 256
+}}
+context.spa-libs = {{
+  support.node.driver = support/libspa-support
+  support.node        = support/libspa-support
+  support.cpu         = support/libspa-support
+  support.log         = support/libspa-support
+}}
+context.modules = [
+  {{ name = libpipewire-module-rt }}
+  {{ name = libpipewire-module-protocol-native }}
+  {{ name = libpipewire-module-metadata }}
+  {{ name = libpipewire-module-spa-node-factory }}
+  {{ name = libpipewire-module-client-node }}
+  {{ name = libpipewire-module-adapter }}{extra_modules}
+]
+context.objects = [
+  {{ factory = spa-node-factory
+    args = {{
+      factory.name    = support.node.driver
+      node.name       = Dummy-Driver
+      node.group      = pipewire.dummy
+      node.sync-group = sync.dummy
+      priority.driver = 200000
+    }}
+  }}
+]
+"#,
+        role = role,
+        extra_modules = extra_modules,
+    )
+}
+
+/// Generate the `eq` instance conf: 9-band EQ filter-chain that captures the
+/// MAIN null-sink monitor `epos-eq-input.monitor` (the static fail-closed
+/// anchor installed once at install time) and plays the processed audio to the
+/// EPOS hardware sink. Apps keep targeting `epos-eq-input`; if this instance
+/// dies, the anchor sink remains → streams stay silent, never routed to A2+.
+/// Flat bands → passthrough `copy` node so the path always flows.
+fn generate_eq_instance_conf(bands: &[epos_shared::config::EqBand], sink: &str) -> String {
     let mut nodes = String::new();
     let mut links = String::new();
     let mut prev: Option<String> = None;
     let mut active = 0usize;
 
     for (i, band) in bands.iter().enumerate() {
-        // Only add band if gain != 0
         if band.gain_db.abs() < 0.1 {
             continue;
         }
@@ -449,65 +429,81 @@ fn generate_eq_filter_conf(bands: &[epos_shared::config::EqBand], device: &Devic
         active += 1;
     }
 
-    // If all bands are flat, return empty string so the caller REMOVES the
-    // config file. A comment-only stub is REJECTED by PipeWire's conf parser
-    // ("Invalid argument") and crashes the whole audio stack.
     if active == 0 {
-        return String::new();
+        // Passthrough — EQ off / all flat: keep the path flowing.
+        nodes.push_str(
+            r#"
+                    { type = builtin name = passthrough label = copy }"#,
+        );
+    } else {
+        info!("EQ: {} active band(s)", active);
     }
 
-    format!(
-        r#"# EPOS GSX 300 parametric EQ - 9-band (PipeWire filter-chain)
-# Auto-generated by epos-gsx300d
-# Device: {sink}
-# Bands: {bands}
-
-context.modules = [
-    {{
-        name = libpipewire-module-filter-chain
-        args = {{
-            node.description = "EPOS GSX 300 EQ"
-            media.name       = "EPOS GSX 300 EQ"
-            filter.graph = {{
-                nodes = [{nodes}
-                ]
-                links = [{links}
-                ]
-            }}
-            audio.channels = 2
-            audio.position = [ FL FR ]
-            capture.props = {{
-                node.name   = "epos-eq-input"
-                media.class = Audio/Sink
-                audio.position = [ FL FR ]
-            }}
-            playback.props = {{
-                node.name   = "epos-eq-output"
-                target.object = "{sink}"
-                node.passive = true
-            }}
+    let module = format!(
+        r#"
+    {{ name = libpipewire-module-filter-chain
+      args = {{
+        node.description = "EPOS GSX 300 EQ"
+        media.name = "EPOS GSX 300 EQ"
+        filter.graph = {{
+            nodes = [{nodes}
+            ]
+            links = [{links}
+            ]
         }}
-    }}
-]
+        audio.channels = 2
+        audio.position = [ FL FR ]
+        capture.props = {{
+            node.name = "epos-eq-capture"
+            target.object = "epos-eq-input.monitor"
+            remote.name = "pipewire-0"
+            node.passive = true
+        }}
+        playback.props = {{
+            node.name = "epos-eq-output"
+            target.object = "{sink}"
+            remote.name = "pipewire-0"
+            node.passive = true
+        }}
+      }} }}
 "#,
-        sink = device.pipewire_sink,
-        bands = active,
+        sink = sink,
         nodes = nodes,
         links = links,
-    )
+    );
+    instance_base_conf("eq", &module)
 }
 
-/// Generate voice enhancer EQ filter config (capture stream / mic).
-/// PipeWire filter-chain source: captures from the EPOS mic source,
-/// applies bq_peaking filters, exposes a virtual Audio/Source.
-fn generate_voice_eq_conf(
-    mode_name: &str,
-    device_source: Option<&str>,
+/// Generate the `voice` instance conf: ONE filter-chain owning the whole mic
+/// path (rnnoise → voice EQ bands → virtual Audio/Source `epos-voice-output`
+/// in MAIN). Nothing enabled → single `copy` passthrough so the source always
+/// exists. rnnoise LADSPA port names are "Input"/"Output" (verified).
+fn generate_voice_instance_conf(
+    source: &str,
+    noise_gate: bool,
+    vad_threshold: f32,
+    mode: &VoiceMode,
     bands: &[(u32, f32, f32)],
 ) -> String {
     let mut nodes = String::new();
     let mut links = String::new();
     let mut prev: Option<String> = None;
+
+    if noise_gate {
+        nodes.push_str(&format!(
+            r#"
+                    {{
+                        type   = ladspa
+                        name   = rnnoise
+                        plugin = "librnnoise_ladspa"
+                        label  = noise_suppressor_mono
+                        control = {{
+                            "VAD Threshold (%)" {vad_threshold:.1}
+                        }}
+                    }}"#
+        ));
+        prev = Some("rnnoise".to_string());
+    }
 
     for (i, &(freq, gain, q)) in bands.iter().enumerate() {
         if gain.abs() < 0.1 {
@@ -521,15 +517,12 @@ fn generate_voice_eq_conf(
                         name  = "{name}"
                         label = bq_peaking
                         control = {{ "Freq" = {freq} "Q" = {q} "Gain" = {gain} }}
-                    }}"#,
-            freq = freq,
-            q = q,
-            gain = gain,
+                    }}"#
         ));
         if let Some(p) = prev.take() {
             links.push_str(&format!(
                 r#"
-                    {{ output = "{p}:Out" input = "{name}:In" }}"#,
+                    {{ output = "{p}:Output" input = "{name}:In" }}"#,
                 p = p,
                 name = name
             ));
@@ -537,61 +530,123 @@ fn generate_voice_eq_conf(
         prev = Some(name);
     }
 
-    let target = device_source
-        .map(|s| format!(r#"                target.object = "{s}""#))
-        .unwrap_or_default();
+    if prev.is_none() {
+        // Nothing enabled → passthrough.
+        nodes.push_str(
+            r#"
+                    { type = builtin name = passthrough label = copy }"#,
+        );
+    }
 
-    format!(
-        r#"# EPOS GSX 300 voice enhancer ({mode}) - PipeWire filter-chain
-# Auto-generated by epos-gsx300d
-# Applied to capture stream
+    info!(
+        "Voice instance: noise_gate={} mode={:?} bands={}",
+        noise_gate,
+        mode,
+        bands.len()
+    );
 
-context.modules = [
-    {{
-        name = libpipewire-module-filter-chain
-        args = {{
-            node.description = "EPOS GSX 300 Voice Enhancer ({mode})"
-            media.name       = "EPOS GSX 300 Voice Enhancer ({mode})"
-            filter.graph = {{
-                nodes = [{nodes}
-                ]
-                links = [{links}
-                ]
-            }}
-            audio.channels = 2
-            audio.position = [ FL FR ]
-            capture.props = {{
-                node.name   = "epos-voice-capture"
-{target}
-                node.passive = true
-            }}
-            playback.props = {{
-                node.name   = "epos-voice-output"
-                media.class = Audio/Source
-            }}
+    let module = format!(
+        r#"
+    {{ name = libpipewire-module-filter-chain
+      args = {{
+        node.description = "EPOS GSX 300 Voice Chain"
+        media.name = "EPOS GSX 300 Voice Chain"
+        filter.graph = {{
+            nodes = [{nodes}
+            ]
+            links = [{links}
+            ]
         }}
-    }}
-]
+        audio.channels = 1
+        audio.position = [ MONO ]
+        capture.props = {{
+            node.name = "epos-voice-capture"
+            target.object = "{source}"
+            media.class = Stream/Input/Audio
+            remote.name = "pipewire-0"
+            node.passive = true
+        }}
+        playback.props = {{
+            node.name = "epos-voice-output"
+            media.class = Audio/Source
+            remote.name = "pipewire-0"
+        }}
+      }} }}
 "#,
-        mode = mode_name,
+        source = source,
         nodes = nodes,
         links = links,
-        target = target,
-    )
+    );
+    instance_base_conf("voice", &module)
 }
 
-/// Reload PipeWire so filter-chain module configs take effect.
-/// Restarts the user pipewire service (fast — <1s) to load new .conf.d files.
-pub(crate) async fn reload_pipewire() {
+/// Restart one epos instance (`systemctl --user restart pipewire-epos@<name>`)
+/// and health-check it: the instance must come up AND publish its expected
+/// node into MAIN (eq/voice always have one; sidetone only when its conf has
+/// the loopback module). Returns success; leaves EPOS silent (fail-closed)
+/// but never touches the main instance.
+pub(crate) async fn restart_epos_instance(role: &str) -> bool {
+    let svc = format!("pipewire-epos@{role}.service");
+    info!("Restarting epos instance {role}");
+    // Check whether the unit exists at all — a missing unit means the install
+    // wasn't completed; fail closed (keep main untouched) and warn loudly.
+    let exists = tokio::process::Command::new("systemctl")
+        .args(["--user", "list-unit-files", &svc])
+        .output()
+        .await
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&svc))
+        .unwrap_or(false);
+    if !exists {
+        warn!("epos instance unit {svc} not found — install not complete, EPOS silent");
+        return false;
+    }
+
     let status = tokio::process::Command::new("systemctl")
-        .args(["--user", "restart", "pipewire"])
+        .args(["--user", "restart", &svc])
         .status()
         .await;
-    match status {
-        Ok(s) if s.success() => info!("PipeWire restarted to apply filter configs"),
-        Ok(s) => warn!("PipeWire restart returned status {:?}", s.code()),
-        Err(e) => warn!("Failed to restart pipewire: {}", e),
+    let ok = match status {
+        Ok(s) if s.success() => true,
+        Ok(s) => {
+            warn!("epos instance restart {svc} returned {:?}", s.code());
+            false
+        }
+        Err(e) => {
+            warn!("epos instance restart {svc} failed: {}", e);
+            false
+        }
+    };
+    if !ok {
+        return false;
     }
+
+    // Health check: the instance must be up AND its control socket reachable
+    // (`pw-cli -r pipewire-epos-<role> info 0`). A conf parse/module error
+    // makes the daemon exit → systemd crash-loop → unit inactive, so
+    // reachability implies the generated conf loaded cleanly. Never touches
+    // the main instance.
+    for attempt in 0..3 {
+        if instance_reachable(role).await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        if attempt == 1 {
+            warn!("epos instance {role}: not reachable after restart — retry once");
+        }
+    }
+    warn!("epos instance {role}: still not reachable — EPOS path silent (fail-closed)");
+    false
+}
+
+/// Is the epos instance's own PipeWire control socket up and answering?
+async fn instance_reachable(role: &str) -> bool {
+    tokio::process::Command::new("pw-cli")
+        .args(["-r", &format!("pipewire-epos-{role}"), "info", "0"])
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// Set the GSX 300 capture gain via amixer, standalone so it can be
@@ -645,11 +700,9 @@ async fn apply_mic_gain_oneshot(device: &DeviceInfo, gain: u32) -> Result<()> {
 
 impl Drop for AudioPipeline {
     fn drop(&mut self) {
-        // Kill sidetone process on shutdown so an orphaned pw-loopback doesn't
-        // keep mixing mic into playback after the daemon exits.
-        if let Some(mut proc) = self.sidetone_proc.take() {
-            let _ = proc.start_kill();
-            info!("Killed sidetone process on shutdown");
-        }
+        // In Option B the sidetone lives inside the pipewire-epos@sidetone
+        // instance (systemd Restart=always), not a daemon-owned child, so there
+        // is nothing to reap here. Restarting/maintaining that instance is the
+        // RestartBus worker's job.
     }
 }

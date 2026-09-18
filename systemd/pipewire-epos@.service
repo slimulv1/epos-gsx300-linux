@@ -1,0 +1,37 @@
+# EPOS GSX 300 — per-role PipeWire instance (Option B, 3i)
+#
+# One instance per DSP role: eq | voice | sidetone
+#   systemctl --user start pipewire-epos@eq
+#   systemctl --user start pipewire-epos@voice
+#   systemctl --user start pipewire-epos@sidetone
+#
+# Each instance is software-only (no ALSA, no WirePlumber) and reads its own
+# self-contained config that the daemon regenerates atomically:
+#   %h/.config/pipewire-epos/%i/pipewire.conf
+#
+# Restarting an instance only affects that DSP path — the MAIN pipewire graph
+# (A2+ speakers, all other apps) is never touched at runtime.
+
+[Unit]
+Description=EPOS GSX 300 %i PipeWire instance (software-only)
+After=pipewire.service wireplumber.service graphical-session.target
+Wants=wireplumber.service
+PartOf=graphical-session.target
+# Fail-closed: if an instance dies it must restart (~1s) instead of leaving
+# the EPOS path silently dead forever.
+StartLimitBurst=5
+StartLimitIntervalSec=10
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/pipewire -c %h/.config/pipewire-epos/%i/pipewire.conf
+Restart=always
+RestartSec=1
+# Lib suggesting rnnoise LADSPA plugin (noise gate) for this instance's
+# filter-chain, mirroring the main pipewire.service.d drop-in.
+Environment=LADSPA_PATH=%h/.local/lib/ladspa:/usr/lib/ladspa:/usr/lib64/ladspa
+MemoryMax=64M
+TasksMax=32
+
+[Install]
+WantedBy=graphical-session.target

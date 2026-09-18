@@ -632,23 +632,38 @@ fn save_config(st: &IpcState) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// Background worker: debounced `systemctl --user restart pipewire`.
+/// Background worker: debounced restart of the per-role epos instances.
 ///
-/// Handlers that change on-disk audio config (EQ / noise gate / voice / profile
-/// switches) call `reload_notify.notify_one()` instead of restarting PipeWire
-/// inline. This worker coalesces those notifications and performs the restart
-/// once, off the IPC lock — so a fast slider drag or a burst of profile
-/// switches triggers a single reload, and the GUI's 3s GetStatus poll never
-/// stalls waiting on a 1–3s blocking restart.
+/// Handlers that change on-disk epos instance confs record the role on the
+/// [`AudioPipeline`] restart bus (via `write_instance_conf`) instead of
+/// restarting anything inline. This worker coalesces those notifications for
+/// 250 ms, drains the deduplicated role set, and restarts only those
+/// instances — never the main pipewire graph (A2+ stays untouched).
 async fn pipewire_reload_worker(state: Arc<RwLock<IpcState>>) {
-    let notify = state.read().await.reload_notify.clone();
     loop {
-        notify.notified().await;
-        // Coalesce rapid changes (e.g. an EQ slider drag) into a single reload:
-        // keep waiting up to 250ms for more notifications before firing.
-        while let Ok(()) = tokio::time::timeout(Duration::from_millis(250), notify.notified()).await {}
-        info!("PipeWire reload (debounced) triggered by audio config change");
-        audio::reload_pipewire().await;
+        // Clone the bus notify under the read lock, then release it before
+        // awaiting — a long idle wait must not hold the IPC lock.
+        let bus = {
+            let st = state.read().await;
+            st.audio.restarts.clone()
+        };
+        bus.notify.notified().await;
+        // Coalesce rapid changes (e.g. an EQ slider drag) into one restart:
+        // keep waiting up to 250 ms for more notifications before firing.
+        while let Ok(()) =
+            tokio::time::timeout(Duration::from_millis(250), bus.notify.notified()).await
+        {}
+        let pending = state.read().await.audio.restarts.drain();
+        if pending.is_empty() {
+            continue;
+        }
+        info!(
+            "EPOS instance restart (debounced) for: {}",
+            pending.iter().cloned().collect::<Vec<_>>().join(", ")
+        );
+        for role in &pending {
+            audio::restart_epos_instance(role).await;
+        }
     }
 }
 
