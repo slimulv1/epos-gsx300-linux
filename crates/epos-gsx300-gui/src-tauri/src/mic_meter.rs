@@ -233,7 +233,6 @@ fn run_meter(app: tauri::AppHandle, stop: Arc<AtomicBool>, node: String) {
             let _ = user_data.format.parse(param);
         })
         .process(|stream, user_data| {
-            use std::convert::TryInto;
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
@@ -248,16 +247,12 @@ fn run_meter(app: tauri::AppHandle, stop: Arc<AtomicBool>, node: String) {
             let n_f32 = n_bytes / 4;
             for i in 0..n_f32 {
                 let off = i * 4;
-                let a = f32::from_le_bytes(
-                    [
-                        samples[off],
-                        samples[off + 1],
-                        samples[off + 2],
-                        samples[off + 3],
-                    ]
-                    .try_into()
-                    .unwrap(),
-                )
+                let a = f32::from_le_bytes([
+                    samples[off],
+                    samples[off + 1],
+                    samples[off + 2],
+                    samples[off + 3],
+                ])
                 .abs();
                 if a > user_data.peak {
                     user_data.peak = a;
