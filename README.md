@@ -190,6 +190,31 @@ systemctl --user restart pipewire
 Verify: `pw-cli ls Node | grep epos-` should show `epos-noisegate-*`
 alongside `epos-eq-*` and `epos-voice-*` filter nodes.
 
+### Runtime GUI-apply behavior (fail-closed, main never touched)
+
+The daemon runs the EQ / voice DSP as per-role **PipeWire instances**
+(`pipewire-epos@eq`, `pipewire-epos@voice`, `pipewire-epos@sidetone`),
+each seeded to its own conf
+(`~/.config/pipewire-epos/<role>/pipewire.conf`, fail-closed). Changing
+EQ / noise gate / voice enhancer from the GUI:
+
+- writes that **role's** instance conf and restarts **that instance only**
+  (`pipewire-epos@<role>`) — the main `pipewire` graph is **never
+  restarted**, so Discord keeps its pinned sink (`epos-eq-input` when
+  EQ is applied, the EPOS hardware sink otherwise) **and** its pinned mic
+  link (`epos-voice-output`).
+- The main graph carries static **fail-closed anchors** the whole time:
+  the EQ anchor is the null-sink `epos-eq-input`
+  (`pipewire.conf.d/40-epos-eq-virtualsink.conf`), the mic anchor is the
+  null-source `epos-voice-output`
+  (`pipewire.conf.d/51-epos-voice-enhancer.conf`). If a DSP instance
+  drops, the anchors keep the links — the side goes silent (fail-closed)
+  instead of Discord re-routing to the default device.
+
+No PipeWire (main) restart is performed for any DSP change from the GUI —
+`pipewire.conf.d/*-epos-*.conf` files are seeded at install time only and
+never rewritten on GUI-apply.
+
 ## Tech Stack
 
 - **Daemon**: Rust + Tokio + signal-hook
