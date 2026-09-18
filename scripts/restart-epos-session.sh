@@ -46,12 +46,19 @@ _main_anchor_note() { # printed once; explains the only-involved main restart
 if [[ ! -x "$ROOT/scripts/install.sh" ]]; then
     die "install.sh missing — run ./scripts/install.sh --help trước"
 fi
-# Template instance unit phải đã được cài bởi install.sh.
-if ! systemctl --user list-unit-files "pipewire-epos@eq.service" >/dev/null 2>&1 &&
-   ! systemctl --user list-unit-files "pipewire-epos@voice.service" >/dev/null 2>&1 &&
-   ! systemctl --user list-unit-files "pipewire-epos@sidetone.service" >/dev/null 2>&1; then
-    die "chưa thấy pipewire-epos@*.service — chạy ./scripts/install.sh trước rồi restart main"
+# Template instance unit phải đã được cài bởi install.sh. Lưu ý:
+# systemd user KHÔNG liệt kê instance alias (pipewire-epos@eq/voice/..) trong
+# list-unit-files — chỉ template `pipewire-epos@.service` (state indirect).
+# Nên gate đúng: template có + 3 symlink enable (wants) trên disk tồn tại.
+if ! systemctl --user list-unit-files "pipewire-epos@.service" >/dev/null 2>&1; then
+    die "chưa thấy template pipewire-epos@.service — chạy ./scripts/install.sh trước rồi restart main"
 fi
+for role in "${EPOS_INSTANCE_ROLES[@]}"; do
+    if [[ ! -e "$XDG_CONFIG_HOME/systemd/user/graphical-session.target.wants/pipewire-epos@$role.service" ]] &&
+       [[ ! -e "$HOME/.config/systemd/user/graphical-session.target.wants/pipewire-epos@$role.service" ]]; then
+        die "chưa thấy enable symlink pipewire-epos@$role — chạy ./scripts/install.sh trước rồi restart main"
+    fi
+done
 
 banner "Restart MAIN lần đầu (nạp null-sink fail-closed + drop DSP chain cũ)"
 systemctl --user restart pipewire wireplumber
