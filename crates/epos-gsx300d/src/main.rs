@@ -159,6 +159,7 @@ async fn main() -> Result<()> {
                                 }
                             }
                             info!("Smart button: mode → {:?} (LED sync)", new_mode);
+                            emit_smart_notify(&st);
                         }
                         SmartButtonAction::ToggleEq => {
                             st.smart_button_seq
@@ -174,6 +175,7 @@ async fn main() -> Result<()> {
                                 warn!("Failed to save config: {}", e);
                             }
                             info!("Smart button: EQ {}", if enabled { "ON" } else { "OFF" });
+                            emit_smart_notify(&st);
                         }
                         SmartButtonAction::CyclePreset => {
                             st.smart_button_seq
@@ -210,6 +212,7 @@ async fn main() -> Result<()> {
                                         warn!("Failed to save config: {}", e);
                                     }
                                     info!("Smart button: profile → {}", name);
+                                    emit_smart_notify(&st);
                                 }
                             }
                         }
@@ -230,6 +233,7 @@ async fn main() -> Result<()> {
                                 "Smart button: sidetone {}",
                                 if enabled { "ON" } else { "OFF" }
                             );
+                            emit_smart_notify(&st);
                         }
                         SmartButtonAction::ToggleNoiseGate => {
                             st.smart_button_seq
@@ -248,6 +252,7 @@ async fn main() -> Result<()> {
                                 "Smart button: noise gate {}",
                                 if enabled { "ON" } else { "OFF" }
                             );
+                            emit_smart_notify(&st);
                         }
                     }
                 }
@@ -816,5 +821,71 @@ async fn led_heartbeat_loop(state: Arc<RwLock<IpcState>>) {
                 warn!("LED heartbeat: failed to re-assert {:?}: {}", desired, e);
             }
         }
+    }
+}
+
+/// Daemon-owned desktop notification for a smart-button action — fires even
+/// with the GUI shut, because the daemon is the single source of truth for
+/// button state and the GUI no longer emits its own toast.
+///
+/// Body is byte-parity with the GUI (`notifySmartButton`): `<profile> · <mode>`.
+/// Deliberately a *sync* fn: it only reads already-committed `st.config` fields
+/// and spawns `notify-send` detached, so it never holds the async state lock or
+/// blocks the audio path. Debounced (~800ms) so the device's twin-press HID
+/// readback (~0.5ms apart) yields exactly one toast, never two.
+fn emit_smart_notify(st: &IpcState) {
+    // Config gate — lets users disable just the button toast without touching
+    // the rest of the smart-button behavior. Denies politely: no toast.
+    if !st.config.smart_button.notify_enabled {
+        return;
+    }
+
+    // Debounce: the GSX 300 reports one readback per physical press via its own
+    // in-device debounce, but the HID twin-press can still surface twice
+    // ~0.5ms apart (observed 12:29:43.871/43.871). Collapse to one toast.
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> =
+        std::sync::Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap();
+        let now = std::time::Instant::now();
+        if last
+            .map(|t| now.duration_since(t) < std::time::Duration::from_millis(800))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        *last = Some(now);
+    }
+
+    // Build the body byte-for-byte like the GUI: `${active_profile ?? "Flat"} ·
+    // ${modeLabel}` where modeLabel is "7.1" for surround/7.1 else "Stereo".
+    let profile = if st.config.active_profile.is_empty() {
+        "Flat".to_string()
+    } else {
+        st.config.active_profile.clone()
+    };
+    let mode_label = match st.config.mode {
+        AudioMode::Surround71 => "7.1",
+        AudioMode::Stereo => "Stereo",
+    };
+    let body = format!("{} · {}", profile, mode_label);
+
+    // Detached spawn — best-effort, warn-only on failure (never blocks the
+    // audio path, never returns an error up into the button handler).
+    let res = std::process::Command::new("notify-send")
+        .arg("-u")
+        .arg("normal")
+        .arg("-a")
+        .arg("epos-gsx300")
+        .arg("EPOS GSX 300")
+        .arg(&body)
+        .spawn();
+    match res {
+        Ok(mut child) => {
+            // Give notify-send a moment to deliver, then let it detach fully.
+            // Drop the handle: we don't await it (no async here by design).
+            let _ = child.try_wait();
+        }
+        Err(e) => warn!("Smart-button notify: notify-send failed: {}", e),
     }
 }

@@ -119,6 +119,18 @@ pub struct Profile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SmartButtonConfig {
     pub action: SmartButtonAction,
+    /// Emit a desktop notification on smart-button action (daemon-owned;
+    /// works with the GUI closed). Default true; old configs without the
+    /// key keep loading (serde default).
+    #[serde(default = "default_true")]
+    pub notify_enabled: bool,
+}
+
+/// serde `default =` path target — keeps `notify_enabled` optional in on-disk
+/// config while the daemon (the binary that must keep compiling byte-anchored)
+/// reads `true` when the key is absent.
+pub fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -154,6 +166,7 @@ impl Default for Config {
             active_profile: "FLAT".into(),
             smart_button: SmartButtonConfig {
                 action: SmartButtonAction::ToggleMode,
+                notify_enabled: true,
             },
         }
     }
