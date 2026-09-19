@@ -77,6 +77,16 @@ pub enum Response {
         active_profile: String,
         mode: AudioMode,
         smart_button_action: String,
+        sidetone_enabled: bool,
+        noise_gate_enabled: bool,
+        voice_enhancer_enabled: bool,
+        /// Monotonic press counter for the physical smart button. The daemon's
+        /// five DSP-apply arms `fetch_add(1)` on every smart-button dispatch
+        /// (main.rs). The GUI diffs this across its 3s Status poll so it can
+        /// fire a desktop notification ONLY when the *smart button* changed a
+        /// DSP/mode — GUI-initiated SetMode/SetEq (which route through
+        /// `Request::Set*` and never touch this counter) never trigger one.
+        smart_button_seq: u64,
         volume: i32,
     },
     Device(Option<DeviceInfo>),

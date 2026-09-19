@@ -113,6 +113,7 @@ async fn main() -> Result<()> {
         last_written: std::sync::Mutex::new(None),
         reload_notify: Arc::new(Notify::new()),
         volume_save_notify: Arc::new(Notify::new()),
+        smart_button_seq: std::sync::atomic::AtomicU64::new(0),
     }));
 
     // Background task: handle smart button presses (mode sync) according to
@@ -133,6 +134,8 @@ async fn main() -> Result<()> {
 
                     match action {
                         SmartButtonAction::ToggleMode => {
+                            st.smart_button_seq
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             // The device toggles its own physical state when the
                             // button is pressed, then reports the NEW state via
                             // ModeChanged. Trust the readback absolutely — never
@@ -158,6 +161,8 @@ async fn main() -> Result<()> {
                             info!("Smart button: mode → {:?} (LED sync)", new_mode);
                         }
                         SmartButtonAction::ToggleEq => {
+                            st.smart_button_seq
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let enabled = !st.config.audio.eq.enabled;
                             st.config.audio.eq.enabled = enabled;
                             let audio_cfg = st.config.audio.clone();
@@ -171,6 +176,8 @@ async fn main() -> Result<()> {
                             info!("Smart button: EQ {}", if enabled { "ON" } else { "OFF" });
                         }
                         SmartButtonAction::CyclePreset => {
+                            st.smart_button_seq
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let names: Vec<String> =
                                 st.config.profiles.iter().map(|p| p.name.clone()).collect();
                             let next = if names.is_empty() {
@@ -207,6 +214,8 @@ async fn main() -> Result<()> {
                             }
                         }
                         SmartButtonAction::ToggleSidetone => {
+                            st.smart_button_seq
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let enabled = !st.config.audio.sidetone.enabled;
                             st.config.audio.sidetone.enabled = enabled;
                             let audio_cfg = st.config.audio.clone();
@@ -223,6 +232,8 @@ async fn main() -> Result<()> {
                             );
                         }
                         SmartButtonAction::ToggleNoiseGate => {
+                            st.smart_button_seq
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let enabled = !st.config.audio.noise_gate.enabled;
                             st.config.audio.noise_gate.enabled = enabled;
                             let audio_cfg = st.config.audio.clone();

@@ -1,5 +1,6 @@
 import { defineStore } from "pinia";
 import { ref } from "vue";
+import { notifySmartButton } from "../lib/notify";
 
 // Tauri invoke — loaded dynamically so browser dev mode can fall back
 let tauriInvoke: ((cmd: string, args?: Record<string, unknown>) => Promise<any>) | null = null;
@@ -62,6 +63,10 @@ export interface DeviceStatus {
   mode: AudioMode;
   smart_button_action?: string;
   volume?: number;
+  sidetone_enabled: boolean;
+  noise_gate_enabled: boolean;
+  voice_enhancer_enabled: boolean;
+  smart_button_seq: number;
 }
 
 // ─── Response shape from daemon ─────────────────────────────
@@ -92,6 +97,7 @@ export const useDaemonStore = defineStore("daemon", () => {
   const audio = ref<AudioConfig | null>(null);
   const profiles = ref<Profile[]>([]);
   const mode = ref<AudioMode>("stereo");
+  const lastSmartSeq = ref<number>(0);
   const device = ref<DeviceInfo | null>(null);
 
   // ─── IPC Layer ────────────────────────────────────────────
@@ -138,6 +144,7 @@ export const useDaemonStore = defineStore("daemon", () => {
   // ─── Mock Data (browser dev fallback only) ────────────────
 
   let mockMode: AudioMode = "stereo";
+  let mockSmartSeq = 0;
   const mockStatus = {
     daemon_version: "0.1.0",
     device_connected: true,
@@ -150,11 +157,12 @@ export const useDaemonStore = defineStore("daemon", () => {
   function mockResponse(request: Record<string, unknown>): DaemonResponse {
     switch (request.type) {
       case "GetStatus":
-        return { type: "Status", payload: { ...mockStatus, mode: mockMode } };
+        return { type: "Status", payload: { ...mockStatus, mode: mockMode, smart_button_seq: mockSmartSeq } };
       case "GetMode":
         return { type: "Mode", payload: mockMode };
       case "ToggleMode":
         mockMode = mockMode === "stereo" ? "surround71" : "stereo";
+        mockSmartSeq += 1;
         return { type: "Mode", payload: mockMode };
       case "SetMode": {
         const m = (request as { payload?: { mode?: AudioMode } }).payload?.mode;
@@ -214,6 +222,12 @@ export const useDaemonStore = defineStore("daemon", () => {
       status.value = res.payload;
       connected.value = true;
       if (res.payload.mode) mode.value = res.payload.mode as AudioMode;
+      const seq = (res.payload as { smart_button_seq?: number }).smart_button_seq;
+      if (typeof seq === "number" && seq !== lastSmartSeq.value) {
+        lastSmartSeq.value = seq;
+        const profile = (res.payload as { active_profile?: string }).active_profile;
+        void notifySmartButton(profile ?? "Flat", res.payload.mode as AudioMode | undefined);
+      }
     }
   }
 

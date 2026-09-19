@@ -83,6 +83,15 @@ pub struct IpcState {
     /// otherwise queue dozens of concurrent `save_config` writes (see
     /// `volume_save_worker` in main.rs, audit F5).
     pub volume_save_notify: Arc<Notify>,
+    /// Monotonic press counter for the physical smart button, bumped by every
+    /// smart-button dispatch arm in main.rs (5 arms: ToggleMode/ToggleEq/
+    /// CyclePreset/ToggleSidetone/ToggleNoiseGate). Exposed via
+    /// `Status::smart_button_seq` so the GUI can tell a *smart-button* change
+    /// (paper trail: seq bump) apart from a GUI-initiated EQ/profile apply
+    /// (same config fields change but seq stays put) — the GUI's poll-diff
+    /// notifies only on seq movement, so desktop notifications never spam on
+    /// the user's own EQ slider drags.
+    pub smart_button_seq: std::sync::atomic::AtomicU64,
 }
 
 pub async fn run_server(state: Arc<RwLock<IpcState>>) -> Result<()> {
@@ -193,6 +202,13 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
                     .trim_matches('"')
                     .into(),
                 volume: state.volume.load(std::sync::atomic::Ordering::Relaxed),
+                sidetone_enabled: state.config.audio.sidetone.enabled,
+                noise_gate_enabled: state.config.audio.noise_gate.enabled,
+                voice_enhancer_enabled: state.config.audio.voice_enhancer.mode
+                    != epos_shared::config::VoiceMode::Off,
+                smart_button_seq: state
+                    .smart_button_seq
+                    .load(std::sync::atomic::Ordering::Relaxed),
             }
         }
         Request::GetDevice => {
