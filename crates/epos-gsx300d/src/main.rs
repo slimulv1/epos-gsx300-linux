@@ -196,8 +196,16 @@ async fn main() -> Result<()> {
                                 if let Some(profile) =
                                     st.config.profiles.iter().find(|p| p.name == name)
                                 {
-                                    st.config.audio = profile.audio.clone();
+                                    let profile_audio = profile.audio.clone();
+                                    let profile_mode = profile.mode;
+                                    st.config.audio = profile_audio;
                                     st.config.active_profile = name.clone();
+                                    st.config.mode = profile_mode;
+                                    if let Some(ref mut led) = st.led {
+                                        if let Err(e) = led.set_mode(profile_mode) {
+                                            warn!("Failed to set LED after smart button: {}", e);
+                                        }
+                                    }
                                     let audio_cfg = st.config.audio.clone();
                                     st.audio.update_config(&audio_cfg);
                                     match st.audio.apply_full().await {
@@ -212,6 +220,14 @@ async fn main() -> Result<()> {
                                         warn!("Failed to save config: {}", e);
                                     }
                                     info!("Smart button: profile → {}", name);
+                                    info!(
+                                        "Smart button: profile → {} · LED {} (sync)",
+                                        name,
+                                        match profile_mode {
+                                            AudioMode::Stereo => "blue",
+                                            AudioMode::Surround71 => "red",
+                                        }
+                                    );
                                     emit_smart_notify(&st);
                                 }
                             }

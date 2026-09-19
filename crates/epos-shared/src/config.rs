@@ -112,6 +112,10 @@ pub enum VoiceMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
     pub name: String,
+    /// Audio mode this profile drives — 7.1 for MOVIE/MUSIC, 2.0 (stereo)
+    /// for FLAT/ESPORT. Missing on old configs → Stereo (2.0) via serde.
+    #[serde(default)]
+    pub mode: AudioMode,
     pub audio: AudioConfig,
     pub created_at: String,
 }
@@ -252,6 +256,7 @@ impl Profile {
     pub fn flat() -> Self {
         Self {
             name: "FLAT".into(),
+            mode: AudioMode::Stereo,
             audio: AudioConfig::default(),
             created_at: "2026-09-09".into(),
         }
@@ -311,6 +316,7 @@ impl Profile {
         ];
         Self {
             name: "MUSIC".into(),
+            mode: AudioMode::Surround71,
             audio,
             created_at: "2026-09-09".into(),
         }
@@ -370,6 +376,7 @@ impl Profile {
         ];
         Self {
             name: "MOVIE".into(),
+            mode: AudioMode::Surround71,
             audio,
             created_at: "2026-09-09".into(),
         }
@@ -429,6 +436,7 @@ impl Profile {
         ];
         Self {
             name: "ESPORT (TREBLE)".into(),
+            mode: AudioMode::Stereo,
             audio,
             created_at: "2026-09-09".into(),
         }

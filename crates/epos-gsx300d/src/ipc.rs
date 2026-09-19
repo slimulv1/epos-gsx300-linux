@@ -428,6 +428,7 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
             let now = chrono_now();
             state.config.profiles.push(epos_shared::Profile {
                 name: name.clone(),
+                mode: epos_shared::AudioMode::Stereo,
                 audio,
                 created_at: now,
             });
