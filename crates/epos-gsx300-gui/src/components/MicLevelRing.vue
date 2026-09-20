@@ -200,6 +200,7 @@ onUnmounted(() => {
   align-items: center;
   gap: 6px;
   font-family: var(--font-ui);
+  width: min(100%, 384px); /* long flat track — svg scales to fill */
 }
 .bar-meter.dead .gain-text {
   fill: var(--muted);
