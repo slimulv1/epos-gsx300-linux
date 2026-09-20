@@ -520,10 +520,13 @@ fn generate_voice_instance_conf(
                     }}"#
         ));
         if let Some(p) = prev.take() {
+            // rnnoise LADSPA exposes `:Output`; PipeWire builtin bq_peaking uses `:Out`.
+            let out_port = if p == "rnnoise" { "Output" } else { "Out" };
             links.push_str(&format!(
                 r#"
-                    {{ output = "{p}:Output" input = "{name}:In" }}"#,
+                    {{ output = "{p}:{out_port}" input = "{name}:In" }}"#,
                 p = p,
+                out_port = out_port,
                 name = name
             ));
         }
@@ -590,12 +593,20 @@ pub(crate) async fn restart_epos_instance(role: &str) -> bool {
     info!("Restarting epos instance {role}");
     // Check whether the unit exists at all — a missing unit means the install
     // wasn't completed; fail closed (keep main untouched) and warn loudly.
+    // The per-role DSP runs as a template INSTANCE of pipewire-epos@.service
+    // (eq, voice, sidetone all pull from the one template unit file). An
+    // instance like `pipewire-epos@voice.service` is NOT itself a unit file,
+    // so `list-unit-files <instance>` is always empty; the unit file that
+    // must exist for the install to be complete is the TEMPLATE. Enable is
+    // "indirect" (instances are pulled from graphical-session.wants), which
+    // is the complete-install state we care about.
+    let template_file = "pipewire-epos@.service";
     let exists = tokio::process::Command::new("systemctl")
-        .args(["--user", "list-unit-files", &svc])
+        .args(["--user", "list-unit-files", template_file])
         .output()
         .await
         .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&svc))
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(template_file))
         .unwrap_or(false);
     if !exists {
         warn!("epos instance unit {svc} not found — install not complete, EPOS silent");
