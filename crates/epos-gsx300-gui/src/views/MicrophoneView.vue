@@ -31,7 +31,8 @@ async function ensureMeter() {
       }
     }
   } catch {
-    // No Tauri runtime (browser dev): MicLevelRing falls back to its mock.
+    // No Tauri runtime (browser dev): MicLevelRing stays dark / "NO SIGNAL".
+    // It NEVER fabricates audio — there is no mock anywhere in the frontend.
   }
 }
 
