@@ -139,18 +139,29 @@ or a comment pinning it.
 
 Not defects that lose audio today, but not solved either:
 
-- **No loaded-conf identity.** `write_instance_conf` compares on-disk bytes
-  only, so it cannot detect an instance running an *older* conf whose file
-  already matches. Mitigated by restarting the DSP instances unconditionally
-  at daemon startup, which makes the running state a function of the config
-  rather than of luck. The proper fix is a hash the instance records and the
-  daemon compares.
-- **Shutdown can drop a pending restart.** A `Quit` or SIGTERM between
-  writing a conf and the debounce worker draining loses the restart; the next
-  start would see unchanged bytes. The same startup convergence covers it.
 - **External `pactl` routing fights the daemon.** The watchdog re-asserts the
   default sink every 5 s when the EQ is on, so a deliberate manual change to
-  the default sink is reverted. Intentional, but worth knowing.
+  the default sink is reverted. That is the intended trade-off — without it the
+  EQ silently stops working the moment someone changes the output — but it is
+  worth knowing before spending time fighting it.
 - **All-flat bands degrade to passthrough** while `eq.enabled` stays true, so
   the status reports the EQ as active when no filtering happens. Honest fix
   would be an effective-band count in the status response.
+
+### Closed
+
+- **No loaded-conf identity** — was the reason a lost restart was permanent.
+  Each instance now records the conf it was last *verified* to have loaded, next
+  to the generated one, and the daemon restarts any role whose conf on disk does
+  not match. A copy rather than a digest, so it needs no new dependency and
+  cannot collide; written only after the post-restart health check passes, so a
+  stamp always describes a load that actually worked. Verified all three ways:
+  a changed config while the daemon was down is detected and restarted, an
+  unchanged one restarts nothing, and a deleted stamp restarts that role rather
+  than trusting it.
+- **Shutdown could drop a pending restart** — solved by the same stamp, with no
+  shutdown work added. A restart lost to an exit or a power cut leaves the stamp
+  describing the previous conf, so the next start repairs it. Draining on exit
+  was rejected: it adds shutdown latency and a hang risk in the exit path to fix
+  something that can be detected on the next start instead.
+

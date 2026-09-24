@@ -555,6 +555,65 @@ impl AudioPipeline {
             .join("pipewire.conf")
     }
 
+    /// The conf an instance was last verified to have loaded.
+    ///
+    /// Deliberately a copy of the conf rather than a digest of it: no new
+    /// dependency, no hash function whose stability would need arguing about,
+    /// and no possibility of two different confs sharing a stamp. It is the only
+    /// record of what the running instance actually parsed, and it is written
+    /// only after the post-restart health check passes.
+    fn loaded_conf_path(role: &str) -> std::path::PathBuf {
+        Self::instance_conf_path(role).with_file_name("loaded.conf")
+    }
+
+    /// Restart any instance that cannot be shown to be running the conf on disk.
+    ///
+    /// Replaces the previous unconditional startup restart of `eq` and `voice`,
+    /// which had two problems: it was a guess rather than a check, and it never
+    /// covered `sidetone`, so a lost sidetone restart stayed lost forever.
+    ///
+    /// Must run after `apply_full()`, which is what writes the confs being
+    /// compared against.
+    pub fn request_stale_instance_restarts(&self) {
+        for role in ["eq", "voice", "sidetone"] {
+            let desired = std::fs::read_to_string(Self::instance_conf_path(role)).ok();
+            let loaded = std::fs::read_to_string(Self::loaded_conf_path(role)).ok();
+            if conf_needs_restart(desired.as_deref(), loaded.as_deref()) {
+                info!(
+                    "{role}: no verified load of the conf on disk — requesting a \
+                     restart so the running instance provably matches the config"
+                );
+                self.request_instance_restart(role);
+            }
+        }
+    }
+
+    /// Stamp the conf an instance was just verified to have loaded.
+    ///
+    /// Only ever called after the health check passed, so a stamp always
+    /// describes a load that demonstrably worked. A role with no conf has its
+    /// stamp removed rather than left to go stale, so the on-disk state is never
+    /// ambiguous.
+    fn record_loaded_conf(role: &str, conf: Option<&str>) {
+        let path = AudioPipeline::loaded_conf_path(role);
+        match conf {
+            Some(contents) => {
+                if let Err(e) = write_atomic(&path, contents) {
+                    // Not fatal: it only means this role will be restarted again
+                    // on the next daemon start, which is the safe direction.
+                    warn!("could not record the loaded {role} conf: {e}");
+                } else {
+                    debug!("recorded the loaded {role} conf");
+                }
+            }
+            None => match std::fs::remove_file(&path) {
+                Ok(()) => debug!("cleared the loaded {role} conf stamp (no conf)"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!("could not clear the loaded {role} conf stamp: {e}"),
+            },
+        }
+    }
+
     /// Atomically write a generated instance conf. Returns true if the file
     /// actually changed (caller decides whether to restart that instance).
     fn write_instance_conf(&self, role: &str, conf: &str) -> Result<bool> {
@@ -568,9 +627,7 @@ impl AudioPipeline {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let tmp = path.with_extension("conf.tmp");
-        std::fs::write(&tmp, conf)?;
-        std::fs::rename(&tmp, &path)?;
+        write_atomic(&path, conf)?;
         info!("{} instance conf written to {}", role, path.display());
         self.restarts.request(role);
         Ok(true)
@@ -1270,6 +1327,11 @@ fn generate_voice_instance_conf(
 pub(crate) async fn restart_epos_instance(role: &str) -> bool {
     let svc = format!("pipewire-epos@{role}.service");
     info!("Restarting epos instance {role}");
+    // Snapshot the conf BEFORE the restart. Whatever the instance is about to
+    // parse is exactly what must later be recorded as "loaded"; reading it
+    // afterwards could pick up a newer conf written while this restart was in
+    // flight, and the stamp would then vouch for a load that never happened.
+    let conf_snapshot = std::fs::read_to_string(AudioPipeline::instance_conf_path(role)).ok();
     // Check whether the unit exists at all — a missing unit means the install
     // wasn't completed; fail closed (keep main untouched) and warn loudly.
     // The per-role DSP runs as a template INSTANCE of pipewire-epos@.service
@@ -1364,19 +1426,24 @@ pub(crate) async fn restart_epos_instance(role: &str) -> bool {
         false
     };
     match tokio::time::timeout(RESTART_VERIFY_BUDGET, verify).await {
-        Ok(healthy) => {
-            if !healthy {
-                // Do not claim silence here. The EQ watchdog independently
-                // re-probes every 5 s, repairs the route and restarts the
-                // instance, so this verdict is a report, not the last word —
-                // and a restart racing another restart can make it look worse
-                // than it is.
-                warn!(
-                    "epos instance {role}: not verified healthy after restart; \
-                     the watchdog will re-check and retry"
-                );
-            }
-            healthy
+        Ok(true) => {
+            // The load is now proven, so this is the moment to record it. Until
+            // here the stamp still describes the previous conf, which is exactly
+            // what makes a lost restart detectable on the next daemon start.
+            AudioPipeline::record_loaded_conf(role, conf_snapshot.as_deref());
+            true
+        }
+        Ok(false) => {
+            // Do not claim silence here. The EQ watchdog independently
+            // re-probes every 5 s, repairs the route and restarts the
+            // instance, so this verdict is a report, not the last word —
+            // and a restart racing another restart can make it look worse
+            // than it is.
+            warn!(
+                "epos instance {role}: not verified healthy after restart; \
+                 the watchdog will re-check and retry"
+            );
+            false
         }
         Err(_) => {
             warn!(
@@ -1644,6 +1711,45 @@ pub(crate) fn eq_route_decision(outcome: ChainProbe, missing_polls: u32) -> EqRo
 /// exactly one definition; a second copy is how two watchers drift apart.
 fn restart_due(missing_polls: u32) -> bool {
     missing_polls >= 1 && (missing_polls - 1) % RESTART_RETRY_POLLS == 0
+}
+
+/// Must this role's instance be restarted before its conf can be trusted?
+///
+/// `desired` is the conf now on disk, `loaded` the conf an instance was last
+/// verified to have loaded. The question is not "did the file change" — that is
+/// what `write_instance_conf` already answers — but "is the running instance
+/// provably using what is on disk", which is the question that goes unanswered
+/// when a requested restart is lost.
+///
+/// Every uncertain case answers `true`, because the two mistakes are not
+/// equivalent: restarting an instance that was already correct costs a fraction
+/// of a second of DSP, while skipping one leaves a configured feature silently
+/// not working for good.
+pub(crate) fn conf_needs_restart(desired: Option<&str>, loaded: Option<&str>) -> bool {
+    match (desired, loaded) {
+        // No conf to run, so nothing to load. A leftover stamp cannot make this
+        // worse: the role has no work either way.
+        (None, _) => false,
+        // A conf with no verified load: there is no evidence of what is running.
+        (Some(_), None) => true,
+        (Some(desired), Some(loaded)) => desired != loaded,
+    }
+}
+
+/// Write `contents` to `path` atomically: a complete write to a sibling temp
+/// file, then a rename.
+///
+/// Used for both the generated conf and its loaded stamp. A reader therefore
+/// never sees a half-written file, and a crash mid-write cannot leave a
+/// truncated file that a later comparison would happily accept.
+fn write_atomic(path: &std::path::Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// Per-role watchdog state: how many consecutive polls have said this role's
@@ -2776,5 +2882,92 @@ mod tests {
                  forever"
             );
         }
+    }
+
+    // ── Which instances are provably running the conf on disk? ─────────────
+    //
+    // `write_instance_conf` decides whether to restart by comparing the conf it
+    // just generated against the file on disk. That answers "has the file
+    // changed?" and never "is the running instance using it?". The two come
+    // apart whenever a restart is requested and then lost — the daemon exits or
+    // is killed inside the 250 ms debounce window, or the machine loses power —
+    // because the conf is already written while the instance keeps running the
+    // previous one. On the next start the bytes match, no restart is requested,
+    // and the mismatch is permanent: the feature is configured one way and
+    // behaves another, with nothing in the log to explain it.
+    //
+    // The repair is a stamp: `loaded.conf` holds the exact conf an instance was
+    // last started with, written only after the post-restart health check
+    // passes. Startup compares the two and restarts whatever differs.
+    //
+    // A copy rather than a hash on purpose. It needs no new dependency and no
+    // hash function, it reuses the byte comparison that already exists here,
+    // and it cannot collide — a stamp that is wrong in the "looks fresh" direction
+    // is the one failure mode this is here to prevent. It costs a few KB per
+    // role.
+    //
+    // Every failure mode points the same way, at restarting something that was
+    // already fine: a missing or unreadable stamp counts as stale, and a stamp
+    // is only written once a load has actually been verified.
+
+    /// A role that has never recorded a verified load is restarted, because
+    /// there is no evidence of what it is running.
+    #[test]
+    fn a_role_that_never_recorded_a_load_is_restarted_at_startup() {
+        assert!(
+            conf_needs_restart(Some("conf"), None),
+            "no stamp means no evidence the instance is running this conf"
+        );
+    }
+
+    /// The steady state, and the reason the startup restart can be dropped: the
+    /// conf on disk is exactly what the instance loaded, so there is nothing to
+    /// do. Without this case every daemon start would bounce all three DSP
+    /// instances for no reason.
+    #[test]
+    fn a_role_whose_conf_matches_the_loaded_one_is_left_alone() {
+        assert!(!conf_needs_restart(Some("conf"), Some("conf")));
+    }
+
+    /// The actual bug: the conf on disk was updated, the restart was lost, and
+    /// the instance is still running the old one.
+    #[test]
+    fn a_role_whose_conf_differs_from_the_loaded_one_is_restarted_at_startup() {
+        assert!(
+            conf_needs_restart(Some("new conf"), Some("old conf")),
+            "a conf that was never loaded must be loaded before it is trusted"
+        );
+    }
+
+    /// A role with no conf has nothing to run, so there is nothing to restart.
+    /// This is the sidetone-with-sidetone-off case.
+    #[test]
+    fn a_role_with_no_conf_is_not_restarted() {
+        assert!(!conf_needs_restart(None, None));
+        assert!(
+            !conf_needs_restart(None, Some("left over from a previous install")),
+            "a stamp for a conf that no longer exists must not ask for a restart"
+        );
+    }
+
+    /// A stamp that was cut short must count as different, never as matching. A
+    /// truncated file that happened to compare equal to a truncated conf would
+    /// vouch for a load that never happened — the exact failure this stamp
+    /// exists to prevent.
+    #[test]
+    fn a_partial_stamp_is_never_treated_as_a_match() {
+        assert!(conf_needs_restart(Some("conf"), Some("conf ")));
+        assert!(conf_needs_restart(Some("conf"), Some("")));
+        assert!(conf_needs_restart(Some("conf"), Some("onf")));
+    }
+
+    /// Byte equality is the whole rule, so two empty files match. This is not
+    /// reachable in practice — a generated conf always carries the daemon
+    /// skeleton, so `desired` is never empty — and the case is pinned so the
+    /// comparison is not quietly changed into something stricter that would
+    /// restart an instance on every start.
+    #[test]
+    fn two_identical_empty_files_are_a_match() {
+        assert!(!conf_needs_restart(Some(""), Some("")));
     }
 }

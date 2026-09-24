@@ -97,17 +97,20 @@ async fn main() -> Result<()> {
         if let Err(e) = audio.apply_full().await {
             warn!("Failed to apply initial audio config: {}", e);
         }
-        // Force the DSP instances to converge on the confs we just wrote.
+        // Make the running instances a function of the config, deterministically.
         //
         // `write_instance_conf` only requests a restart when the file bytes
-        // changed, which cannot detect an instance that is running an OLDER
-        // conf while the on-disk file already matches — the state is
-        // unreachable for the watchdog too, since the chain node exists either
-        // way. Restarting once at startup makes the running instances a
-        // function of the config, deterministically, instead of by luck.
-        for role in ["eq", "voice"] {
-            audio.request_instance_restart(role);
-        }
+        // changed, which cannot detect an instance running an OLDER conf whose
+        // file already matches — the state a lost restart leaves behind, and the
+        // one the watchdog cannot see either, since the node is published either
+        // way. Each instance records the conf it was last verified to have
+        // loaded, and anything that does not match what is on disk is restarted
+        // now.
+        //
+        // This replaces an unconditional restart of `eq` and `voice`, which was
+        // a guess rather than a check and never covered `sidetone` at all, so a
+        // lost sidetone restart stayed lost for good.
+        audio.request_stale_instance_restarts();
     }
 
     // HID event channel: reader thread → async handler task
