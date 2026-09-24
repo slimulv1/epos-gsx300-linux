@@ -167,6 +167,7 @@ async fn main() -> Result<()> {
         hw_info,
         device: None,
         pipewire_nodes: None,
+        last_volume_sink: std::sync::Mutex::new(String::new()),
         last_written: std::sync::Mutex::new(None),
         volume_save_notify: Arc::new(Notify::new()),
         smart_button_seq: std::sync::atomic::AtomicU64::new(0),
@@ -339,18 +340,11 @@ async fn main() -> Result<()> {
                     // incremental consumer detents (no absolute readback).
                     // Volume is reported via GetStatus for the GUI.
                     // Each detent = 2% (measured on hardware, 2026-09-14).
-                    // Resolve the EPOS sink name + current tracked value under a
-                    // short read lock, then drop it so the awaiting pactl call
-                    // never holds the state lock.
-                    let (sink, cur) = {
+                    // Resolve the tracked value under a short read lock, then drop
+                    // it so the awaiting pactl call never holds the state lock.
+                    let cur = {
                         let st = s.read().await;
-                        let cur = st.volume.load(std::sync::atomic::Ordering::Relaxed);
-                        let sink = st
-                            .pipewire_nodes
-                            .as_ref()
-                            .map(|(snk, _)| snk.clone())
-                            .unwrap_or_default();
-                        (sink, cur)
+                        st.volume.load(std::sync::atomic::Ordering::Relaxed)
                     };
                     let next = (cur + dir * 2).clamp(0, 100);
                     // Record the value we are about to command so the volume
@@ -363,6 +357,11 @@ async fn main() -> Result<()> {
                     }
                     // Mirror the dial onto the real PipeWire sink so the displayed
                     // value always matches the actual output level.
+                    // Read the target outside the read lock: it costs a
+                    // `pactl get-default-sink`, and holding the global lock across
+                    // a subprocess is how the hotplug poll and the IPC handlers
+                    // get stalled by one slow call.
+                    let sink = volume_sink(&s).await;
                     apply_sink_volume(&sink, next).await;
                     // Update the tracked value only AFTER the sink has been
                     // commanded, so a watcher poll that runs mid-apply sees
@@ -483,8 +482,30 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Apply a host-side dial volume (0-100) to the EPOS PipeWire sink so the
-/// hardware dial value and the real sink output level always agree.
+/// The sink whose volume the dial and the GUI reflect: whichever one is actually
+/// carrying audio right now.
+///
+/// This used to be the EPOS hardware sink unconditionally, which is correct only
+/// while playback goes through the headset. With audio on the speakers the dial
+/// still moved the headset, so turning it did nothing audible while the
+/// interface displayed a number for a device that was not playing — three
+/// different volumes on screen at once and none of them the one being heard.
+async fn volume_sink(state: &Arc<RwLock<IpcState>>) -> String {
+    let epos = {
+        let st = state.read().await;
+        st.pipewire_nodes
+            .as_ref()
+            .map(|(sink, _)| sink.clone())
+            .unwrap_or_default()
+    };
+    let default = audio::AudioPipeline::read_default_sink()
+        .await
+        .unwrap_or_default();
+    audio::volume_target_sink(&default, &epos, audio::EQ_SINK_NAME)
+}
+
+/// Apply a host-side dial volume (0-100) to the sink that is actually playing, so
+/// the hardware dial value and the real output level always agree.
 async fn apply_sink_volume(sink: &str, percent: i32) {
     if sink.is_empty() {
         return;
@@ -553,13 +574,10 @@ async fn volume_watch_loop(state: Arc<RwLock<IpcState>>) {
     let interval = tokio::time::Duration::from_secs(1);
     loop {
         tokio::time::sleep(interval).await;
-        let sink = {
-            let st = state.read().await;
-            st.pipewire_nodes
-                .as_ref()
-                .map(|(s, _)| s.clone())
-                .unwrap_or_default()
-        };
+        // Follow whichever sink is actually carrying audio. Hardcoding the EPOS
+        // sink made the dial move the headset while the speakers were playing,
+        // and the reported level belonged to a device nobody could hear.
+        let sink = volume_sink(&state).await;
         if sink.is_empty() {
             continue;
         }
@@ -568,6 +586,28 @@ async fn volume_watch_loop(state: Arc<RwLock<IpcState>>) {
             None => continue,
         };
         let st = state.write().await;
+
+        // A different sink means the tracked number belonged to another device
+        // entirely, so this is not somebody adjusting the volume: it is playback
+        // moving. Say which, and adopt the new sink's real level.
+        let target_changed = {
+            let mut last = st.last_volume_sink.lock().unwrap();
+            let changed = !last.is_empty() && last.as_str() != sink.as_str();
+            *last = sink.clone();
+            changed
+        };
+        if target_changed {
+            st.volume
+                .store(actual, std::sync::atomic::Ordering::Relaxed);
+            st.last_volume_target
+                .store(actual, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(
+                "Volume now follows {} — showing its level, {}%",
+                sink,
+                actual
+            );
+            continue;
+        }
         let tracked = st.volume.load(std::sync::atomic::Ordering::Relaxed);
         if actual == tracked {
             continue;
@@ -698,11 +738,14 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
                 // Restore host-side dial volume onto the real sink so the
                 // knob position matches the actual output level after (re)plug.
                 let vol = st.volume.load(std::sync::atomic::Ordering::Relaxed);
-                let sink = st
-                    .pipewire_nodes
-                    .as_ref()
-                    .map(|(snk, _)| snk.clone())
-                    .unwrap_or_default();
+                let sink = audio::volume_target_sink(
+                    &audio::AudioPipeline::read_default_sink().await.unwrap_or_default(),
+                    &st.pipewire_nodes
+                        .as_ref()
+                        .map(|(snk, _)| snk.clone())
+                        .unwrap_or_default(),
+                    audio::EQ_SINK_NAME,
+                );
                 st.last_volume_target
                     .store(vol, std::sync::atomic::Ordering::Relaxed);
                 apply_sink_volume(&sink, vol).await;

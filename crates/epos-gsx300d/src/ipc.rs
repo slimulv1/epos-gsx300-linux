@@ -112,6 +112,14 @@ pub struct IpcState {
     /// by the hotplug loop only on (re)connect; lets the loop's `detect()`
     /// skip the blocking `pw-dump` subprocess on every 5s poll.
     pub pipewire_nodes: Option<(String, String)>,
+    /// Which sink the tracked `volume` currently refers to.
+    ///
+    /// The volume target follows whichever sink is actually carrying audio, so
+    /// it changes when playback moves — the user picking the speakers, or the EQ
+    /// anchor being swapped for raw output. Remembering the previous target lets
+    /// a target change be reported as exactly that, instead of being mistaken for
+    /// somebody adjusting the volume externally.
+    pub last_volume_sink: std::sync::Mutex<String>,
     /// Raw bytes of the config file as last written by the daemon itself.
     /// `config_watch_loop` compares the on-disk bytes against this so it can
     /// tell the daemon's own atomic `save()` apart from a genuine external

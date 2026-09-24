@@ -272,6 +272,36 @@ pub(crate) enum MicWatchAction {
     NoSignal,
 }
 
+/// Which sink's volume the dial and the GUI should read and write.
+///
+/// The one that is actually carrying audio to the speakers right now.
+///
+/// The anchor is the exception, and only because it was measured: `epos-eq-input`
+/// is a null-sink whose monitor feeds the filter-chain, so with the EQ on,
+/// forcing its volume to 0 % left the measured output unchanged (440 Hz 16.17 to
+/// 16.89, i.e. nothing) while forcing the EPOS sink to 0 % dropped it to 5.31,
+/// about -9.6 dB. The anchor's volume is a no-op; the EPOS sink's is the real
+/// output level. So when playback sits on the anchor, the volume that matters is
+/// the hardware one the chain ends at.
+///
+/// Every other default sink is somebody's real output and is controlled as-is.
+/// That is the reported bug: playback on the speakers, the dial still moving the
+/// headset, and the interface showing a number for a device that was not playing.
+pub fn volume_target_sink(default_sink: &str, epos_sink: &str, eq_anchor: &str) -> String {
+    if default_sink.is_empty() {
+        // The default could not be read. The EPOS sink is known to carry audio, so
+        // it is the safe answer.
+        return epos_sink.to_string();
+    }
+    if default_sink == eq_anchor {
+        return epos_sink.to_string();
+    }
+    if default_sink == epos_sink {
+        return default_sink.to_string();
+    }
+    default_sink.to_string()
+}
+
 /// Are the cached PipeWire node names still published in the main graph?
 ///
 /// Answers "no cache" as *not stale*, so this can only ever add a re-check and
@@ -1075,7 +1105,7 @@ impl AudioPipeline {
     }
 
     /// Current PipeWire default sink name, or `None` if it cannot be read.
-    async fn read_default_sink() -> Option<String> {
+    pub(crate) async fn read_default_sink() -> Option<String> {
         let name = run_status("pactl", &["get-default-sink"], PROBE_BUDGET)
             .await
             .ok()?
@@ -4050,5 +4080,114 @@ mod tests {
             node_names_changed(Some(&new), &half_moved),
             "one half changing is still a change"
         );
+    }
+
+    // ── Volume must follow the output that is actually playing ──────────────
+    //
+    // The dial and the GUI both read and write one sink's volume, and for a long
+    // time that was hardcoded to the EPOS hardware sink. While the EQ is on that
+    // is right, and measuring it is why: `epos-eq-input` is a null-sink whose
+    // monitor feeds the filter-chain, and forcing its volume to 0 % changed the
+    // measured output not at all (440 Hz 16.17 -> 16.89), while forcing the EPOS
+    // sink to 0 % dropped it to 5.31, about -9.6 dB. The anchor's volume is a
+    // no-op; the EPOS sink's is the real output level.
+    //
+    // The bug is everything else. Play the audio through the speakers and the
+    // dial still adjusted the headset, so turning it did nothing audible while
+    // the interface confidently displayed the wrong number. Three different
+    // volumes were visible at once: the anchor at 46 %, the EPOS sink at 14 %,
+    // the speakers at 20 %, and the GUI showing the EPOS sink's 14 %.
+
+    /// The measured case: with the EQ on, playback sits on the anchor, whose
+    /// volume does nothing, so the EPOS sink is the only useful target.
+    #[test]
+    fn with_the_eq_on_the_hardware_sink_is_the_volume_target() {
+        assert_eq!(
+            volume_target_sink(
+                EQ_SINK_NAME,
+                "alsa_output.usb-EPOS-00.analog-stereo",
+                EQ_SINK_NAME,
+            ),
+            "alsa_output.usb-EPOS-00.analog-stereo"
+        );
+    }
+
+    /// The reported bug: playback on the speakers, so the speakers are what the
+    /// dial has to move.
+    #[test]
+    fn volume_follows_playback_onto_another_device() {
+        assert_eq!(
+            volume_target_sink(
+                "alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink",
+                "alsa_output.usb-EPOS-00.analog-stereo",
+                EQ_SINK_NAME,
+            ),
+            "alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink"
+        );
+    }
+
+    /// Output already on the EPOS sink: unchanged, and not routed through the
+    /// anchor rule by accident.
+    #[test]
+    fn the_hardware_sink_targets_itself() {
+        assert_eq!(
+            volume_target_sink(
+                "alsa_output.usb-EPOS-00.analog-stereo",
+                "alsa_output.usb-EPOS-00.analog-stereo",
+                EQ_SINK_NAME,
+            ),
+            "alsa_output.usb-EPOS-00.analog-stereo"
+        );
+    }
+
+    /// The default sink could not be read. The EPOS sink is known to exist and
+    /// to carry audio, so it is the safe answer — better than doing nothing, and
+    /// far better than guessing at whatever was there before.
+    #[test]
+    fn an_unreadable_default_falls_back_to_the_hardware_sink() {
+        assert_eq!(
+            volume_target_sink("", "alsa_output.usb-EPOS-00.analog-stereo", EQ_SINK_NAME),
+            "alsa_output.usb-EPOS-00.analog-stereo"
+        );
+    }
+
+    /// The headset is unplugged, so there is no EPOS sink, but something else is
+    /// playing. Controlling what is actually audible beats falling back to a
+    /// device that is not there.
+    #[test]
+    fn a_known_default_wins_over_an_unknown_hardware_sink() {
+        assert_eq!(
+            volume_target_sink(
+                "alsa_output.pci-0000_00_1f.3.analog-stereo",
+                "",
+                EQ_SINK_NAME
+            ),
+            "alsa_output.pci-0000_00_1f.3.analog-stereo"
+        );
+    }
+
+    /// Nothing known at all: return nothing, so the callers' existing empty-name
+    /// guard makes this a no-op instead of a command against `""`.
+    #[test]
+    fn nothing_known_yields_no_target() {
+        assert_eq!(volume_target_sink("", "", EQ_SINK_NAME), "");
+    }
+
+    /// An unfamiliar sink name is somebody's real output, not a reason to
+    /// override it. Only the anchor is special, and only because it was measured
+    /// to be inaudible.
+    #[test]
+    fn an_unfamiliar_sink_is_controlled_rather_than_overridden() {
+        for sink in [
+            "bluez_sink.00_00_00_00_00_00.a2dp_sink",
+            "games_sink",
+            "alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Headphones__sink",
+        ] {
+            assert_eq!(
+                volume_target_sink(sink, "alsa_output.usb-EPOS-00.analog-stereo", EQ_SINK_NAME),
+                sink,
+                "sink: {sink}"
+            );
+        }
     }
 }
