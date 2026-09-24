@@ -272,7 +272,7 @@ impl AudioPipeline {
             return;
         }
 
-        let outcome = Self::main_graph_probe(EQ_CAPTURE_NAME).await;
+        let outcome = self.eq_chain_probe().await;
         // Only conclusive absences advance the miss counter, and only a clean
         // streak clears it. Resetting on the first good poll would let a
         // flapping chain defeat the retry cadence.
@@ -554,28 +554,20 @@ impl AudioPipeline {
 
     /// Current PipeWire default sink name, or `None` if it cannot be read.
     async fn read_default_sink() -> Option<String> {
-        let out = tokio::process::Command::new("pactl")
-            .args(["get-default-sink"])
-            .output()
+        let name = run_status("pactl", &["get-default-sink"], PROBE_BUDGET)
             .await
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            .ok()?
+            .trim()
+            .to_string();
         (!name.is_empty()).then_some(name)
     }
 
     async fn read_default_source() -> Option<String> {
-        let out = tokio::process::Command::new("pactl")
-            .args(["get-default-source"])
-            .output()
+        let name = run_status("pactl", &["get-default-source"], PROBE_BUDGET)
             .await
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            .ok()?
+            .trim()
+            .to_string();
         (!name.is_empty()).then_some(name)
     }
 
@@ -596,6 +588,31 @@ impl AudioPipeline {
     async fn main_graph_probe(node: &str) -> ChainProbe {
         let result = run_probe("pw-cli", &["-r", "pipewire-0", "ls", "Node"], PROBE_BUDGET).await;
         probe_outcome(&result, node)
+    }
+
+    /// Is the EQ chain actually usable?
+    ///
+    /// Both ends must be published. One probe covers both names, and a probe
+    /// that failed is `Unknown` even if the other name happens to be listed:
+    /// an unusable probe is not evidence either way.
+    async fn eq_chain_probe(&self) -> ChainProbe {
+        match run_probe(
+            "pw-cli",
+            &["-r", "pipewire-0", "ls", "Node"],
+            PROBE_BUDGET,
+        )
+        .await
+        {
+            Probe::TimedOut | Probe::SpawnFailed(_) => ChainProbe::Unknown,
+            Probe::Ran(list) => {
+                let capture = node_list_has_node(&list, EQ_CAPTURE_NAME);
+                let output = node_list_has_node(&list, EQ_OUTPUT_NAME);
+                match (capture, output) {
+                    (true, true) => ChainProbe::Present,
+                    _ => ChainProbe::Absent,
+                }
+            }
+        }
     }
 
     /// Point the default capture source at the processed mic when voice work
@@ -665,18 +682,10 @@ impl AudioPipeline {
     }
 
     async fn set_default_source(source: &str) -> Result<()> {
-        let output = tokio::process::Command::new("pactl")
-            .args(["set-default-source", source])
-            .output()
+        run_status("pactl", &["set-default-source", source], PROBE_BUDGET)
             .await
-            .context("Failed to run pactl set-default-source")?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "pactl set-default-source {source} failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Ok(())
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("pactl set-default-source {source} failed: {e}"))
     }
 
     /// Align the default sink with the EQ toggle. Returns true if it changed.
@@ -1332,6 +1341,40 @@ async fn run_probe(program: &str, args: &[&str], budget: Duration) -> Probe {
     }
 }
 
+/// Run `program args...` capped, returning its stdout on success.
+///
+/// Same guarantees as [`run_probe`] — stdin closed, hard cap, child killed on
+/// drop — but it also reports the exit status, which `pactl set-default-sink`
+/// and `amixer cset` callers need in order to tell "the command worked" from
+/// "the command printed something while failing".
+///
+/// This exists because those calls were previously bare `.output().await`
+/// with no cap, made from code that holds the global state write lock. A
+/// hung `pactl` or `amixer` could therefore stall the whole daemon: IPC, the
+/// config watcher and the EQ watchdog all wait on that one lock.
+async fn run_status(program: &str, args: &[&str], budget: Duration) -> Result<String, String> {
+    let child = tokio::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    match tokio::time::timeout(budget, child).await {
+        Ok(Ok(o)) if o.status.success() => {
+            Ok(String::from_utf8_lossy(&o.stdout).into_owned())
+        }
+        Ok(Ok(o)) => Err(format!(
+            "exited {:?}: {}",
+            o.status.code(),
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => {
+            warn!("`{program}` exceeded {budget:?} — abandoned");
+            Err(format!("{program} timed out after {budget:?}"))
+        }
+    }
+}
+
 /// Does a `pw-dump` of the MAIN graph publish `node`?
 ///
 /// `pw-dump` emits JSON, so the name is read out of each object's
@@ -1386,9 +1429,14 @@ fn eq_expected_node(conf: &str) -> &'static str {
     }
 }
 
-/// The MAIN-graph node the EQ filter-chain must publish for its path to work.
-/// Named in the capture side of the generated conf.
+/// Both MAIN-graph nodes the EQ filter-chain must publish for its path to
+/// work: the capture that drains the anchor, and the playback that feeds the
+/// headset. Requiring only the capture left a half-broken chain looking
+/// healthy — the capture node can stay listed while the playback side fails to
+/// resolve its target, in which case the anchor is drained by nothing and
+/// routed playback is silent.
 const EQ_CAPTURE_NAME: &str = "epos-eq-capture";
+const EQ_OUTPUT_NAME: &str = "epos-eq-output";
 
 /// Consecutive healthy polls required before a previous failure is forgotten.
 /// One good poll is not enough, otherwise a flapping chain resets the miss
