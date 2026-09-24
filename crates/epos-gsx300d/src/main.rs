@@ -2,6 +2,7 @@ mod audio;
 mod config;
 mod devices;
 mod hid;
+mod hid_io;
 mod hwinfo;
 mod ipc;
 mod led;

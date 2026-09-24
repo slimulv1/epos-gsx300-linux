@@ -30,6 +30,7 @@
 use epos_shared::device::HwSnapshot;
 use std::fs::File;
 use std::io::{self, Read, Write};
+use crate::hid_io::{drain_nonblocking, O_NONBLOCK};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -40,10 +41,6 @@ use tracing::warn;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Poll interval while waiting non-blockingly for the 0x05 response.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
-/// Linux O_NONBLOCK (glibc/asm-generic value 0x800). Used via
-/// `OpenOptionsExt::custom_flags` so a stuck firmware can never block the
-/// daemon's probe.
-const O_NONBLOCK: i32 = 0x800;
 
 /// Report ID for the primary (memory-bus) output report.
 const REPORT_ID_PRIMARY: u8 = 0x04;
@@ -301,102 +298,3 @@ fn write_all_nonblocking(file: &mut File, buf: &[u8], budget: Duration) -> bool 
     drain_nonblocking(buf, budget, |chunk| file.write(chunk))
 }
 
-/// Push `buf` through a non-blocking sink, retrying `WouldBlock` until it goes
-/// through or the budget runs out.
-///
-/// Split out from the `File` so the retry policy can be tested by handing it a
-/// sink that always reports `EAGAIN` — the case that used to be unreachable in a
-/// test. A hidraw endpoint that keeps answering `EAGAIN` (a wedged USB endpoint,
-/// a device that stopped draining) spun in the old loop forever, and the caller
-/// has no timeout of its own covering it, so a probe or a heartbeat sat there
-/// for the life of the process. Giving up reports the truth: the report did not
-/// go out.
-fn drain_nonblocking(
-    mut buf: &[u8],
-    budget: Duration,
-    mut sink: impl FnMut(&[u8]) -> io::Result<usize>,
-) -> bool {
-    let started = std::time::Instant::now();
-    while !buf.is_empty() {
-        match sink(buf) {
-            Ok(0) => return false,
-            Ok(n) => buf = &buf[n..],
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                if started.elapsed() >= budget {
-                    return false;
-                }
-                std::thread::sleep(POLL_INTERVAL);
-            }
-            Err(_) => return false,
-        }
-    }
-    true
-}
-
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Write;
-
-    /// A sink that reports `EAGAIN` every time, standing in for a wedged USB
-    /// endpoint. The old loop had no way to be tested here at all, because the
-    /// retry was welded to a `File`.
-    fn always_would_block(_: &[u8]) -> io::Result<usize> {
-        Err(io::Error::from(io::ErrorKind::WouldBlock))
-    }
-
-    /// The bug this exists for: a transfer that never drains must be abandoned
-    /// at its budget, not awaited forever.
-    #[test]
-    fn a_transfer_that_never_drains_is_abandoned_at_its_budget() {
-        let started = std::time::Instant::now();
-        let delivered = drain_nonblocking(&[0u8; 8], Duration::from_millis(150), always_would_block);
-        assert!(!delivered, "a transfer that never drains must report failure");
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "must give up near its budget, took {:?}",
-            started.elapsed()
-        );
-    }
-
-    /// A sink that accepts part of the buffer is drained completely rather than
-    /// giving up — a short write is normal, not a failure.
-    #[test]
-    fn a_sink_taking_one_byte_at_a_time_still_completes() {
-        let mut offered = 0usize;
-        let delivered = drain_nonblocking(&[7u8; 4], Duration::from_secs(5), |buf| {
-            offered += 1;
-            assert!(offered <= 4, "must stop once the buffer is empty");
-            Ok(1.min(buf.len()))
-        });
-        assert!(delivered);
-        assert_eq!(offered, 4, "every byte must be offered exactly once");
-    }
-
-    /// An immediate zero-byte write is a dead endpoint, not a retry.
-    #[test]
-    fn a_sink_that_writes_nothing_is_a_failure() {
-        assert!(!drain_nonblocking(&[1, 2], Duration::from_secs(5), |_| Ok(0)));
-    }
-
-    /// A real error ends the attempt immediately.
-    #[test]
-    fn a_sink_that_fails_ends_the_attempt() {
-        assert!(!drain_nonblocking(&[1, 2], Duration::from_secs(5), |_| {
-            Err(io::Error::from(io::ErrorKind::BrokenPipe))
-        }));
-    }
-
-    /// The ordinary path still writes to a real descriptor. A temporary file is
-    /// the simplest thing that behaves like one without any raw-fd handling.
-    #[test]
-    fn a_real_file_still_receives_the_report() {
-        let path = std::env::temp_dir().join(format!("epos-hwinfo-{}", std::process::id()));
-        let mut file = File::create(&path).expect("create temp file");
-        assert!(write_all_nonblocking(&mut file, &[1, 2, 3], Duration::from_secs(5)));
-        drop(file);
-        assert_eq!(std::fs::read(&path).expect("read back"), vec![1, 2, 3]);
-        let _ = std::fs::remove_file(&path);
-    }
-}

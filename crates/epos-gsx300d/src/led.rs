@@ -34,7 +34,9 @@
 //! decoded. NOTE: because the output field is only 2 bits, values >0x03 are
 //! ignored by the firmware — writes are clamped in `write_vendor_report`.
 
+use crate::hid_io::{drain_nonblocking, O_NONBLOCK};
 use std::fs::{File, OpenOptions};
+use std::os::unix::fs::OpenOptionsExt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -64,6 +66,14 @@ const REPORT_ID_VENDOR_LED: u8 = 0x02;
 /// HID Output payload size for Report ID 0x04 (memory-bus / primary command).
 /// Descriptor: `75 08` + `95 26` (38) = 304 bits = 38 bytes.
 const PRIMARY_CMD_PAYLOAD_SIZE: usize = 38;
+
+/// How long one LED report may keep retrying before it is given up.
+///
+/// Short on purpose: the ring is cosmetic and the heartbeat re-asserts it every
+/// couple of seconds, so a slow report is abandoned quickly and retried rather
+/// than holding whatever caller is waiting — and the signal handler, which holds
+/// the global state lock while it resets the ring.
+const LED_WRITE_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Report ID for the memory-bus / primary command interface.
 const REPORT_ID_PRIMARY_CMD: u8 = 0x04;
@@ -104,7 +114,12 @@ impl LedController {
         // give udev up to ~4s to catch up before failing for real.
         let mut file = None;
         for attempt in 0..10u32 {
-            match OpenOptions::new().write(true).read(true).open(&hidraw_path) {
+            match OpenOptions::new()
+                .write(true)
+                .read(true)
+                .custom_flags(O_NONBLOCK)
+                .open(&hidraw_path)
+            {
                 Ok(f) => {
                     file = Some(f);
                     break;
@@ -174,6 +189,7 @@ impl LedController {
         let file = OpenOptions::new()
             .write(true)
             .read(true)
+            .custom_flags(O_NONBLOCK)
             .open(&self._hidraw_path)
             .context("Failed to reopen hidraw device")?;
         self.file = Some(file);
@@ -323,8 +339,9 @@ fn write_vendor_report(file: &mut File, byte: u8) -> Result<()> {
     let mut packet = vec![0u8; VENDOR_LED_PAYLOAD_SIZE + 1];
     packet[0] = REPORT_ID_VENDOR_LED;
     packet[1] = byte;
-    file.write_all(&packet)
-        .context("Failed to write vendor LED report")?;
+    if !drain_nonblocking(&packet, LED_WRITE_BUDGET, |chunk| file.write(chunk)) {
+        anyhow::bail!("Vendor LED report was not accepted by the device");
+    }
     file.flush().ok();
     Ok(())
 }
@@ -338,8 +355,9 @@ fn write_vendor_report(file: &mut File, byte: u8) -> Result<()> {
 /// 0x07 / 0x1A (firmware flash protocol) are hard-blocked by the daemon.
 fn write_primary_report(file: &mut File, payload: &[u8]) -> Result<()> {
     let packet = primary_packet(payload)?;
-    file.write_all(&packet)
-        .context("Failed to write primary LED report")?;
+    if !drain_nonblocking(&packet, LED_WRITE_BUDGET, |chunk| file.write(chunk)) {
+        anyhow::bail!("Primary LED report was not accepted by the device");
+    }
     file.flush().ok();
     Ok(())
 }
@@ -387,7 +405,7 @@ impl Drop for LedController {
             let mut packet = vec![0u8; VENDOR_LED_PAYLOAD_SIZE + 1];
             packet[0] = REPORT_ID_VENDOR_LED;
             packet[1] = byte;
-            let _ = file.write_all(&packet);
+            let _ = drain_nonblocking(&packet, LED_WRITE_BUDGET, |chunk| file.write(chunk));
             let _ = file.flush();
         }
     }
