@@ -607,6 +607,17 @@ impl AudioPipeline {
         pipeline
     }
 
+    /// Whether the pipeline has been given a device yet.
+    ///
+    /// `main` hands the pipeline a device and applies the whole config when its
+    /// own start-up scan finds the headset, so on a normal boot this is already
+    /// true before the hotplug loop's first tick. It is false only when
+    /// start-up detection missed and the headset appeared later — the case the
+    /// first-connect branch has to cover.
+    pub fn has_device(&self) -> bool {
+        self.device.is_some()
+    }
+
     /// Store device reference for future operations
     pub fn set_device(&mut self, device: &DeviceInfo) {
         self.device = Some(device.clone());

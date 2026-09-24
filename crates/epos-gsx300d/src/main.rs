@@ -827,6 +827,25 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
                     apply_volume(&state, vol).await;
                     tracing::info!("Volume restored to {}% at boot", vol);
                     let mut st = state.write().await;
+                    // When start-up detection missed the headset, `main` never
+                    // gave the pipeline a device and never applied the config,
+                    // and the reconnect branch is skipped because
+                    // `was_connected` was already seeded true. Close that here.
+                    // Done before `st.device = device` so the device can be
+                    // borrowed from the local, not from the guard.
+                    if first_connect_owes_pipeline(st.audio.has_device()) {
+                        info!("Pipeline had no device at boot - applying config now");
+                        if let Some(ref d) = device {
+                            st.audio.set_device(d);
+                        }
+                        let audio_cfg = st.config.audio.clone();
+                        st.audio.update_config(&audio_cfg);
+                        match st.audio.apply_full().await {
+                            Ok(true) => debug!("audio conf changed - instance restart enqueued"),
+                            Ok(false) => debug!("audio conf unchanged - no instance restart"),
+                            Err(e) => warn!("Failed to apply config on first connect: {}", e),
+                        }
+                    }
                     st.device = device;
                     // Boot with the device already plugged: the steady-state
                     // branch never calls apply_full, so the output route has to
@@ -880,6 +899,23 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
 
         was_connected = is_connected;
     }
+}
+
+/// Whether the first-connect branch still owes the pipeline its device.
+///
+/// `main` leaves the node cache empty even when its own start-up scan found the
+/// headset, so this branch runs on the first poll either way. On a normal boot
+/// the pipeline was already given a device and the whole config applied, and
+/// doing that again would re-write every instance conf for nothing.
+///
+/// It is genuinely owed only when start-up detection missed: `main` saw no
+/// device, so it never called `set_device` or `apply_full`, and the loop's own
+/// scan found the headset moments later with `was_connected` already seeded
+/// true — which skips the reconnect branch, the only other place that hands the
+/// pipeline a device. Without this, the routing below ran against fallback node
+/// names with a config that had never been applied, and nothing said so.
+fn first_connect_owes_pipeline(pipeline_has_device: bool) -> bool {
+    !pipeline_has_device
 }
 
 /// Background task: watch config file for external edits and hot-apply them.
@@ -1224,3 +1260,27 @@ fn emit_smart_notify(st: &IpcState) {
         Err(e) => warn!("Smart-button notify: notify-send failed: {}", e),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The silent-wrong-state case. Start-up detection missed the headset, so
+    /// `main` never called `set_device` or `apply_full`; the loop's own scan
+    /// found it a moment later with `was_connected` already true, which skips
+    /// the reconnect branch — the only other place that hands the pipeline a
+    /// device. The pipeline was left with `device: None`, routing ran against
+    /// fallback node names, and the persisted config was never applied.
+    #[test]
+    fn a_pipeline_without_a_device_is_initialised_on_first_connect() {
+        assert!(first_connect_owes_pipeline(false));
+    }
+
+    /// The other half is what stops the fix costing a second full apply on
+    /// every normal boot: `main` already did it, so the branch must not.
+    #[test]
+    fn a_pipeline_that_already_has_a_device_is_left_alone() {
+        assert!(!first_connect_owes_pipeline(true));
+    }
+}
+
