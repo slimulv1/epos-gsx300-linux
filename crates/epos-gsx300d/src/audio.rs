@@ -33,6 +33,9 @@ pub struct AudioPipeline {
     /// Consecutive 5 s polls that saw no `epos-eq-capture` while the EQ was
     /// enabled. Drives the fall-back grace period and the restart cadence.
     eq_chain_missing_polls: AtomicU32,
+    /// Consecutive healthy polls seen since the last miss, used to require
+    /// more than one clean sample before forgetting a failure.
+    eq_chain_recovered_polls: AtomicU32,
 }
 
 /// Debounced restart bus: audio handlers record which epos instance(s) changed
@@ -213,6 +216,7 @@ impl AudioPipeline {
             restarts: Arc::new(RestartBus::new()),
             gain_epoch: Arc::new(AtomicU64::new(0)),
             eq_chain_missing_polls: AtomicU32::new(0),
+            eq_chain_recovered_polls: AtomicU32::new(0),
         };
         // Same funnel as update_config, so a hand-edited config.json is bounded
         // at startup too and not only on later IPC updates.
@@ -268,23 +272,63 @@ impl AudioPipeline {
             return;
         }
 
-        let present = Self::main_graph_has_node(EQ_CAPTURE_NAME).await;
-        let missing = if present {
-            self.eq_chain_missing_polls.store(0, Ordering::Relaxed);
-            0
-        } else {
-            self.eq_chain_missing_polls.fetch_add(1, Ordering::Relaxed) + 1
+        let outcome = Self::main_graph_probe(EQ_CAPTURE_NAME).await;
+        // Only conclusive absences advance the miss counter, and only a clean
+        // streak clears it. Resetting on the first good poll would let a
+        // flapping chain defeat the retry cadence.
+        let missing = match outcome {
+            ChainProbe::Present => {
+                if self.eq_chain_recovered_polls.fetch_add(1, Ordering::Relaxed) + 1
+                    >= EQ_RECOVERY_POLLS
+                {
+                    self.eq_chain_missing_polls.store(0, Ordering::Relaxed);
+                    self.eq_chain_recovered_polls.store(0, Ordering::Relaxed);
+                }
+                0
+            }
+            ChainProbe::Absent => {
+                self.eq_chain_recovered_polls.store(0, Ordering::Relaxed);
+                self.eq_chain_missing_polls.fetch_add(1, Ordering::Relaxed) + 1
+            }
+            // An unusable probe tells us nothing, so it must not count against
+            // the chain or trigger a restart.
+            ChainProbe::Unknown => self.eq_chain_missing_polls.load(Ordering::Relaxed),
         };
-        let decision = eq_route_decision(present, missing);
+        let decision = eq_route_decision(outcome, missing);
 
-        if decision.repair_to_raw {
-            warn!(
-                "EQ chain absent for {missing} poll(s) - falling back to the raw \
-                 EPOS sink so audio is not swallowed by the EQ anchor"
-            );
-        }
-        if let Err(e) = self.route_output_with_chain(Some(present)).await {
-            warn!("Failed to maintain EQ output route: {}", e);
+        // The decision is the instruction. Routing used to be handed the raw
+        // probe result instead, so the grace period below only delayed the log
+        // line while the route had already moved.
+        match decision.action {
+            EqRouteAction::AssertAnchor => {
+                if let Err(e) = self.route_output_with_chain(Some(true)).await {
+                    warn!("Failed to assert EQ output route: {}", e);
+                }
+            }
+            EqRouteAction::Hold => {
+                debug!("EQ chain missing on one poll - holding the current route");
+            }
+            EqRouteAction::FallBackToRaw => {
+                // Once per outage, then on the same cadence as the restart
+                // request. Logging this every poll produced a dozen identical
+                // warnings a minute while a chain was down.
+                if missing == 1 || decision.request_restart {
+                    warn!(
+                        "EQ chain absent ({missing} poll(s)) - playback moved to the \
+                         raw EPOS sink so audio is not swallowed by the EQ anchor"
+                    );
+                }
+                if let Err(e) = self.route_output_with_chain(Some(false)).await {
+                    warn!("Failed to fall back to the raw EPOS sink: {}", e);
+                }
+                // Changing the default sink only affects NEW streams, so any
+                // stream already playing into the anchor stays silent. Move it.
+                match self.rescue_anchor_streams().await {
+                    Ok(0) => {}
+                    Ok(n) => warn!("Moved {n} in-flight stream(s) off the EQ anchor to raw audio"),
+                    Err(e) => warn!("Could not move in-flight streams off the EQ anchor: {e}"),
+                }
+            }
         }
         if decision.request_restart {
             warn!("EQ chain missing - requesting pipewire-epos@eq restart");
@@ -292,10 +336,70 @@ impl AudioPipeline {
         }
     }
 
+    /// Move every stream currently attached to the EQ anchor onto the raw EPOS
+    /// sink.
+    ///
+    /// `pactl set-default-sink` only steers streams created afterwards, so
+    /// without this a long-running stream stays pinned to the dead anchor and
+    /// the fallback would not actually restore any audio.
+    async fn rescue_anchor_streams(&self) -> Result<usize> {
+        let Some(raw_sink) = self
+            .device
+            .as_ref()
+            .map(|d| d.pipewire_sink.as_str())
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(0);
+        };
+        let sinks = match run_probe("pactl", &["list", "short", "sinks"], PROBE_BUDGET).await {
+            Probe::Ran(out) => out,
+            other => {
+                warn!("Could not list sinks for anchor rescue: {other:?}");
+                return Ok(0);
+            }
+        };
+        let Some(anchor_index) = sink_index_of(&sinks, EQ_SINK_NAME) else {
+            return Ok(0);
+        };
+        let listing =
+            match run_probe("pactl", &["list", "short", "sink-inputs"], PROBE_BUDGET).await {
+                Probe::Ran(out) => out,
+                other => {
+                    warn!("Could not list sink inputs for anchor rescue: {other:?}");
+                    return Ok(0);
+                }
+            };
+        let mut moved = 0usize;
+        for index in sink_input_indices_on(&listing, anchor_index) {
+            match run_probe(
+                "pactl",
+                &["move-sink-input", &index.to_string(), raw_sink],
+                PROBE_BUDGET,
+            )
+            .await
+            {
+                Probe::Ran(_) => moved += 1,
+                other => {
+                    warn!("Could not move sink input {index} to {raw_sink}: {other:?}");
+                }
+            }
+        }
+        Ok(moved)
+    }
+
     /// Apply the full audio config (EQ, mic gain, sidetone, noise gate, voice).
     /// Returns which of the three epos instances need a restart.
     pub async fn apply_full(&mut self) -> Result<bool> {
-        self.apply_mic_gain().await?;
+        // A mic-gain failure must not abort the rest. `usable_alsa_card(None)`
+        // is an error while USB has enumerated but ALSA has not, and letting
+        // that propagate with `?` meant no EQ/voice/sidetone conf was written
+        // at all — a regression from refusing to guess card 0. The DSP confs
+        // are independent of the capture mixer, so write them regardless and
+        // report the gain failure separately.
+        let gain_result = self.apply_mic_gain().await;
+        if let Err(e) = &gain_result {
+            warn!("Mic gain not applied: {e}");
+        }
         let mut changed = false;
         changed |= self.write_eq_conf()?;
         changed |= self.write_voice_conf()?;
@@ -311,6 +415,11 @@ impl AudioPipeline {
         // switch, a reload) bumps the epoch, and this task then aborts. Without
         // it, changing the gain within the 4s window let this stale task
         // re-apply the OLD value, silently reverting the user's newer setting.
+        // Keep the gain result reachable for callers that care, without
+        // discarding the DSP work that already succeeded.
+        if let Err(e) = gain_result {
+            debug!("apply_full completed DSP writes; mic gain still pending: {e}");
+        }
         let epoch = self.gain_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         let gain = self.config.mic_gain;
         let device = self.device.clone();
@@ -475,17 +584,18 @@ impl AudioPipeline {
     /// Reuses the capped `pw-dump` probe, so this cannot wedge the caller.
     /// Is `node` currently published in the MAIN graph?
     ///
+    /// Returns a tri-state on purpose. A timed-out or unspawnable probe is
+    /// `Unknown`, not `Absent`: the watchdog must not move a user's audio
+    /// because `pw-cli` hiccupped.
+    ///
     /// Uses `pw-cli -r pipewire-0 ls Node` rather than a full `pw-dump`:
-    /// measured 4 ms / 5.8 KB against 14 ms / 510 KB, and this now runs on
-    /// every 5 s poll. `ls Node` is a well-formed command, so it exits instead
-    /// of dropping into pw-cli's interactive fallback — that is what made
-    /// `info 0` hang and wedge the reload worker. `run_probe` still closes
-    /// stdin and caps the wait, so a regression here cannot hang the daemon.
-    async fn main_graph_has_node(node: &str) -> bool {
-        matches!(
-            run_probe("pw-cli", &["-r", "pipewire-0", "ls", "Node"], PROBE_BUDGET).await,
-            Probe::Ran(list) if node_list_has_node(&list, node)
-        )
+    /// measured 4 ms / 5.8 KB against 14 ms / 510 KB, and this runs on every
+    /// 5 s poll. `ls Node` is well formed, so it exits instead of dropping into
+    /// pw-cli's interactive fallback — that is what made `info 0` hang and
+    /// wedge the reload worker. `run_probe` still closes stdin and caps the wait.
+    async fn main_graph_probe(node: &str) -> ChainProbe {
+        let result = run_probe("pw-cli", &["-r", "pipewire-0", "ls", "Node"], PROBE_BUDGET).await;
+        probe_outcome(&result, node)
     }
 
     /// Point the default capture source at the processed mic when voice work
@@ -505,19 +615,30 @@ impl AudioPipeline {
         let processing = voice_active || noise_gate;
 
         // Cheap exit first: this runs on the 5 s poll, so when the default is
-        // already correct we must not spawn a pw-dump. The processed node only
-        // exists once the voice instance has restarted and published it, which
-        // is why this is re-asserted on every poll rather than only on change.
+        // already correct we must not spawn a graph probe. The processed node
+        // only exists once the voice instance has restarted and published it,
+        // which is why this is re-asserted on every poll rather than only on
+        // change.
+        //
+        // NOTE: the early return used to sit in front of the "processed mic
+        // disappeared" recovery below, which made that recovery unreachable in
+        // exactly the case it was written for. It is now only taken once the
+        // node is known to be alive.
         let current = Self::read_default_source().await;
         if processing && current.as_deref() == Some(VOICE_SOURCE_NAME) {
-            return Ok(false);
+            if Self::main_graph_probe(VOICE_SOURCE_NAME).await == ChainProbe::Present {
+                return Ok(false);
+            }
+            // Absent or unknown: fall through. Unknown is safe here because
+            // the fall-through only acts when the probe says the node is gone.
         }
         if !processing && current.as_deref() == self.device.as_ref().map(|d| d.pipewire_source.as_str())
         {
             return Ok(false);
         }
 
-        let processed_present = Self::main_graph_has_node(VOICE_SOURCE_NAME).await;
+        let processed_present =
+            Self::main_graph_probe(VOICE_SOURCE_NAME).await == ChainProbe::Present;
         let Some(target) = desired_input_route(
             voice_active,
             noise_gate,
@@ -583,7 +704,9 @@ impl AudioPipeline {
         // at a null-sink nobody drains, i.e. silence.
         let chain_present = match chain_present {
             Some(v) => v,
-            None if self.config.eq.enabled => Self::main_graph_has_node(EQ_CAPTURE_NAME).await,
+            None if self.config.eq.enabled => {
+                Self::main_graph_probe(EQ_CAPTURE_NAME).await == ChainProbe::Present
+            }
             None => false,
         };
         let Some(route) = desired_output_route(eq_enabled, device_connected, chain_present) else {
@@ -1267,56 +1390,129 @@ fn eq_expected_node(conf: &str) -> &'static str {
 /// Named in the capture side of the generated conf.
 const EQ_CAPTURE_NAME: &str = "epos-eq-capture";
 
-/// Consecutive polls with a missing chain tolerated before the route gives up
-/// on the EQ. One poll is 5 s, so this is a 10 s grace period: long enough that
-/// a single missed sample cannot bounce audio between sinks, short enough that
-/// a real failure does not leave the user in silence.
-const EQ_FAILCLOSED_AFTER_POLLS: u32 = 2;
+/// Consecutive healthy polls required before a previous failure is forgotten.
+/// One good poll is not enough, otherwise a flapping chain resets the miss
+/// counter and defeats the retry cadence.
+const EQ_RECOVERY_POLLS: u32 = 2;
 
-/// Once the route has fallen back, ask for an instance restart on this poll and
-/// then every `EQ_RESTART_RETRY_POLLS` polls. 6 polls = 30 s, so a chain that
-/// cannot start is retried without becoming a restart storm.
+/// After the first conclusive absence, ask for an instance restart on this poll
+/// and then every `EQ_RESTART_RETRY_POLLS` polls. 6 polls = 30 s, so a chain
+/// that cannot start is retried without becoming a restart storm.
 const EQ_RESTART_RETRY_POLLS: u32 = 6;
 
-/// What the EQ route should do on this poll.
+/// What a liveness probe can tell us.
+///
+/// A probe that times out or cannot spawn says nothing about the chain, and
+/// treating that as "absent" would move the route on a transient tooling
+/// failure. Only a successful probe that does not see the node counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChainProbe {
+    Present,
+    Absent,
+    Unknown,
+}
+
+/// Map a raw probe result onto a chain verdict.
+///
+/// Split out from the subprocess call so the mapping is testable: getting
+/// "the probe could not run" wrong is what makes a `pw-cli` hiccup look like a
+/// dead EQ, and that must not be a silent behaviour change.
+fn probe_outcome(result: &Probe, node: &str) -> ChainProbe {
+    match result {
+        Probe::Ran(list) if node_list_has_node(list, node) => ChainProbe::Present,
+        Probe::Ran(_) => ChainProbe::Absent,
+        // A timeout or a spawn failure says nothing about the chain.
+        Probe::TimedOut | Probe::SpawnFailed(_) => ChainProbe::Unknown,
+    }
+}
+
+/// What the EQ watchdog should do on this poll.
+///
+/// An enum rather than a set of booleans on purpose: the previous shape let
+/// `maintain_eq` compute a grace period and then ignore it, because the
+/// routing call was handed the raw probe result instead of the decision.
+/// Making the decision *be* the instruction removes that failure mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EqRouteAction {
+    /// Chain is up: make sure playback is routed through the EQ anchor.
+    AssertAnchor,
+    /// Inside the grace period after a single bad poll: change nothing. A
+    /// momentary false negative must not bounce audio between two sinks, which
+    /// is its own audible artefact.
+    Hold,
+    /// Chain confirmed gone: move the default sink to raw hardware *and* move
+    /// any already-playing stream off the anchor, because changing the default
+    /// only affects new streams.
+    FallBackToRaw,
+}
+
+/// The watchdog's verdict for one poll.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EqRouteDecision {
-    /// Route playback through `epos-eq-input` (EQ applied).
-    pub use_anchor: bool,
-    /// Actively move the default sink back to the raw hardware sink.
-    pub repair_to_raw: bool,
-    /// Ask the restart bus to restart the eq instance.
+    pub action: EqRouteAction,
+    /// Ask the restart bus to restart the eq instance. Rate limited, and only
+    /// meaningful alongside `FallBackToRaw`.
     pub request_restart: bool,
 }
 
-/// Decide the EQ route from the chain's liveness and how long it has been gone.
+/// Decide what the EQ watchdog should do.
 ///
-/// A missing chain is the dangerous state, because `epos-eq-input` keeps
-/// accepting streams that go nowhere. Falling back to the raw hardware sink
-/// costs the user their EQ but keeps their audio, which is the right order.
-pub(crate) fn eq_route_decision(chain_present: bool, missing_polls: u32) -> EqRouteDecision {
-    if chain_present {
-        return EqRouteDecision {
-            use_anchor: true,
-            repair_to_raw: false,
+/// A conclusively absent chain is the dangerous state, because `epos-eq-input`
+/// keeps accepting streams that go nowhere. It is handled immediately: audio
+/// safety cannot wait on a grace period. `missing_polls` only paces the
+/// *restart*, which is where patience is cheap and a storm is expensive.
+///
+/// An `Unknown` probe is always `Hold`. That is the whole point of the
+/// distinction — a `pw-cli` hiccup must not bounce audio between two sinks.
+pub(crate) fn eq_route_decision(outcome: ChainProbe, missing_polls: u32) -> EqRouteDecision {
+    match outcome {
+        ChainProbe::Present => EqRouteDecision {
+            action: EqRouteAction::AssertAnchor,
             request_restart: false,
-        };
-    }
-    if missing_polls < EQ_FAILCLOSED_AFTER_POLLS {
-        // Inside the grace period: hold whatever route is current.
-        return EqRouteDecision {
-            use_anchor: true,
-            repair_to_raw: false,
+        },
+        ChainProbe::Unknown => EqRouteDecision {
+            action: EqRouteAction::Hold,
             request_restart: false,
-        };
+        },
+        ChainProbe::Absent => EqRouteDecision {
+            action: EqRouteAction::FallBackToRaw,
+            // First attempt immediately, then every `EQ_RESTART_RETRY_POLLS`
+            // polls (1, 7, 13, ...). Restarting the same broken instance every
+            // 5 s would be a storm; never restarting leaves the EQ dead.
+            request_restart: missing_polls == 1
+                || (missing_polls - 1) % EQ_RESTART_RETRY_POLLS == 0,
+        },
     }
-    EqRouteDecision {
-        use_anchor: false,
-        repair_to_raw: true,
-        // First attempt the moment the grace period expires, then every
-        // `EQ_RESTART_RETRY_POLLS` after that (2, 8, 14, ...).
-        request_restart: (missing_polls - EQ_FAILCLOSED_AFTER_POLLS) % EQ_RESTART_RETRY_POLLS == 0,
-    }
+}
+
+/// Resolve a sink NAME to its numeric index from `pactl list short sinks`.
+///
+/// `pactl list short sink-inputs` identifies the sink by index, never by name,
+/// so the name has to be resolved first or the rescue silently matches nothing.
+fn sink_index_of(listing: &str, sink_name: &str) -> Option<u32> {
+    listing.lines().find_map(|line| {
+        let mut f = line.split_whitespace();
+        let index = f.next()?.parse::<u32>().ok()?;
+        (f.next()? == sink_name).then_some(index)
+    })
+}
+
+/// Parse `pactl list short sink-inputs` and return the indices of streams
+/// currently attached to `sink_index`.
+///
+/// Needed because moving the default sink does not retarget streams that are
+/// already playing: a long-running stream stays pinned to `epos-eq-input` and
+/// stays silent after a fallback, so the fallback has to move it explicitly.
+fn sink_input_indices_on(listing: &str, sink_index: u32) -> Vec<u32> {
+    let wanted = sink_index.to_string();
+    listing
+        .lines()
+        .filter_map(|line| {
+            let mut f = line.split_whitespace();
+            let index = f.next()?.parse::<u32>().ok()?;
+            (f.next()? == wanted).then_some(index)
+        })
+        .collect()
 }
 
 /// Does `pw-cli ls Node` output list `node`?
@@ -2080,32 +2276,78 @@ mod tests {
     /// A healthy chain is the only reason to sit on the anchor.
     #[test]
     fn eq_route_holds_the_anchor_while_the_chain_is_up() {
-        let d = eq_route_decision(true, 0);
-        assert!(d.use_anchor, "chain present: keep EQ'd audio on the anchor");
-        assert!(!d.repair_to_raw, "nothing to repair");
+        let d = eq_route_decision(ChainProbe::Present, 0);
+        assert_eq!(
+            d.action,
+            EqRouteAction::AssertAnchor,
+            "chain present: keep EQ'd audio on the anchor"
+        );
         assert!(!d.request_restart, "a healthy chain must not be restarted");
     }
 
-    /// One bad poll is not enough to move the route: a single missed sample
-    /// must not bounce audio between the anchor and the raw sink.
+    /// A probe that could not run is `Unknown`, not `Absent`. This is the
+    /// mapping itself, not just the decision that consumes it.
     #[test]
-    fn eq_route_tolerates_one_bad_poll_before_falling_back() {
-        let d = eq_route_decision(false, 1);
-        assert!(
-            d.use_anchor,
-            "one missing poll must not flap the route away from the EQ"
+    fn an_unusable_probe_maps_to_unknown_not_absent() {
+        assert_eq!(
+            probe_outcome(&Probe::TimedOut, "epos-eq-capture"),
+            ChainProbe::Unknown,
+            "a timeout is not evidence the chain died"
         );
-        assert!(!d.repair_to_raw, "repair only after the grace period");
-        assert!(!d.request_restart, "no restart storm on a single blip");
+        assert_eq!(
+            probe_outcome(&Probe::SpawnFailed("boom".into()), "epos-eq-capture"),
+            ChainProbe::Unknown
+        );
+        assert_eq!(
+            probe_outcome(
+                &Probe::Ran("node.name = \"epos-eq-capture\"".into()),
+                "epos-eq-capture"
+            ),
+            ChainProbe::Present
+        );
+        assert_eq!(
+            probe_outcome(&Probe::Ran("node.name = \"other\"".into()), "epos-eq-capture"),
+            ChainProbe::Absent,
+            "a successful probe that does not see the node is a real absence"
+        );
+    }
+
+    /// A probe that could not run tells us nothing, so it must never move the
+    /// route or trigger a restart. This is the distinction that keeps a
+    /// `pw-cli` hiccup from bouncing a user's audio between two sinks.
+    #[test]
+    fn an_unusable_probe_never_moves_the_route() {
+        let d = eq_route_decision(ChainProbe::Unknown, 3);
+        assert_eq!(
+            d.action,
+            EqRouteAction::Hold,
+            "a timed-out probe is not evidence the chain is gone"
+        );
+        assert!(!d.request_restart, "and must not restart anything");
+    }
+
+    /// A conclusively absent chain is handled at once. Audio safety cannot wait
+    /// on a grace period: every extra poll is extra silence.
+    #[test]
+    fn a_conclusive_absence_falls_back_immediately() {
+        let d = eq_route_decision(ChainProbe::Absent, 1);
+        assert_eq!(
+            d.action,
+            EqRouteAction::FallBackToRaw,
+            "a confirmed dead chain must be left at once, not after a delay"
+        );
     }
 
     /// After the grace period the route must fall back to raw hardware, which
     /// is unprocessed but audible. Silence is the worse failure.
     #[test]
     fn eq_route_falls_back_to_raw_after_the_grace_period() {
-        let d = eq_route_decision(false, 2);
-        assert!(!d.use_anchor, "a dead chain must not stay the default sink");
-        assert!(d.repair_to_raw, "move the default sink back to raw hardware");
+        let d = eq_route_decision(ChainProbe::Absent, 1);
+        assert_eq!(
+            d.action,
+            EqRouteAction::FallBackToRaw,
+            "a dead chain must not stay the default sink"
+        );
         assert!(d.request_restart, "ask for a restart once it has settled");
     }
 
@@ -2114,20 +2356,57 @@ mod tests {
     #[test]
     fn eq_restarts_are_rate_limited() {
         assert!(
-            !eq_route_decision(false, 3).request_restart,
+            eq_route_decision(ChainProbe::Absent, 1).request_restart,
+            "the first conclusive absence asks for a restart"
+        );
+        assert!(
+            !eq_route_decision(ChainProbe::Absent, 2).request_restart,
             "no restart on every poll"
         );
         assert!(
-            !eq_route_decision(false, 7).request_restart,
-            "not on an odd poll either"
+            !eq_route_decision(ChainProbe::Absent, 6).request_restart,
+            "not on an off-cadence poll either"
         );
         assert!(
-            eq_route_decision(false, 8).request_restart,
+            eq_route_decision(ChainProbe::Absent, 7).request_restart,
             "a periodic retry is still wanted"
         );
         assert!(
-            eq_route_decision(false, 14).request_restart,
+            eq_route_decision(ChainProbe::Absent, 13).request_restart,
             "and it keeps retrying slowly"
+        );
+    }
+
+    /// The fallback must also move streams that are ALREADY playing into the
+    /// anchor, because `set-default-sink` only affects new ones. The sink is
+    /// identified by numeric index in `sink-inputs`, so the name has to be
+    /// resolved first — a bug an earlier version of this had.
+    #[test]
+    fn sink_input_rescue_matches_the_anchor_by_index() {
+        let sinks = "33\tepos-eq-input\tPipeWire\tfloat32le 2ch 48000Hz\n\
+                      4786\talsa_output.usb-EPOS-00.analog-stereo\tPipeWire\ts24le 2ch 48000Hz\n";
+        assert_eq!(sink_index_of(sinks, EQ_SINK_NAME), Some(33));
+        assert_eq!(sink_index_of(sinks, "nope"), None);
+        assert_eq!(sink_index_of("", EQ_SINK_NAME), None);
+
+        let listing = "37\t1374\t-\tPipeWire\tfloat32le 2ch 48000Hz\n\
+                       8602\t4786\t-\tPipeWire\tfloat32le 2ch 48000Hz\n\
+                       11958\t33\t-\tPipeWire\tfloat32le 2ch 48000Hz\n\
+                       13556\t33\t-\tPipeWire\tfloat32le 2ch 48000Hz\n";
+        assert_eq!(sink_input_indices_on(listing, 33), vec![11958, 13556]);
+        assert_eq!(sink_input_indices_on(listing, 4786), vec![8602]);
+        assert!(sink_input_indices_on(listing, 9999).is_empty());
+        assert!(sink_input_indices_on("", 33).is_empty());
+    }
+
+    /// A single healthy poll must not erase a failure, or a flapping chain
+    /// defeats the retry cadence and restarts every other cycle.
+    #[test]
+    fn recovery_needs_more_than_one_clean_poll() {
+        assert!(
+            EQ_RECOVERY_POLLS > 1,
+            "one good poll resetting the miss counter lets a flapping chain \
+             restart repeatedly"
         );
     }
 

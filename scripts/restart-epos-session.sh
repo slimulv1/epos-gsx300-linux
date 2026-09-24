@@ -17,6 +17,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# `set -u` is on, so an unset XDG_CONFIG_HOME would abort this script
+# before it restarts anything. Resolve it once with the documented default.
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 ANCHOR_SINK="epos-eq-input"
 INSTANCE_BASE="pipewire-epos@"
 ROLES=( eq voice sidetone )
@@ -54,7 +57,7 @@ if ! systemctl --user list-unit-files "pipewire-epos@.service" >/dev/null 2>&1; 
     die "chưa thấy template pipewire-epos@.service — chạy ./scripts/install.sh trước rồi restart main"
 fi
 for role in "${ROLES[@]}"; do
-    if [[ ! -e "$XDG_CONFIG_HOME/systemd/user/graphical-session.target.wants/pipewire-epos@$role.service" ]] &&
+    if [[ ! -e "$CONFIG_HOME/systemd/user/graphical-session.target.wants/pipewire-epos@$role.service" ]] &&
        [[ ! -e "$HOME/.config/systemd/user/graphical-session.target.wants/pipewire-epos@$role.service" ]]; then
         die "chưa thấy enable symlink pipewire-epos@$role — chạy ./scripts/install.sh trước rồi restart main"
     fi

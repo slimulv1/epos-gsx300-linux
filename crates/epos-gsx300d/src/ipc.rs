@@ -55,7 +55,15 @@ fn sync_profile_audio(profiles: &mut [epos_shared::Profile], active: &str, live:
     if active.is_empty() {
         return;
     }
-    if let Some(p) = profiles.iter_mut().find(|p| p.name == active) {
+    // Case-insensitive, as the shared config contract requires: the shipped
+    // `active_profile` is "FLAT" while configs in the wild also use "Flat",
+    // and an exact compare silently left the active profile stale, so an EQ or
+    // mic change reverted on the next profile switch. `DeleteProfile` already
+    // compares this way.
+    if let Some(p) = profiles
+        .iter_mut()
+        .find(|p| p.name.eq_ignore_ascii_case(active))
+    {
         p.audio = live.clone();
     }
 }
