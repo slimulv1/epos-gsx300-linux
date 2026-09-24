@@ -73,6 +73,23 @@ const eqLooksTransparent = computed(
     eqActiveBandCount.value === 0,
 );
 
+/* Whether the EQ is loaded and enabled but playback is routed somewhere else.
+
+   This is a different failure from the flat-curve one above, and the two were
+   previously indistinguishable on screen: both leave the EQ doing nothing while
+   the interface has every reason to look healthy. A flat curve is a property of
+   the curve; being out of the path is a property of the routing, and the curve
+   can be perfectly good. The daemon has reported `eq_in_path` for this since it
+   was added, and nothing rendered it, so the status said "7 bands active" in
+   green while nothing filtered.
+
+   Optional for the same reason as the band count: a GUI talking to an older
+   daemon has no verdict, and says nothing rather than guessing. */
+const eqInPath = computed(() => store.status?.eq_in_path ?? null);
+const eqBypassed = computed(
+  () => (store.audio?.eq?.enabled ?? false) && eqInPath.value === false,
+);
+
 /* ─── Save preset modal ─── */
 const saveOpen = ref(false);
 const saveName = ref("");
@@ -141,6 +158,12 @@ async function confirmSave() {
     <!-- EQ graph -->
     <div class="eq-section">
       <h3 class="section-title">EQUALIZER</h3>
+      <p v-if="eqBypassed" class="eq-note">
+        ON, BUT NOT IN THE AUDIO PATH - the filter is loaded and the curve below
+        is real, but playback is routed somewhere else, so none of it is being
+        applied. Selecting the EPOS output, or toggling the EQ off and on, puts
+        it back in the path.
+      </p>
       <p v-if="eqLooksTransparent" class="eq-note">
         ON, BUT NOT FILTERING - every band is flat, so the graph has no filter
         in it. Move a band off 0 dB and the change will be audible.
