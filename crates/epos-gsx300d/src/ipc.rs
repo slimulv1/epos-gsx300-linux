@@ -19,9 +19,15 @@ use tracing::{debug, info, warn};
 
 use anyhow::Result;
 
-/// True when a request mutates daemon state (RAM + config file). Read-only
-/// requests (GetStatus/GetEq/GetMode/GetProfiles/GetDevice) return here false,
-/// so the GUI's 3s status polling never rewrites the config file to disk.
+/// True when a request mutates daemon state that must be persisted to the
+/// config file. Read-only requests (GetStatus/GetEq/GetMode/GetProfiles/
+/// GetDevice) return here false, so the GUI's 3s status polling never rewrites
+/// the config file to disk.
+///
+/// `Reload` is deliberately absent. It adopts the file as the source of truth
+/// and then hands it to the pipeline, so writing it straight back accomplishes
+/// nothing except re-serialising it — which silently drops any field this build
+/// does not understand, and can clobber an edit made in the meantime.
 pub fn request_is_mutation(req: &Request) -> bool {
     matches!(
         req,
@@ -36,7 +42,6 @@ pub fn request_is_mutation(req: &Request) -> bool {
             | Request::CreateProfile { .. }
             | Request::DeleteProfile { .. }
             | Request::SetSmartButton { .. }
-            | Request::Reload
             | Request::Quit
     )
 }
@@ -628,7 +633,12 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
         // --- Lifecycle ---
         Request::Reload => {
             let mut state = state.write().await;
-            match config::load() {
+            // Read-only by design: a missing or malformed file is reported and
+            // left exactly as found. The bootstrap loader answers an absent
+            // file by writing `Config::default()` over the real path, so a
+            // config that was momentarily gone turned a reload into a factory
+            // reset that discarded the user's profiles.
+            match config::load_existing() {
                 Ok(new_config) => {
                     state.config = new_config;
                     // Sync the reloaded config into the pipeline's own copy

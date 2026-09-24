@@ -976,7 +976,7 @@ async fn config_watch_loop(state: Arc<RwLock<IpcState>>) {
             }
         }
 
-        let mut new_config = match config::load() {
+        let mut new_config = match config::load_existing() {
             Ok(c) => c,
             Err(e) => {
                 // File may be mid-write or malformed; keep current config.
