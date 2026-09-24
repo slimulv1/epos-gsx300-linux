@@ -1273,14 +1273,22 @@ pub(crate) async fn restart_epos_instance(role: &str) -> bool {
     match tokio::time::timeout(RESTART_VERIFY_BUDGET, verify).await {
         Ok(healthy) => {
             if !healthy {
-                warn!("epos instance {role}: still not reachable — EPOS path silent (fail-closed)");
+                // Do not claim silence here. The EQ watchdog independently
+                // re-probes every 5 s, repairs the route and restarts the
+                // instance, so this verdict is a report, not the last word —
+                // and a restart racing another restart can make it look worse
+                // than it is.
+                warn!(
+                    "epos instance {role}: not verified healthy after restart; \
+                     the watchdog will re-check and retry"
+                );
             }
             healthy
         }
         Err(_) => {
             warn!(
                 "epos instance {role}: verification exceeded {RESTART_VERIFY_BUDGET:?} \
-                 — treating as unhealthy (fail-closed)"
+                 — treating as unhealthy; the watchdog will retry"
             );
             false
         }

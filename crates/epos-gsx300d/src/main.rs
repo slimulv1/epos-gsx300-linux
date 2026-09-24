@@ -64,6 +64,32 @@ async fn main() -> Result<()> {
         info!("Chip ID: {:#04x}", id);
     }
 
+    // Resolve the live audio from the active profile before building the
+    // pipeline, the same way `SetActiveProfile` does.
+    //
+    // The config file carries the audio twice: the top-level `audio` block and
+    // a copy inside each profile, and `sync_active_profile` keeps the two in
+    // step at runtime. On disk the profile is the one a user edits, so it has
+    // to win at startup. Otherwise a band changed in the profile was applied
+    // by the config watcher, then silently reverted on the next daemon start
+    // from the stale top-level copy — verified before this change.
+    let mut config = config;
+    if !config.active_profile.is_empty() {
+        if let Some(p) = config
+            .profiles
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case(&config.active_profile))
+        {
+            if serde_json::to_value(&p.audio).ok() != serde_json::to_value(&config.audio).ok() {
+                info!(
+                    "Applying audio from active profile '{}' (top-level copy was stale)",
+                    p.name
+                );
+                config.audio = p.audio.clone();
+            }
+        }
+    }
+
     // Initialize audio pipeline
     let mut audio = AudioPipeline::new(&config.audio);
     if let Some(ref d) = device {
@@ -853,7 +879,7 @@ async fn config_watch_loop(state: Arc<RwLock<IpcState>>) {
             }
         }
 
-        let new_config = match config::load() {
+        let mut new_config = match config::load() {
             Ok(c) => c,
             Err(e) => {
                 // File may be mid-write or malformed; keep current config.
@@ -871,9 +897,39 @@ async fn config_watch_loop(state: Arc<RwLock<IpcState>>) {
             .unwrap_or(true);
         let mode_changed = st.config.mode != new_config.mode;
 
+        // A change confined to the ACTIVE PROFILE's audio is an audio change
+        // too. Comparing only the top-level `audio` block meant editing a
+        // profile's EQ on disk was classified as a non-audio edit and never
+        // applied: the watcher logged "non-audio settings updated" while the
+        // generated EQ conf kept the old curve. This is the common way a user
+        // edits an EQ.
+        let active_before = st.config.active_profile.clone();
+        let profile_audio = |cfg: &epos_shared::config::Config, name: &str| {
+            cfg.profiles
+                .iter()
+                .find(|p| p.name.eq_ignore_ascii_case(name))
+                .and_then(|p| serde_json::to_value(&p.audio).ok())
+        };
+        let active_profile_changed = active_before != new_config.active_profile
+            || profile_audio(&st.config, &active_before)
+                != profile_audio(&new_config, &new_config.active_profile);
+
+        // Resolve the live audio from the active profile, the same way
+        // `SetActiveProfile` does, so a profile edit actually reaches the
+        // pipeline instead of the top-level snapshot winning.
+        if active_profile_changed && !active_before.is_empty() {
+            if let Some(p) = new_config
+                .profiles
+                .iter()
+                .find(|p| p.name.eq_ignore_ascii_case(&new_config.active_profile))
+            {
+                new_config.audio = p.audio.clone();
+            }
+        }
+
         st.config = new_config;
 
-        if audio_changed {
+        if audio_changed || active_profile_changed {
             let audio_cfg = st.config.audio.clone();
             st.audio.update_config(&audio_cfg);
             match st.audio.apply_full().await {
@@ -883,7 +939,14 @@ async fn config_watch_loop(state: Arc<RwLock<IpcState>>) {
                 Ok(false) => debug!("audio conf unchanged - no instance restart"),
                 Err(e) => warn!("Failed to apply reloaded audio config: {}", e),
             }
-            info!("Config hot-reload: audio settings applied");
+            info!(
+                "Config hot-reload: audio settings applied{}",
+                if active_profile_changed {
+                    " (from the active profile)"
+                } else {
+                    ""
+                }
+            );
         }
         if mode_changed {
             let desired_mode = st.config.mode;
