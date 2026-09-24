@@ -4,7 +4,7 @@ use epos_shared::ipc::MicInputState;
 use epos_shared::device::DeviceInfo;
 use crate::sync::lock;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -49,31 +49,6 @@ pub struct AudioPipeline {
     /// Only so the "the EQ is bypassed while you are on this device" line is
     /// emitted once per change rather than on every 5 s poll.
     last_user_sink: Mutex<Option<String>>,
-    /// The default sink as of the previous poll, recorded whatever the decision
-    /// was.
-    ///
-    /// This is what separates a device the user picked from one that was merely
-    /// left in place. A MAIN restart restores the persisted default without
-    /// anybody choosing anything, so the value comes back equal to the one
-    /// already observed and the route is repaired; a device selected while the
-    /// daemon runs differs from it and is left alone. Recording every poll
-    /// rather than only the value seen at startup is what keeps the second case
-    /// working after the daemon has already reclaimed once.
-    last_seen_default_sink: Mutex<Option<String>>,
-    /// The user has picked a device and no transition has happened since.
-    ///
-    /// Without this the rule cannot be made to work in both directions, and the
-    /// failure is not subtle. Respecting a foreign sink means the next poll sees
-    /// the same value and cannot tell "the user chose this and it has not
-    /// changed" from "this was never chosen and nothing has touched it" — the two
-    /// are the same value. Measured on the running daemon: the choice was honoured
-    /// for one poll and taken back on the next.
-    ///
-    /// So the choice is held until something re-opens the question: the EQ being
-    /// toggled, the device being replugged. That is the contract this function's
-    /// own documentation already claimed — a manual override is preserved until
-    /// the next transition — and the 5 s watchdog is what stopped it being true.
-    user_holds_route: AtomicBool,
 }
 
 /// Microphone signal watchdog bookkeeping.
@@ -166,57 +141,40 @@ pub enum OutputDecision {
     Untouched,
 }
 
-/// Which sink the default should point at, with the default this daemon last
-/// observed taken into account.
+/// Which sink the default should point at, if any.
 ///
-/// The rule protects every published sink that is not ours, because on its own it
-/// cannot tell a device somebody picked from one that was merely left in place.
-/// That distinction is not cosmetic: a MAIN restart restores the persisted
-/// default without anybody choosing anything, and with the EQ on the result was a
-/// healthy chain reported as active that was not in the audio path at all — the
-/// quiet form of the failure this section exists to prevent.
+/// The daemon owns exactly two sinks — the EQ anchor and the raw hardware sink —
+/// and normalises between them. Any other published sink is a device the user is
+/// listening on, so it is left alone.
 ///
-/// So the daemon remembers what the default was on its previous poll and passes
-/// it here. A default still carrying that exact value was not changed while the
-/// daemon ran, so it does not protect itself and the route is repaired as before.
-/// One that differs was changed while the daemon ran, and is left alone.
+/// That is the whole rule, and it is what the user asked for: on the EPOS the EQ
+/// applies, on anything else it does not, and it comes back when the EPOS comes
+/// back. Which device playback is on is read from the default sink, so there is
+/// nothing to infer and nothing to remember.
 ///
-/// Comparing against the previous poll rather than against startup is what makes
-/// the rule hold in both directions. Startup alone is not enough: a daemon that
-/// started with the speakers as the default, reclaimed the route as intended, and
-/// was then handed the speakers again would read that as "unchanged since start"
-/// and take them back — overruling exactly the choice it is meant to respect.
-///
-/// The exemption is limited to the EQ being on, which is the case it exists for.
-/// With the EQ off there is nothing to reclaim, and this stays the old rule
-/// unchanged.
-///
-/// `held_by_user` says a device was picked while the daemon was running and no
-/// transition has happened since. It is what makes the choice stick: without it
-/// the poll after a respected one sees the same value and reads it as unchanged,
-/// which is indistinguishable from a value nobody ever chose.
-///
-/// `None` for `last_seen_default` means no earlier observation was available.
-/// Nothing is proven then, and the conservative rule stands.
-pub fn desired_output_route_with_history(
+/// An earlier version tried to do more than this. It tried to recover the EQ after
+/// a PipeWire restart by working out whether the default had been changed while
+/// the daemon was running, treating "nobody changed it" as licence to take it
+/// back. That inference was the entire difficulty, it was wrong twice on the
+/// running daemon, and it was not needed: WirePlumber stores the selected default
+/// itself and restores it, so a default of ours comes back as ours. Measured — on
+/// the EPOS, restarting `pipewire` left the default on `epos-eq-input` with
+/// `eq_in_path` still true, and `~/.local/state/wireplumber/default-nodes`
+/// recording it. The cost of the inference was not complexity, it was wrongness:
+/// on a profile change it took the user from the speakers to the headset while
+/// they were on the speakers.
+pub fn desired_output_route(
     eq_enabled: bool,
     device_connected: bool,
     chain_present: bool,
     current_default: &str,
-    last_seen_default: Option<&str>,
-    held_by_user: bool,
     raw_sink: &str,
     published_sinks: &[String],
 ) -> OutputDecision {
     if !device_connected {
         return OutputDecision::Untouched;
     }
-    // `eq_enabled` gates the exemption on purpose: with the EQ off, an unchanged
-    // default is left exactly as the rule below has always left it.
-    let reclaimable = eq_enabled
-        && !held_by_user
-        && !changed_since_last_seen(current_default, last_seen_default);
-    if is_user_choice(current_default, raw_sink, EQ_SINK_NAME, published_sinks) && !reclaimable {
+    if is_user_choice(current_default, raw_sink, EQ_SINK_NAME, published_sinks) {
         return OutputDecision::RespectUserChoice;
     }
     // `Processed` points apps at `epos-eq-input`, a null-sink that only
@@ -228,35 +186,6 @@ pub fn desired_output_route_with_history(
     } else {
         OutputRoute::Raw
     })
-}
-
-/// Did the default sink change between two observations the daemon made itself?
-///
-/// `None` means there was no earlier observation, so nothing is proven and the
-/// answer is the conservative one: assume it was changed.
-fn changed_since_last_seen(current: &str, last_seen: Option<&str>) -> bool {
-    !matches!(last_seen, Some(seen) if seen == current)
-}
-
-/// What the next poll should treat as the previously observed default.
-///
-/// The value to remember is the one the default sink actually holds once the poll
-/// is over, which is the target when the daemon moved it and the observed value
-/// when it did not.
-///
-/// Recording the observed value unconditionally is wrong in a way that only shows
-/// up at runtime. A reclaiming poll reads the speakers, moves the default to the
-/// anchor, and then records "speakers" — so the next poll believes the speakers
-/// are still the default. Handing the speakers back then looks unchanged, and the
-/// daemon takes the route again, overruling the very choice the rule exists to
-/// respect. Measured on the running daemon: the choice held for one poll and was
-/// reverted on the next.
-fn next_observation(previous: &str, target: &str, route_applied: bool) -> String {
-    if route_applied {
-        target.to_string()
-    } else {
-        previous.to_string()
-    }
 }
 
 /// Is `current` a device somebody chose, rather than one this daemon manages?
@@ -679,8 +608,6 @@ impl AudioPipeline {
             eq_chain_recovered_polls: AtomicU32::new(0),
             role_health: Mutex::new(BTreeMap::new()),
             last_user_sink: Mutex::new(None),
-            last_seen_default_sink: Mutex::new(None),
-            user_holds_route: AtomicBool::new(false),
         };
         // Same funnel as update_config, so a hand-edited config.json is bounded
         // at startup too and not only on later IPC updates.
@@ -700,13 +627,8 @@ impl AudioPipeline {
     }
 
     /// Store device reference for future operations
-    ///
-    /// A replug is a transition: the default sink is re-evaluated from scratch, so
-    /// a device the user had chosen before is not treated as a standing choice
-    /// over a headset that has just come back.
     pub fn set_device(&mut self, device: &DeviceInfo) {
         self.device = Some(device.clone());
-        self.forget_route_history();
     }
 
     /// Sync latest config into the pipeline before applying filters
@@ -715,33 +637,9 @@ impl AudioPipeline {
         // Single funnel for every config source, so a profile or an edited
         // config.json cannot smuggle an out-of-range gain past the IPC clamp.
         config.mic_gain = sanitize_mic_gain(config.mic_gain);
-        // Toggling the EQ is the other transition: it is an explicit statement
-        // about where playback should go, so it re-opens the question. Nothing
-        // else here counts — a volume change or a profile switch that leaves the
-        // EQ alone must not quietly undo a device the user picked.
-        let eq_toggled = self.config.eq.enabled != config.eq.enabled;
         self.config = config;
-        if eq_toggled {
-            self.forget_route_history();
-        }
     }
 
-    /// Drop what the daemon remembers about the default sink.
-    ///
-    /// Called on transitions only. Between them the memory is the whole point:
-    /// without it the daemon cannot tell a MAIN restart, which restores the
-    /// persisted default without anybody choosing anything, from a device the
-    /// user picked while it was running.
-    fn forget_route_history(&mut self) {
-        if let Ok(mut seen) = self.last_seen_default_sink.lock() {
-            *seen = None;
-        }
-        self.user_holds_route.store(false, Ordering::Relaxed);
-    }
-
-    /// Ask the restart bus to (re)start a DSP instance.
-    ///
-    /// Used by the startup convergence pass and the EQ watchdog. The bus
     /// deduplicates and the worker debounces, so repeated requests for the same
     /// role collapse into one restart.
     pub fn request_instance_restart(&self, role: &str) {
@@ -1528,84 +1426,38 @@ impl AudioPipeline {
             })
             .unwrap_or_default();
 
-        let last_seen = lock(&self.last_seen_default_sink).clone();
-        let held_by_user = self.user_holds_route.load(Ordering::Relaxed);
-        let current_default = previous.as_deref().unwrap_or_default();
-        // A default that differs from the previous poll was changed by something
-        // other than this daemon while it was running. That is the user's choice,
-        // and it is what sets the hold below.
-        let changed_by_someone =
-            matches!(last_seen.as_deref(), Some(seen) if seen != current_default);
-        let route = desired_output_route_with_history(
+        let route = desired_output_route(
             eq_enabled,
             device_connected,
             chain_present,
-            current_default,
-            last_seen.as_deref(),
-            held_by_user,
+            previous.as_deref().unwrap_or_default(),
             &raw_sink,
             &published,
         );
-        // Record what the default actually holds once this poll is over. It has to
-        // happen on every path, not only where the daemon acts: the case this whole
-        // change exists for is a default that keeps being respected, so recording
-        // it only when the route moved would never record anything and the reclaim
-        // could never happen. And it has to happen *after* the route is applied —
-        // see `next_observation` for what goes wrong otherwise.
         let route = match route {
-            OutputDecision::Untouched => {
-                // The device is absent. The default is not this daemon's to reason
-                // about, and a device the user picked while it was gone must still
-                // read as a change, so nothing is recorded.
-                return Ok(false);
-            }
+            OutputDecision::Untouched => return Ok(false),
             OutputDecision::RespectUserChoice => {
-                // Logged once per change rather than every poll, because the
-                // consequence matters: with the EQ on, playback elsewhere means the
-                // EQ is not in the path, and that is now reported through
-                // `eq_in_path` rather than quietly pretended otherwise.
+                // Playback is on a device this daemon does not own, so the EQ is
+                // out of the path. Logged once per change rather than every poll,
+                // because the consequence matters and is otherwise invisible: the
+                // chain is still loaded and still enabled, it is simply not in
+                // anything the user can hear. That is reported through
+                // `eq_in_path` and shown in the GUI rather than pretended otherwise.
                 if previous.as_deref() != lock(&self.last_user_sink).as_deref() {
                     if let Ok(mut remembered) = self.last_user_sink.lock() {
                         *remembered = previous.clone();
                     }
-                    if last_seen.is_some() {
-                        info!(
-                            "Output left on {} as chosen — the EQ is bypassed while \
-                             playback is not routed through it",
-                            previous.as_deref().unwrap_or("the current sink")
-                        );
-                    } else {
-                        // Being conservative is not the same as knowing. Saying "as
-                        // chosen" when no earlier poll was ever seen would claim an
-                        // observation this daemon has not made.
-                        info!(
-                            "Output left on {} — no earlier poll to compare against, \
-                             so it is left alone for now; the EQ is bypassed while \
-                             playback is not routed through it",
-                            previous.as_deref().unwrap_or("the current sink")
-                        );
-                    }
-                }
-                if let Some(observed) = previous.as_deref() {
-                    *lock(&self.last_seen_default_sink) =
-                        Some(next_observation(observed, "", false));
-                }
-                // A device that changed while this daemon was running is the user's
-                // choice, and it is held until a transition re-opens the question.
-                // The very first poll is not such a change — there is nothing to
-                // compare against yet — so it does not set the hold, which is what
-                // lets the reclaim happen on the next poll for a default nobody
-                // touched.
-                if changed_by_someone {
-                    self.user_holds_route.store(true, Ordering::Relaxed);
+                    info!(
+                        "Output left on {} — the EQ is bypassed while playback is \
+                         not routed through it, and comes back when playback \
+                         returns to the EPOS",
+                        previous.as_deref().unwrap_or("the current sink")
+                    );
                 }
                 return Ok(false);
             }
             OutputDecision::Set(route) => route,
         };
-        // The daemon is taking the route, so it is no longer the case that a
-        // device the user picked is standing.
-        self.user_holds_route.store(false, Ordering::Relaxed);
         // Coming back to one of our own sinks: forget the remembered choice so a
         // later switch away is reported again.
         if let Ok(mut remembered) = self.last_user_sink.lock() {
@@ -1620,20 +1472,11 @@ impl AudioPipeline {
         }
         let previous = Self::read_default_sink().await;
         if previous.as_deref() == Some(target.as_str()) {
-            *lock(&self.last_seen_default_sink) = Some(target.clone());
             return Ok(false);
         }
-        if let Err(e) = Self::set_default_sink(&target).await {
-            // The move did not happen, so the default still holds what was
-            // observed. Recording the target would make the next poll think the
-            // route was in place when it is not.
-            if let Some(observed) = previous.as_deref() {
-                *lock(&self.last_seen_default_sink) =
-                    Some(next_observation(observed, &target, false));
-            }
-            return Err(e);
-        }
-        *lock(&self.last_seen_default_sink) = Some(target.clone());
+        // A failure here is reported to the caller; the next poll retries,
+        // and there is no state to correct because the default is not remembered.
+        Self::set_default_sink(&target).await?;
         // Only reached when the default really is changing, so `previous` is an
         // observed value rather than a guess. A sink this daemon never set was
         // put there by the user or another tool, and the route is about to be
@@ -3038,7 +2881,7 @@ mod tests {
     #[test]
     fn eq_on_with_device_routes_to_processed_sink() {
         assert_eq!(
-            desired_output_route_with_history(true, true, true, "", None, false, "", &[]),
+            desired_output_route(true, true, true, "", "", &[]),
             OutputDecision::Set(OutputRoute::Processed)
         );
     }
@@ -3046,7 +2889,7 @@ mod tests {
     /// With EQ OFF, playback must go straight to the EPOS hardware sink.
     #[test]
     fn eq_off_with_device_routes_to_raw_sink() {
-        assert_eq!(desired_output_route_with_history(false, true, false, "", None, false, "", &[]),
+        assert_eq!(desired_output_route(false, true, false, "", "", &[]),
               OutputDecision::Set(OutputRoute::Raw));
     }
 
@@ -3057,7 +2900,7 @@ mod tests {
     fn absent_device_never_touches_the_default_sink() {
         for eq_enabled in [true, false] {
             assert_eq!(
-                desired_output_route_with_history(eq_enabled, false, true, "", None, false, "", &[]),
+                desired_output_route(eq_enabled, false, true, "", "", &[]),
                 OutputDecision::Untouched,
                 "eq_enabled={eq_enabled} must not touch the default while absent"
             );
@@ -3722,7 +3565,7 @@ mod tests {
     #[test]
     fn eq_route_falls_back_to_raw_when_the_chain_is_missing() {
         assert_eq!(
-            desired_output_route_with_history(true, true, false, "", None, false, "", &[]),
+            desired_output_route(true, true, false, "", "", &[]),
             OutputDecision::Set(OutputRoute::Raw),
             "routing to epos-eq-input without epos-eq-capture would silence apps"
         );
@@ -3732,7 +3575,7 @@ mod tests {
     #[test]
     fn eq_route_uses_the_anchor_when_the_chain_is_present() {
         assert_eq!(
-            desired_output_route_with_history(true, true, true, "", None, false, "", &[]),
+            desired_output_route(true, true, true, "", "", &[]),
             OutputDecision::Set(OutputRoute::Processed)
         );
     }
@@ -3740,16 +3583,16 @@ mod tests {
     /// EQ off is unaffected: raw sink whether or not a chain lingers.
     #[test]
     fn eq_off_always_means_raw_sink() {
-        assert_eq!(desired_output_route_with_history(false, true, false, "", None, false, "", &[]), OutputDecision::Set(OutputRoute::Raw));
-        assert_eq!(desired_output_route_with_history(false, true, true, "", None, false, "", &[]), OutputDecision::Set(OutputRoute::Raw));
+        assert_eq!(desired_output_route(false, true, false, "", "", &[]), OutputDecision::Set(OutputRoute::Raw));
+        assert_eq!(desired_output_route(false, true, true, "", "", &[]), OutputDecision::Set(OutputRoute::Raw));
     }
 
     /// Disconnected: leave the default alone, as before.
     #[test]
     fn no_output_route_is_desired_while_disconnected() {
-        assert_eq!(desired_output_route_with_history(true, false, true, "", None, false, "", &[]),
+        assert_eq!(desired_output_route(true, false, true, "", "", &[]),
             OutputDecision::Untouched);
-        assert_eq!(desired_output_route_with_history(false, false, false, "", None, false, "", &[]),
+        assert_eq!(desired_output_route(false, false, false, "", "", &[]),
             OutputDecision::Untouched);
     }
 
@@ -4859,16 +4702,13 @@ mod tests {
             "alsa_output.usb-EPOS-00.analog-stereo".to_string(),
         ];
         assert_eq!(
-            desired_output_route_with_history(
+            desired_output_route(
                 true,
                 true,
                 true,
                 "alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink",
-                None,
-                false,
                 "alsa_output.usb-EPOS-00.analog-stereo",
-                &speakers,
-            ),
+                &speakers,),
             OutputDecision::RespectUserChoice,
             "the EQ being on is not a reason to overrule a device the user picked"
         );
@@ -4880,16 +4720,13 @@ mod tests {
     fn a_users_chosen_sink_survives_even_with_the_eq_off() {
         let speakers = vec!["bluez_sink.00_00_00_00_00_00.a2dp_sink".to_string()];
         assert_eq!(
-            desired_output_route_with_history(
+            desired_output_route(
                 false,
                 true,
                 false,
                 "bluez_sink.00_00_00_00_00_00.a2dp_sink",
-                None,
-                false,
                 "alsa_output.usb-EPOS-00.analog-stereo",
-                &speakers,
-            ),
+                &speakers,),
             OutputDecision::RespectUserChoice
         );
     }
@@ -4901,22 +4738,20 @@ mod tests {
     fn the_daemons_own_sinks_are_still_normalised() {
         let raw = "alsa_output.usb-EPOS-00.analog-stereo";
         assert_eq!(
-            desired_output_route_with_history(true, true, true, raw, None, false, raw, &[raw.to_string()]),
+            desired_output_route(true, true, true, raw, raw, &[raw.to_string()]),
             OutputDecision::Set(OutputRoute::Processed),
             "the raw sink with the EQ on resolves to the anchor"
         );
         assert_eq!(
-            desired_output_route_with_history(false, true, false, raw, None, false, raw, &[raw.to_string()]),
+            desired_output_route(false, true, false, raw, raw, &[raw.to_string()]),
             OutputDecision::Set(OutputRoute::Raw)
         );
         assert_eq!(
-            desired_output_route_with_history(
+            desired_output_route(
                 false,
                 true,
                 false,
                 EQ_SINK_NAME,
-                None,
-                false,
                 raw,
                 &[raw.to_string()]
             ),
@@ -4931,16 +4766,13 @@ mod tests {
     fn a_default_sink_that_no_longer_exists_is_not_a_user_choice() {
         let raw = "alsa_output.usb-EPOS-00.analog-stereo";
         assert_eq!(
-            desired_output_route_with_history(
+            desired_output_route(
                 true,
                 true,
                 true,
                 "alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink",
-                None,
-                false,
                 raw,
-                &[raw.to_string()],
-            ),
+                &[raw.to_string()],),
             OutputDecision::Set(OutputRoute::Processed),
             "a sink that is not in the graph cannot be what the user is listening to"
         );
@@ -4952,11 +4784,11 @@ mod tests {
     fn an_absent_device_never_touches_the_default() {
         let raw = "alsa_output.usb-EPOS-00.analog-stereo";
         assert_eq!(
-            desired_output_route_with_history(true, false, true, "", None, false, raw, &[raw.to_string()]),
+            desired_output_route(true, false, true, "", raw, &[raw.to_string()]),
             OutputDecision::Untouched
         );
         assert_eq!(
-            desired_output_route_with_history(true, false, true, "some_other_sink", None, false, raw, &["some_other_sink".to_string()]),
+            desired_output_route(true, false, true, "some_other_sink", raw, &["some_other_sink".to_string()]),
             OutputDecision::Untouched,
             "not even a user choice may pull the default while the device is gone"
         );
@@ -4968,41 +4800,63 @@ mod tests {
     fn an_unknown_default_is_not_treated_as_a_user_choice() {
         let raw = "alsa_output.usb-EPOS-00.analog-stereo";
         assert_eq!(
-            desired_output_route_with_history(true, true, true, "", None, false, raw, &[raw.to_string()]),
+            desired_output_route(true, true, true, "", raw, &[raw.to_string()]),
             OutputDecision::Set(OutputRoute::Processed)
         );
     }
 
-    // ─── A default sink nobody changed while the daemon was running ──
+    // ─── The rule, stated the way the user states it ───────────
     //
-    // The tests above protect a device the user picked. They could not tell a
-    // picked device from one merely left in place, because with a MAIN restart
-    // both look identical: the persisted default comes back, nobody picks
-    // anything, and the result is an EQ chain that is healthy, reported active,
-    // and not in the path.
+    // On the EPOS the EQ applies. On anything else it does not. Which device
+    // playback is on is read from the default sink, and that is the whole of the
+    // input: no history, no inference about who changed what, nothing carried
+    // between polls.
     //
-    // The daemon now remembers what the default was when it started, so the two
-    // cases can be told apart.
+    // These tests used to be about recovering the EQ after a MAIN restart, by
+    // working out whether the default had been changed while the daemon ran. That
+    // inference was the entire difficulty, it was wrong twice on the running
+    // daemon, and it turned out not to be needed: WirePlumber stores the selected
+    // default itself and restores it, so a default of ours comes back as ours.
+    // Measured — on the EPOS, a `pipewire` restart left the default on
+    // `epos-eq-input` with `eq_in_path` still true, and the state file recording
+    // it. A default that is not ours is a device the user is on, and the answer to
+    // that is to leave it alone, whether or not anybody touched it.
 
-    /// The bug in policy form: the default is still exactly what the daemon
-    /// started with, so nobody changed it while it ran, and the EQ is on.
+    /// The rule, first case: playback on the EPOS with the EQ on means playback
+    /// through the anchor, so the EQ applies.
     #[test]
-    fn a_default_unchanged_since_startup_is_reclaimed_for_the_eq() {
+    fn on_the_device_the_eq_applies() {
+        let raw = "alsa_output.usb-EPOS-00.analog-stereo";
+        assert_eq!(
+            desired_output_route(
+                true,
+                true,
+                true,
+                raw,
+                raw,
+                &[raw.to_string()],),
+            OutputDecision::Set(OutputRoute::Processed)
+        );
+    }
+
+    /// The rule, second case, and the one the old inference got wrong: a device
+    /// that is not ours is left alone even when it is the same device as last
+    /// poll. What makes it the user's choice is being a device they are listening
+    /// on, not having been changed by them.
+    #[test]
+    fn on_another_device_the_eq_is_left_out_of_the_path() {
         let speakers = "alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink";
         let raw = "alsa_output.usb-EPOS-00.analog-stereo";
         assert_eq!(
-            desired_output_route_with_history(
+            desired_output_route(
                 true,
                 true,
                 true,
                 speakers,
-                Some(speakers),
-                false,
                 raw,
-                &[speakers.to_string(), raw.to_string()],
-            ),
-            OutputDecision::Set(OutputRoute::Processed),
-            "a default nobody changed while the daemon ran is not a choice to protect"
+                &[speakers.to_string(), raw.to_string()],),
+            OutputDecision::RespectUserChoice,
+            "a device the user is listening on is theirs, changed by them or not"
         );
     }
 
@@ -5015,16 +4869,13 @@ mod tests {
         let speakers = "alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink";
         let raw = "alsa_output.usb-EPOS-00.analog-stereo";
         assert_eq!(
-            desired_output_route_with_history(
+            desired_output_route(
                 false,
                 true,
                 false,
                 speakers,
-                Some(speakers),
-                false,
                 raw,
-                &[speakers.to_string(), raw.to_string()],
-            ),
+                &[speakers.to_string(), raw.to_string()],),
             OutputDecision::RespectUserChoice
         );
     }
@@ -5037,16 +4888,13 @@ mod tests {
         let speakers = "alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink";
         let raw = "alsa_output.usb-EPOS-00.analog-stereo";
         assert_eq!(
-            desired_output_route_with_history(
+            desired_output_route(
                 true,
                 true,
                 true,
                 speakers,
-                Some(EQ_SINK_NAME),
-                false,
                 raw,
-                &[speakers.to_string(), raw.to_string()],
-            ),
+                &[speakers.to_string(), raw.to_string()],),
             OutputDecision::RespectUserChoice,
             "changing the output while the daemon runs is a choice, and it counts"
         );
@@ -5059,16 +4907,13 @@ mod tests {
         let speakers = "bluez_sink.00_00_00_00_00_00.a2dp_sink";
         let raw = "alsa_output.usb-EPOS-00.analog-stereo";
         assert_eq!(
-            desired_output_route_with_history(
+            desired_output_route(
                 true,
                 true,
                 true,
                 speakers,
-                None,
-                false,
                 raw,
-                &[speakers.to_string(), raw.to_string()],
-            ),
+                &[speakers.to_string(), raw.to_string()],),
             OutputDecision::RespectUserChoice
         );
     }
@@ -5080,16 +4925,13 @@ mod tests {
         let vanished = "alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink";
         let raw = "alsa_output.usb-EPOS-00.analog-stereo";
         assert_eq!(
-            desired_output_route_with_history(
+            desired_output_route(
                 true,
                 true,
                 true,
                 vanished,
-                Some(vanished),
-                false,
                 raw,
-                &[raw.to_string()],
-            ),
+                &[raw.to_string()],),
             OutputDecision::Set(OutputRoute::Processed)
         );
     }
@@ -5100,136 +4942,15 @@ mod tests {
         let speakers = "bluez_sink.00_00_00_00_00_00.a2dp_sink";
         let raw = "alsa_output.usb-EPOS-00.analog-stereo";
         assert_eq!(
-            desired_output_route_with_history(
+            desired_output_route(
                 true,
                 false,
                 true,
                 speakers,
-                Some(speakers),
-                false,
                 raw,
-                &[speakers.to_string(), raw.to_string()],
-            ),
+                &[speakers.to_string(), raw.to_string()],),
             OutputDecision::Untouched
         );
-    }
-
-    /// What the next poll remembers after a poll that moved the default.
-    ///
-    /// This is the case that was measured failing: the reclaiming poll read the
-    /// speakers, moved the default to the anchor, and recording what it read left
-    /// the daemon believing the speakers were still current. Handing the speakers
-    /// back then looked like nothing had changed, and the route was taken again one
-    /// poll later.
-    #[test]
-    fn a_poll_that_moved_the_default_remembers_the_target() {
-        assert_eq!(
-            next_observation(
-                "alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink",
-                EQ_SINK_NAME,
-                true
-            ),
-            EQ_SINK_NAME
-        );
-    }
-
-    /// A poll that left the default alone remembers what it saw, so the next poll
-    /// can compare against it.
-    #[test]
-    fn a_poll_that_changed_nothing_remembers_what_it_saw() {
-        let speakers = "bluez_sink.00_00_00_00_00_00.a2dp_sink";
-        assert_eq!(next_observation(speakers, EQ_SINK_NAME, false), speakers);
-    }
-
-    // ─── A device the user picked, held until a transition ────────────
-    //
-    // The rule above decides correctly on any single poll and still fails across
-    // two of them, which is what forced this section. Measured on the running
-    // daemon: a device chosen while the daemon was running was honoured for one
-    // poll and taken back on the next, because by then the daemon's own previous
-    // poll had made that value look unchanged.
-
-    /// The choice holds. Same value as the previous poll, EQ on, and the daemon
-    /// still leaves it alone.
-    #[test]
-    fn a_device_the_user_picked_stays_picked_while_it_is_unchanged() {
-        let speakers = "alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink";
-        let raw = "alsa_output.usb-EPOS-00.analog-stereo";
-        assert_eq!(
-            desired_output_route_with_history(
-                true,
-                true,
-                true,
-                speakers,
-                Some(speakers),
-                true,
-                raw,
-                &[speakers.to_string(), raw.to_string()],
-            ),
-            OutputDecision::RespectUserChoice,
-            "the poll after a respected choice must not undo it"
-        );
-    }
-
-    /// The same inputs without the hold, which is what makes this a test of the
-    /// hold and not of the comparison.
-    #[test]
-    fn without_the_hold_the_same_unchanged_default_is_reclaimed() {
-        let speakers = "alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink";
-        let raw = "alsa_output.usb-EPOS-00.analog-stereo";
-        assert_eq!(
-            desired_output_route_with_history(
-                true,
-                true,
-                true,
-                speakers,
-                Some(speakers),
-                false,
-                raw,
-                &[speakers.to_string(), raw.to_string()],
-            ),
-            OutputDecision::Set(OutputRoute::Processed)
-        );
-    }
-
-    /// A hold the user did not ask for must not survive a change that is not a
-    /// transition. Only the EQ being toggled and the device being replugged count
-    /// as one; a volume change updates this same config on every dial movement,
-    /// and treating that as a transition would undo the choice within seconds of
-    /// touching the volume.
-    #[test]
-    fn changing_the_mic_gain_does_not_release_a_chosen_device() {
-        let mut pipeline = AudioPipeline::new(&AudioConfig::default());
-        pipeline.user_holds_route.store(true, Ordering::Relaxed);
-        *lock(&pipeline.last_seen_default_sink) = Some("some_sink".to_string());
-        let mut config = AudioConfig::default();
-        config.mic_gain = 77;
-        pipeline.update_config(&config);
-        assert!(
-            pipeline.user_holds_route.load(Ordering::Relaxed),
-            "a volume change is not a transition"
-        );
-        assert_eq!(
-            lock(&pipeline.last_seen_default_sink).as_deref(),
-            Some("some_sink")
-        );
-    }
-
-    /// Toggling the EQ is an explicit statement about where playback should go,
-    /// so it does re-open the question.
-    #[test]
-    fn toggling_the_eq_releases_a_chosen_device() {
-        let mut pipeline = AudioPipeline::new(&AudioConfig::default());
-        pipeline.user_holds_route.store(true, Ordering::Relaxed);
-        *lock(&pipeline.last_seen_default_sink) = Some("some_sink".to_string());
-        let mut config = AudioConfig::default();
-        config.eq.enabled = !config.eq.enabled;
-        pipeline.update_config(&config);
-        assert!(
-            !pipeline.user_holds_route.load(Ordering::Relaxed),
-            "toggling the EQ is a transition"
-        );
-        assert!(lock(&pipeline.last_seen_default_sink).is_none());
     }
 
     /// The EQ must only claim to be in the audio path when playback is actually
