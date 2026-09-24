@@ -48,6 +48,27 @@ Every failure mode has been exercised on this machine:
 This is the only option tested against every one of those events, and it
 passes them.
 
+### Every cross-daemon instance needs its own liveness check
+
+The EQ is not special here, and assuming it was is a measured bug. Restarting
+the MAIN `pipewire.service` drops every per-role instance's link to the main
+graph. Measured on 2026-09-24, with `voice` and `sidetone` both enabled:
+
+- `eq` came back by itself — it has a watchdog.
+- `voice` and `sidetone` did **not**. Their nodes stayed absent indefinitely,
+  both units kept reporting `active`, and nothing was logged. The microphone
+  processing and the sidetone were silently not working, and only recovered when
+  a setting happened to change.
+
+`AudioPipeline::maintain_instances` now watches `voice` and `sidetone` on the
+same 5 s poll, from one shared `pw-cli ls Node` listing. The policy is a pure
+state machine (`role_health_action`) with the rules the EQ watchdog had already
+proven: a probe that cannot run is `Unknown` and moves nothing, a conclusive
+absence asks for a restart on the first poll and then on a slow heartbeat, and
+two consecutive healthy polls are needed to forget a failure. Re-measured after
+the change: all three roles recover about 2 s after a MAIN restart, with no
+manual action, and a 65 s idle window produces no restarts and no warnings.
+
 ### B. Put the filter-chain in the MAIN graph
 
 Simpler topology, and it removes the cross-daemon target resolution entirely

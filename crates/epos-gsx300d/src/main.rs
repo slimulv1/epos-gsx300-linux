@@ -744,6 +744,12 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
             // silence with no diagnostic. maintain_eq() verifies the chain,
             // falls back to raw hardware if it is gone, and asks for a restart.
             st.audio.maintain_eq().await;
+            // Watchdog for the roles the EQ watcher does not cover. A MAIN
+            // `pipewire.service` restart drops every cross-daemon instance's
+            // link, and `voice`/`sidetone` previously stayed silent-but-apparently
+            // healthy forever afterwards: nodes gone, units still `active`,
+            // nothing logged. One shared node listing covers both.
+            st.audio.maintain_instances().await;
         }
 
         was_connected = is_connected;

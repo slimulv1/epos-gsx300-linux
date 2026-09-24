@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use epos_shared::config::{AudioConfig, VoiceMode};
 use epos_shared::device::DeviceInfo;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -36,6 +36,10 @@ pub struct AudioPipeline {
     /// Consecutive healthy polls seen since the last miss, used to require
     /// more than one clean sample before forgetting a failure.
     eq_chain_recovered_polls: AtomicU32,
+    /// Per-role liveness state for the roles that have no dedicated watcher
+    /// (`voice`, `sidetone`), keyed by role name. The EQ keeps its own counters
+    /// because it also has route actions layered on top.
+    role_health: Mutex<BTreeMap<String, RoleHealth>>,
 }
 
 /// Debounced restart bus: audio handlers record which epos instance(s) changed
@@ -217,6 +221,7 @@ impl AudioPipeline {
             gain_epoch: Arc::new(AtomicU64::new(0)),
             eq_chain_missing_polls: AtomicU32::new(0),
             eq_chain_recovered_polls: AtomicU32::new(0),
+            role_health: Mutex::new(BTreeMap::new()),
         };
         // Same funnel as update_config, so a hand-edited config.json is bounded
         // at startup too and not only on later IPC updates.
@@ -279,7 +284,7 @@ impl AudioPipeline {
         let missing = match outcome {
             ChainProbe::Present => {
                 if self.eq_chain_recovered_polls.fetch_add(1, Ordering::Relaxed) + 1
-                    >= EQ_RECOVERY_POLLS
+                    >= RECOVERY_POLLS
                 {
                     self.eq_chain_missing_polls.store(0, Ordering::Relaxed);
                     self.eq_chain_recovered_polls.store(0, Ordering::Relaxed);
@@ -334,6 +339,81 @@ impl AudioPipeline {
             warn!("EQ chain missing - requesting pipewire-epos@eq restart");
             self.restarts.request("eq");
         }
+    }
+
+    /// Keep the remaining DSP instances honest on the same 5 s poll that watches
+    /// the EQ.
+    ///
+    /// `voice` and `sidetone` had no liveness check at all, and the consequence
+    /// was measured rather than theorised. Restarting the MAIN
+    /// `pipewire.service` — something the user does by changing an audio
+    /// setting, and something systemd and the session do on their own — drops
+    /// every cross-daemon instance's link to the main graph. The EQ chain came
+    /// straight back because [`Self::maintain_eq`] watches it. The other two
+    /// did not: their nodes stayed absent indefinitely, both units kept
+    /// reporting `active`, and nothing was logged. With a voice mode and
+    /// sidetone enabled that is a microphone and a sidetone that are silently
+    /// not processing, which is worse than a missing feature because the status
+    /// says everything is fine.
+    ///
+    /// One `pw-cli ls Node` listing (measured 4 ms / 5.8 KB) serves every role,
+    /// so the whole check costs about as much as the EQ's own probe. A listing
+    /// that could not be fetched is `Unknown` for every role, which moves no
+    /// counter and triggers no restart — the same rule the EQ already follows.
+    ///
+    /// The EQ is deliberately not in this list: it is watched by
+    /// [`Self::maintain_eq`], which additionally repairs the output route and
+    /// rescues in-flight streams, and watching it here too would give it two
+    /// independent opinions about the same instance.
+    pub async fn maintain_instances(&self) {
+        let Some(list) = Self::main_node_list().await else {
+            // Unusable probe: no evidence, so nothing is counted or restarted.
+            return;
+        };
+        for role in ["voice", "sidetone"] {
+            // A role whose conf publishes no node is legitimately doing nothing,
+            // so it is not watched at all rather than being reported as failed.
+            let Some(node) = expected_node(role) else {
+                self.set_role_health(role, RoleHealth::default());
+                continue;
+            };
+            let outcome = if node_list_has_node(&list, &node) {
+                ChainProbe::Present
+            } else {
+                ChainProbe::Absent
+            };
+            let previous = self.role_health(role);
+            let (next, action) = role_health_action(true, outcome, previous);
+            self.set_role_health(role, next);
+            if let RoleAction::Absent { restart: true } = action {
+                // Rate limited by the cadence inside the state machine, so this
+                // logs once per outage and then on the slow heartbeat rather
+                // than on every poll.
+                warn!(
+                    "epos instance {role}: node '{node}' absent - requesting \
+                     pipewire-epos@{role} restart"
+                );
+                self.restarts.request(role);
+            }
+        }
+    }
+
+    /// The current watchdog state for `role`, defaulting for a role seen first
+    /// time.
+    fn role_health(&self, role: &str) -> RoleHealth {
+        self.role_health
+            .lock()
+            .unwrap()
+            .get(role)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn set_role_health(&self, role: &str, state: RoleHealth) {
+        self.role_health
+            .lock()
+            .unwrap()
+            .insert(role.to_string(), state);
     }
 
     /// Move every stream currently attached to the EQ anchor onto the raw EPOS
@@ -590,12 +670,13 @@ impl AudioPipeline {
         probe_outcome(&result, node)
     }
 
-    /// Is the EQ chain actually usable?
+    /// Every node the MAIN graph publishes, or `None` when the listing could not
+    /// be fetched.
     ///
-    /// Both ends must be published. One probe covers both names, and a probe
-    /// that failed is `Unknown` even if the other name happens to be listed:
-    /// an unusable probe is not evidence either way.
-    async fn eq_chain_probe(&self) -> ChainProbe {
+    /// `None` must never be read as "nothing is there". It means the tool timed
+    /// out or could not start, which is not evidence about any node — the
+    /// distinction the whole watchdog rests on.
+    async fn main_node_list() -> Option<String> {
         match run_probe(
             "pw-cli",
             &["-r", "pipewire-0", "ls", "Node"],
@@ -603,8 +684,20 @@ impl AudioPipeline {
         )
         .await
         {
-            Probe::TimedOut | Probe::SpawnFailed(_) => ChainProbe::Unknown,
-            Probe::Ran(list) => {
+            Probe::Ran(list) => Some(list),
+            Probe::TimedOut | Probe::SpawnFailed(_) => None,
+        }
+    }
+
+    /// Is the EQ chain actually usable?
+    ///
+    /// Both ends must be published. One probe covers both names, and a probe
+    /// that failed is `Unknown` even if the other name happens to be listed:
+    /// an unusable probe is not evidence either way.
+    async fn eq_chain_probe(&self) -> ChainProbe {
+        match Self::main_node_list().await {
+            None => ChainProbe::Unknown,
+            Some(list) => {
                 let capture = node_list_has_node(&list, EQ_CAPTURE_NAME);
                 let output = node_list_has_node(&list, EQ_OUTPUT_NAME);
                 match (capture, output) {
@@ -1449,12 +1542,12 @@ const EQ_OUTPUT_NAME: &str = "epos-eq-output";
 /// Consecutive healthy polls required before a previous failure is forgotten.
 /// One good poll is not enough, otherwise a flapping chain resets the miss
 /// counter and defeats the retry cadence.
-const EQ_RECOVERY_POLLS: u32 = 2;
+const RECOVERY_POLLS: u32 = 2;
 
 /// After the first conclusive absence, ask for an instance restart on this poll
-/// and then every `EQ_RESTART_RETRY_POLLS` polls. 6 polls = 30 s, so a chain
+/// and then every `RESTART_RETRY_POLLS` polls. 6 polls = 30 s, so a chain
 /// that cannot start is retried without becoming a restart storm.
-const EQ_RESTART_RETRY_POLLS: u32 = 6;
+const RESTART_RETRY_POLLS: u32 = 6;
 
 /// What a liveness probe can tell us.
 ///
@@ -1532,12 +1625,101 @@ pub(crate) fn eq_route_decision(outcome: ChainProbe, missing_polls: u32) -> EqRo
         },
         ChainProbe::Absent => EqRouteDecision {
             action: EqRouteAction::FallBackToRaw,
-            // First attempt immediately, then every `EQ_RESTART_RETRY_POLLS`
+            // First attempt immediately, then every `RESTART_RETRY_POLLS`
             // polls (1, 7, 13, ...). Restarting the same broken instance every
             // 5 s would be a storm; never restarting leaves the EQ dead.
-            request_restart: missing_polls == 1
-                || (missing_polls - 1) % EQ_RESTART_RETRY_POLLS == 0,
+            request_restart: restart_due(missing_polls),
         },
+    }
+}
+
+/// Is this poll one that should ask for an instance restart?
+///
+/// The first conclusive absence acts immediately — a DSP path that is gone is
+/// a feature that is silently not working — and then every
+/// `RESTART_RETRY_POLLS` polls after that, so an instance that cannot start is
+/// retried without becoming a restart storm.
+///
+/// Shared by the EQ route decision and the per-role watchdog so the cadence has
+/// exactly one definition; a second copy is how two watchers drift apart.
+fn restart_due(missing_polls: u32) -> bool {
+    missing_polls >= 1 && (missing_polls - 1) % RESTART_RETRY_POLLS == 0
+}
+
+/// Per-role watchdog state: how many consecutive polls have said this role's
+/// node is gone, and how many consecutive good polls have followed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RoleHealth {
+    /// Consecutive conclusive absences. Drives the restart cadence.
+    pub missing_polls: u32,
+    /// Consecutive healthy polls since the last absence, never reaching
+    /// `RECOVERY_POLLS` (it resets the state instead of overshooting).
+    pub healthy_polls: u32,
+}
+
+/// What the per-role watchdog decided on one poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RoleAction {
+    /// The role's generated conf publishes no node, so there is nothing to
+    /// watch and no state to keep.
+    NotWatched,
+    /// The probe could not run: no evidence either way, so nothing moves.
+    Inconclusive,
+    /// The role's node is published.
+    Present,
+    /// The role's node is conclusively gone. `restart` is true only on the retry
+    /// cadence, so a role that stays broken is retried slowly rather than every
+    /// poll.
+    Absent { restart: bool },
+}
+
+/// Advance one role's watchdog by a single poll.
+///
+/// Pure policy, no I/O, so the behaviour that matters — when a restart is asked
+/// for, and what a failed probe is allowed to do — is testable without PipeWire.
+/// The EQ has its own route actions layered on top of the same counters
+/// ([`eq_route_decision`]); `voice` and `sidetone` need nothing beyond this.
+pub(crate) fn role_health_action(
+    watched: bool,
+    outcome: ChainProbe,
+    state: RoleHealth,
+) -> (RoleHealth, RoleAction) {
+    if !watched {
+        // Clear the state rather than keeping it: a role that is switched off
+        // and on again must not inherit an old failure and restart immediately.
+        return (RoleHealth::default(), RoleAction::NotWatched);
+    }
+    match outcome {
+        // An unusable probe is not evidence. Moving either counter here would
+        // let a `pw-cli` hiccup fabricate a failure, and would also let a
+        // transient failure delay the real restart.
+        ChainProbe::Unknown => (state, RoleAction::Inconclusive),
+        ChainProbe::Present => {
+            let healthy = state.healthy_polls + 1;
+            if healthy >= RECOVERY_POLLS {
+                (RoleHealth::default(), RoleAction::Present)
+            } else {
+                (
+                    RoleHealth {
+                        missing_polls: state.missing_polls,
+                        healthy_polls: healthy,
+                    },
+                    RoleAction::Present,
+                )
+            }
+        }
+        ChainProbe::Absent => {
+            let missing = state.missing_polls + 1;
+            (
+                RoleHealth {
+                    missing_polls: missing,
+                    healthy_polls: 0,
+                },
+                RoleAction::Absent {
+                    restart: restart_due(missing),
+                },
+            )
+        }
     }
 }
 
@@ -2460,7 +2642,7 @@ mod tests {
     #[test]
     fn recovery_needs_more_than_one_clean_poll() {
         assert!(
-            EQ_RECOVERY_POLLS > 1,
+            RECOVERY_POLLS > 1,
             "one good poll resetting the miss counter lets a flapping chain \
              restart repeatedly"
         );
@@ -2476,5 +2658,123 @@ mod tests {
         assert!(!node_list_has_node(list, "epos-eq-output"));
         assert!(!node_list_has_node(list, "epos-eq"));
         assert!(!node_list_has_node(list, ""));
+    }
+
+    // ── Per-role watchdog: every DSP path must survive a MAIN restart ─────
+    //
+    // Measured on this machine: restarting the MAIN `pipewire.service` drops
+    // every cross-daemon instance's link to it. The EQ chain came back on its
+    // own because `maintain_eq` watches it. `voice` and `sidetone` did NOT:
+    // their nodes stayed absent for as long as they were left alone, with no log
+    // line and no restart — so with a voice mode and sidetone enabled the
+    // microphone processing and the sidetone were silently dead after any MAIN
+    // restart, and only came back when the user happened to change a setting.
+    // Both units reported `active` throughout, which is exactly why the status
+    // looked healthy.
+    //
+    // The discipline the EQ watchdog already proved applies to every role, so the
+    // policy is one pure state machine and the roles are just its inputs.
+
+    /// A role whose conf publishes no node has nothing to watch. Demanding a node
+    /// from a passthrough instance would report a permanent false failure and
+    /// restart it forever.
+    #[test]
+    fn a_role_with_no_expected_node_is_never_watched() {
+        let (state, action) = role_health_action(
+            false,
+            ChainProbe::Absent,
+            RoleHealth {
+                missing_polls: 5,
+                healthy_polls: 0,
+            },
+        );
+        assert_eq!(action, RoleAction::NotWatched);
+        assert_eq!(
+            state,
+            RoleHealth::default(),
+            "an unwatched role must not carry failure state forward, or it would \
+             look stale the moment it is enabled again"
+        );
+    }
+
+    /// A probe that timed out or could not spawn is not evidence. It must move
+    /// neither counter, so a `pw-cli` hiccup cannot fabricate a failure and
+    /// cannot mask a real one.
+    #[test]
+    fn an_unusable_probe_leaves_role_state_untouched() {
+        let before = RoleHealth {
+            missing_polls: 3,
+            healthy_polls: 1,
+        };
+        let (state, action) = role_health_action(true, ChainProbe::Unknown, before);
+        assert_eq!(action, RoleAction::Inconclusive);
+        assert_eq!(
+            state, before,
+            "an unusable probe must leave the miss count and the healthy streak \
+             exactly as they were"
+        );
+    }
+
+    /// A confirmed absence is acted on at once and then retried slowly: the first
+    /// poll, then every `RESTART_RETRY_POLLS` polls. Restarting a broken instance
+    /// every 5 s is a storm; never restarting leaves the role dead.
+    #[test]
+    fn a_confirmed_absence_restarts_on_a_slow_cadence() {
+        let mut state = RoleHealth::default();
+        for miss in 1..=13u32 {
+            let (next, action) = role_health_action(true, ChainProbe::Absent, state);
+            let RoleAction::Absent { restart } = action else {
+                panic!("miss {miss}: expected Absent, got {action:?}");
+            };
+            assert_eq!(
+                restart,
+                miss == 1 || (miss - 1) % RESTART_RETRY_POLLS == 0,
+                "miss {miss}: first absence, then a slow heartbeat"
+            );
+            assert_eq!(next.missing_polls, miss, "the miss count must advance");
+            assert_eq!(next.healthy_polls, 0, "an absence clears the streak");
+            state = next;
+        }
+    }
+
+    /// A single healthy poll must not forget a failure, or a flapping role defeats
+    /// the retry cadence and restarts on every other cycle.
+    #[test]
+    fn role_recovery_needs_consecutive_clean_polls() {
+        let failed = RoleHealth {
+            missing_polls: 4,
+            healthy_polls: 0,
+        };
+        let (one, action) = role_health_action(true, ChainProbe::Present, failed);
+        assert_eq!(action, RoleAction::Present);
+        assert_eq!(
+            one.missing_polls, 4,
+            "one good poll must not erase the failure"
+        );
+        assert_eq!(one.healthy_polls, 1);
+        let (two, _) = role_health_action(true, ChainProbe::Present, one);
+        assert_eq!(
+            two,
+            RoleHealth::default(),
+            "{} consecutive clean polls clear the failure state",
+            RECOVERY_POLLS
+        );
+    }
+
+    /// The healthy streak must not run away between failures, or a role that is
+    /// briefly absent every few hours would take many polls to forget.
+    #[test]
+    fn the_healthy_streak_is_capped_at_the_recovery_threshold() {
+        let mut state = RoleHealth::default();
+        for _ in 0..(RECOVERY_POLLS * 10) {
+            let (next, action) = role_health_action(true, ChainProbe::Present, state);
+            assert_eq!(action, RoleAction::Present);
+            state = next;
+            assert!(
+                state.healthy_polls < RECOVERY_POLLS,
+                "the streak must reset once it reaches the threshold, not grow \
+                 forever"
+            );
+        }
     }
 }
