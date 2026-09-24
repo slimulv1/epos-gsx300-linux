@@ -613,6 +613,11 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
                 if let Err(e) = st.audio.route_output().await {
                     warn!("Failed to route output on reconnect: {}", e);
                 }
+                // Same for the capture side: the voice chain is rebuilt on
+                // reconnect, so re-point the default source at the fresh node.
+                if let Err(e) = st.audio.route_input().await {
+                    warn!("Failed to route input on reconnect: {}", e);
+                }
                 // Restore host-side dial volume onto the real sink so the
                 // knob position matches the actual output level after (re)plug.
                 let vol = st.volume.load(std::sync::atomic::Ordering::Relaxed);
@@ -675,11 +680,26 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
                     if let Err(e) = st.audio.route_output().await {
                         warn!("Failed to route output on boot: {}", e);
                     }
+                    // And the capture route, for the same reason: a persisted
+                    // voice mode must be live from the first poll, not only
+                    // after the user toggles something.
+                    if let Err(e) = st.audio.route_input().await {
+                        warn!("Failed to route input on boot: {}", e);
+                    }
                     continue;
                 }
             }
             if st.device != device {
                 st.device = device;
+            }
+            // Re-assert the capture route on every poll. The processed mic
+            // node only exists once the voice instance has restarted and
+            // published it, which happens after this branch's earlier work, so
+            // a one-shot call at connect time would find nothing and never be
+            // retried. route_input() exits cheaply when the default is already
+            // correct, so the steady-state cost is one `pactl get-default-source`.
+            if let Err(e) = st.audio.route_input().await {
+                warn!("Failed to route input: {}", e);
             }
         }
 

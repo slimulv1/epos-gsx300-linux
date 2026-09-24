@@ -169,6 +169,31 @@ fn usable_alsa_card(card: Option<u8>) -> Result<u8> {
     )
 }
 
+/// The virtual source the voice instance publishes into MAIN: raw EPOS mic ->
+/// rnnoise (when the gate is on) -> voice EQ bands -> this node. It is the
+/// node apps must record from for any of that to be audible.
+pub const VOICE_SOURCE_NAME: &str = "epos-voice-output";
+
+/// Which capture source new streams should attach to.
+///
+/// `None` means "do not touch the default" — either nothing is enabled, the
+/// headset is absent, or the processed node is not currently published. The
+/// last case matters most: pointing the default source at a node that does not
+/// exist turns "no voice processing" into "no microphone at all".
+pub fn desired_input_route(
+    voice_active: bool,
+    noise_gate: bool,
+    device_connected: bool,
+    processed_node_present: bool,
+) -> Option<&'static str> {
+    if !device_connected {
+        return None;
+    }
+    (voice_active || noise_gate)
+        .then_some(VOICE_SOURCE_NAME)
+        .filter(|_| processed_node_present)
+}
+
 impl AudioPipeline {
     pub fn new(config: &AudioConfig) -> Self {
         let mut pipeline = Self {
@@ -360,6 +385,99 @@ impl AudioPipeline {
         }
         let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
         (!name.is_empty()).then_some(name)
+    }
+
+    async fn read_default_source() -> Option<String> {
+        let out = tokio::process::Command::new("pactl")
+            .args(["get-default-source"])
+            .output()
+            .await
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// Is a node currently published in the MAIN graph?
+    ///
+    /// Reuses the capped `pw-dump` probe, so this cannot wedge the caller.
+    async fn main_graph_has_node(node: &str) -> bool {
+        matches!(
+            run_probe("pw-dump", &["-r", "pipewire-0"], PROBE_BUDGET).await,
+            Probe::Ran(dump) if dump_has_node(&dump, node)
+        )
+    }
+
+    /// Point the default capture source at the processed mic when voice work
+    /// is enabled, and back to the raw device when it is not.
+    ///
+    /// Fail-closed in both directions: the processed node must actually be
+    /// published before it becomes the default (otherwise every app loses its
+    /// microphone), and when processing is switched off the raw source is
+    /// restored so nothing is left pointing at a node that may go away.
+    pub async fn route_input(&self) -> Result<bool> {
+        let device_connected = self
+            .device
+            .as_ref()
+            .is_some_and(|d| !d.pipewire_source.is_empty());
+        let voice_active = self.config.voice_enhancer.mode != VoiceMode::Off;
+        let noise_gate = self.config.noise_gate.enabled;
+        let processing = voice_active || noise_gate;
+
+        // Cheap exit first: this runs on the 5 s poll, so when the default is
+        // already correct we must not spawn a pw-dump. The processed node only
+        // exists once the voice instance has restarted and published it, which
+        // is why this is re-asserted on every poll rather than only on change.
+        let current = Self::read_default_source().await;
+        if processing && current.as_deref() == Some(VOICE_SOURCE_NAME) {
+            return Ok(false);
+        }
+        if !processing && current.as_deref() == self.device.as_ref().map(|d| d.pipewire_source.as_str())
+        {
+            return Ok(false);
+        }
+
+        let processed_present = Self::main_graph_has_node(VOICE_SOURCE_NAME).await;
+        let Some(target) = desired_input_route(
+            voice_active,
+            noise_gate,
+            device_connected,
+            processed_present,
+        ) else {
+            // Nothing to route to. If we had been pointing at the processed
+            // node and it is gone, fall back to the raw device so the user is
+            // not left with a dead default source.
+            if current.as_deref() == Some(VOICE_SOURCE_NAME) {
+                if let Some(raw) = self.device.as_ref().map(|d| d.pipewire_source.as_str()) {
+                    if !raw.is_empty() {
+                        Self::set_default_source(raw).await?;
+                        warn!("Processed mic disappeared — default source restored to {raw}");
+                        return Ok(true);
+                    }
+                }
+            }
+            return Ok(false);
+        };
+        Self::set_default_source(target).await?;
+        info!("Input routed to {target} (voice processing active)");
+        Ok(true)
+    }
+
+    async fn set_default_source(source: &str) -> Result<()> {
+        let output = tokio::process::Command::new("pactl")
+            .args(["set-default-source", source])
+            .output()
+            .await
+            .context("Failed to run pactl set-default-source")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "pactl set-default-source {source} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
     }
 
     /// Align the default sink with the EQ toggle. Returns true if it changed.
@@ -668,6 +786,7 @@ fn generate_eq_instance_conf(bands: &[epos_shared::config::EqBand], sink: &str) 
         r#"
     {{ name = libpipewire-module-filter-chain
       args = {{
+        remote.name = "pipewire-0"
         node.description = "EPOS GSX 300 EQ"
         media.name = "EPOS GSX 300 EQ"
         filter.graph = {{
@@ -682,13 +801,13 @@ fn generate_eq_instance_conf(bands: &[epos_shared::config::EqBand], sink: &str) 
             node.name = "epos-eq-capture"
             target.object = "epos-eq-input.monitor"
             remote.name = "pipewire-0"
-            node.passive = true
+            node.dont-fallback = true
         }}
         playback.props = {{
             node.name = "epos-eq-output"
             target.object = "{sink}"
             remote.name = "pipewire-0"
-            node.passive = true
+            node.dont-fallback = true
         }}
       }} }}
 "#,
@@ -777,6 +896,7 @@ fn generate_voice_instance_conf(
         r#"
     {{ name = libpipewire-module-filter-chain
       args = {{
+        remote.name = "pipewire-0"
         node.description = "EPOS GSX 300 Voice Chain"
         media.name = "EPOS GSX 300 Voice Chain"
         filter.graph = {{
@@ -792,12 +912,13 @@ fn generate_voice_instance_conf(
             target.object = "{source}"
             media.class = Stream/Input/Audio
             remote.name = "pipewire-0"
-            node.passive = true
+            node.dont-fallback = true
         }}
         playback.props = {{
             node.name = "epos-voice-output"
             media.class = Audio/Source
             remote.name = "pipewire-0"
+            node.dont-fallback = true
         }}
       }} }}
 "#,
@@ -1489,5 +1610,120 @@ mod tests {
         cfg.mic_gain = 5_000;
         let pipeline = AudioPipeline::new(&cfg);
         assert_eq!(pipeline.config.mic_gain, 100);
+    }
+
+    // ── The filter-chain instances must actually join the MAIN graph ───────
+    //
+    // `epos-eq` and `epos-voice` are filter-chain modules in a separate,
+    // software-only daemon. Two properties decided whether they existed
+    // outside it at all, and both were wrong for every reason the features
+    // looked enabled:
+    //
+    // 1. `remote.name` must sit at the **module args** level. With it only
+    //    inside `capture.props`/`playback.props`, the module's streams
+    //    connected back to their own daemon instead of `pipewire-0`
+    //    (`mod.protocol-native: connecting to 'pipewire-epos-eq'`) and the
+    //    nodes stayed `suspended`/`unconnected`, publishing nothing to MAIN.
+    // 2. `node.passive = true` stops the chain from ever being linked, so
+    //    even once present it sat at `suspended` while audio played into
+    //    it. `node.dont-fallback` is the correct fail-closed tool: verified
+    //    `running` with it, and it still refuses to fall back to another
+    //    device when the target vanishes. `node.dont-reconnect` is
+    //    deliberately NOT set: it also gives up when the intended target
+    //    merely appears a moment late (e.g. right after a replug), which is
+    //    a normal startup race rather than a failure.
+
+    fn sample_filter_chain_confs() -> [(&'static str, String); 2] {
+        [
+            ("eq", generate_eq_instance_conf(&[], "sink")),
+            (
+                "voice",
+                generate_voice_instance_conf("source", false, 50.0, &VoiceMode::Off, &[]),
+            ),
+        ]
+    }
+
+    /// Module-level `remote.name`, exactly like the loopback sidetone has.
+    #[test]
+    fn filter_chain_conf_names_the_main_remote_at_module_level() {
+        for (role, conf) in sample_filter_chain_confs() {
+            let after_module = conf
+                .split("libpipewire-module-filter-chain")
+                .nth(1)
+                .unwrap_or_else(|| panic!("{role}: no filter-chain module"));
+            let before_capture = after_module
+                .split("capture.props")
+                .next()
+                .expect("split always yields a head");
+            assert!(
+                before_capture.contains("remote.name = \"pipewire-0\""),
+                "{role}: remote.name must be at module args level, not only inside \
+                 capture.props/playback.props - otherwise the module connects to \
+                 its own daemon and publishes nothing to MAIN"
+            );
+        }
+    }
+
+    /// `node.passive` must not come back: it silently disables the chain.
+    #[test]
+    fn filter_chain_conf_never_marks_itself_passive() {
+        for (role, conf) in sample_filter_chain_confs() {
+            assert!(
+                !conf.contains("node.passive"),
+                "{role}: node.passive prevents the chain from ever linking"
+            );
+            assert!(
+                conf.contains("node.dont-fallback = true"),
+                "{role}: fail-closed must use node.dont-fallback"
+            );
+        }
+    }
+
+    // ── Routing the capture path ──────────────────────────────────────────
+    //
+    // The voice chain builds `epos-voice-output` in MAIN (rnnoise + voice EQ).
+    // Until it is the default source, every app keeps using the raw EPOS mic
+    // and the whole chain is dead weight: the UI says "Warm" and the audio is
+    // untouched. Routing must also be fail-closed — if the processed node is
+    // not actually published, pointing the default at it would leave the user
+    // with no working microphone at all.
+
+    /// Voice processing active -> the processed source.
+    #[test]
+    fn processed_mic_is_desired_when_voice_work_is_on() {
+        assert_eq!(
+            desired_input_route(true, false, true, true).as_deref(),
+            Some(VOICE_SOURCE_NAME)
+        );
+        assert_eq!(
+            desired_input_route(false, true, true, true).as_deref(),
+            Some(VOICE_SOURCE_NAME),
+            "the noise gate alone also needs the processed source"
+        );
+    }
+
+    /// Nothing enabled -> stay on the raw mic.
+    #[test]
+    fn raw_mic_is_desired_when_no_voice_work_is_on() {
+        assert_eq!(desired_input_route(false, false, true, true), None);
+    }
+
+    /// The processed node missing from MAIN must never become the default:
+    /// that is the difference between "no processing" and "no microphone".
+    #[test]
+    fn processed_mic_is_not_desired_when_the_node_is_absent() {
+        assert_eq!(
+            desired_input_route(true, false, true, false),
+            None,
+            "routing to a source that does not exist would mute every app"
+        );
+        assert_eq!(desired_input_route(false, true, true, false), None);
+    }
+
+    /// Disconnected: leave the user's current default alone rather than
+    /// forcing a route we cannot honour.
+    #[test]
+    fn no_input_route_is_desired_while_disconnected() {
+        assert_eq!(desired_input_route(true, true, false, true), None);
     }
 }
