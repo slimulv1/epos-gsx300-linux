@@ -185,11 +185,17 @@ async fn main() -> Result<()> {
                             let next = if names.is_empty() {
                                 None
                             } else {
-                                let idx = names
+                                // An unknown/missing active_profile must fall
+                                // back to the FIRST entry. Using usize::MAX
+                                // here and adding 1 overflowed: panic in debug
+                                // builds, wrap-to-0 in release.
+                                let next_idx = match names
                                     .iter()
                                     .position(|n| *n == st.config.active_profile)
-                                    .unwrap_or(usize::MAX);
-                                let next_idx = (idx + 1) % names.len();
+                                {
+                                    Some(i) => (i + 1) % names.len(),
+                                    None => 0,
+                                };
                                 Some(names[next_idx].clone())
                             };
                             if let Some(name) = next {
@@ -876,7 +882,7 @@ fn emit_smart_notify(st: &IpcState) {
     // Build the body byte-for-byte like the GUI: `${active_profile ?? "Flat"} ·
     // ${modeLabel}` where modeLabel is "7.1" for surround/7.1 else "Stereo".
     let profile = if st.config.active_profile.is_empty() {
-        "Flat".to_string()
+        epos_shared::config::FLAT_PROFILE_NAME.to_string()
     } else {
         st.config.active_profile.clone()
     };

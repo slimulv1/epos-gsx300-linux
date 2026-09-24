@@ -2,6 +2,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::led::LedProbeConfig;
 
+/// Canonical name of the always-present neutral profile.
+///
+/// The daemon writes "FLAT" but the checked-in `config/default.json`, the
+/// frontend mock and user-created configs have all used "Flat". Every lookup
+/// must therefore compare case-insensitively against this constant rather than
+/// a hard-coded spelling, otherwise deleting the active profile silently
+/// failed to fall back to the neutral one.
+pub const FLAT_PROFILE_NAME: &str = "FLAT";
+
 /// Audio output mode — controls LED ring color
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -70,7 +79,7 @@ pub struct EqConfig {
     pub bands: Vec<EqBand>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct EqBand {
     pub freq: u32,
     pub gain_db: f32,
@@ -100,13 +109,36 @@ pub struct VoiceEnhancerConfig {
     pub custom_bands: Option<Vec<EqBand>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum VoiceMode {
     Off,
     Warm,
     Clear,
     Custom,
+}
+
+impl VoiceMode {
+    /// Every mode name accepted on the IPC wire, in canonical (lowercase) form.
+    pub const WIRE_NAMES: [&'static str; 4] = ["off", "warm", "clear", "custom"];
+
+    /// Parse a mode name received from an IPC client.
+    ///
+    /// Returns `None` for anything not exactly matching the canonical
+    /// lowercase spelling used by the GUI and by `#[serde(rename_all)]`.
+    /// Callers MUST surface that as an error rather than defaulting: a
+    /// silently substituted mode reads to the user as "the button does
+    /// nothing", which is how a casing typo used to disable the enhancer
+    /// while the daemon still answered `Ok`.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "off" => Some(VoiceMode::Off),
+            "warm" => Some(VoiceMode::Warm),
+            "clear" => Some(VoiceMode::Clear),
+            "custom" => Some(VoiceMode::Custom),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,7 +199,7 @@ impl Default for Config {
                 Profile::movie(),
                 Profile::esport(),
             ],
-            active_profile: "FLAT".into(),
+            active_profile: FLAT_PROFILE_NAME.into(),
             smart_button: SmartButtonConfig {
                 action: SmartButtonAction::ToggleMode,
                 notify_enabled: true,
@@ -255,7 +287,7 @@ impl AudioConfig {
 impl Profile {
     pub fn flat() -> Self {
         Self {
-            name: "FLAT".into(),
+            name: FLAT_PROFILE_NAME.into(),
             mode: AudioMode::Stereo,
             audio: AudioConfig::default(),
             created_at: "2026-09-09".into(),
@@ -439,6 +471,64 @@ impl Profile {
             mode: AudioMode::Stereo,
             audio,
             created_at: "2026-09-09".into(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The four mode names the GUI actually sends must all parse. This is the
+    /// contract between the Vue buttons and the daemon; breaking it disables
+    /// the enhancer.
+    #[test]
+    fn every_canonical_mode_name_parses() {
+        for name in VoiceMode::WIRE_NAMES {
+            assert!(
+                VoiceMode::from_wire(name).is_some(),
+                "canonical mode '{}' must parse",
+                name
+            );
+        }
+    }
+
+    /// Round-trip: every parsed mode must serialise back to the exact same
+    /// lowercase name. Guards against serde and from_wire drifting apart.
+    #[test]
+    fn mode_round_trips_through_serde() {
+        for name in VoiceMode::WIRE_NAMES {
+            let parsed = VoiceMode::from_wire(name).expect("canonical name parses");
+            let json = serde_json::to_string(&parsed).expect("serialises");
+            assert_eq!(json, format!("\"{}\"", name));
+            let back: VoiceMode = serde_json::from_str(&json).expect("deserialises");
+            assert_eq!(back, parsed);
+        }
+    }
+
+    /// A casing typo must be REJECTED, not silently coerced. "Warm" used to
+    /// fall through to a default that disabled the enhancer while the daemon
+    /// still answered Ok, so the button looked set but did nothing.
+    #[test]
+    fn wrong_casing_is_rejected_not_defaulted() {
+        for bad in ["Warm", "WARM", "cLeAr", "Custom", "OFF"] {
+            assert!(
+                VoiceMode::from_wire(bad).is_none(),
+                "'{}' must be rejected so the caller can report an error",
+                bad
+            );
+        }
+    }
+
+    /// Empty / unknown / whitespace-padded names are rejected outright.
+    #[test]
+    fn empty_and_unknown_names_are_rejected() {
+        for bad in ["", " ", " warm", "warm ", "bogus", "warmth", "0"] {
+            assert!(
+                VoiceMode::from_wire(bad).is_none(),
+                "'{}' must not be accepted as a voice mode",
+                bad
+            );
         }
     }
 }

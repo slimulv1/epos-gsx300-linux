@@ -6,6 +6,7 @@ use crate::hwinfo::HwInfo;
 use crate::led::LedController;
 use epos_shared::config::AudioConfig;
 use epos_shared::config::AudioMode;
+use epos_shared::config::FLAT_PROFILE_NAME;
 use epos_shared::ipc::{Request, Response};
 use epos_shared::Config;
 use std::path::PathBuf;
@@ -38,6 +39,45 @@ pub fn request_is_mutation(req: &Request) -> bool {
             | Request::Reload
             | Request::Quit
     )
+}
+
+/// Mirror the live audio config back into the currently-active profile.
+///
+/// Previously the live setters (SetEq / SetVoiceEnhancer / SetNoiseGate /
+/// SetSidetone / SetMicGain) only updated the top-level `config.audio`, leaving
+/// the selected profile's own `audio` stale. Switching to another profile and
+/// back then silently reverted every change the user had made. Treat the
+/// active profile as "the profile you are editing", so live edits stick.
+///
+/// Takes the two pieces separately (rather than `&mut IpcState`) so the rule is
+/// directly testable without constructing a live audio pipeline.
+fn sync_profile_audio(profiles: &mut [epos_shared::Profile], active: &str, live: &AudioConfig) {
+    if active.is_empty() {
+        return;
+    }
+    if let Some(p) = profiles.iter_mut().find(|p| p.name == active) {
+        p.audio = live.clone();
+    }
+}
+
+fn sync_active_profile(state: &mut IpcState) {
+    let active = state.config.active_profile.clone();
+    let live = state.config.audio.clone();
+    sync_profile_audio(&mut state.config.profiles, &active, &live);
+}
+
+/// Apply a new playback EQ to an audio config.
+///
+/// Voice mode `custom` is a *view* of the playback EQ, never an independent
+/// copy. Previously the custom bands were a one-off snapshot taken when the
+/// Custom button was clicked, so every later EQ edit was ignored by the voice
+/// chain and the two silently diverged. Re-deriving here keeps a single source
+/// of truth; non-custom modes are left alone.
+fn apply_eq_to_audio(audio: &mut AudioConfig, eq: epos_shared::config::EqConfig) {
+    audio.eq = eq;
+    if audio.voice_enhancer.mode == epos_shared::config::VoiceMode::Custom {
+        audio.voice_enhancer.custom_bands = Some(audio.eq.bands.clone());
+    }
 }
 
 pub struct IpcState {
@@ -249,7 +289,9 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
         }
         Request::SetEq { eq } => {
             let mut state = state.write().await;
-            state.config.audio.eq = eq.eq;
+            // Voice "custom" is re-derived from the new EQ by apply_eq_to_audio.
+            apply_eq_to_audio(&mut state.config.audio, eq.eq);
+            sync_active_profile(&mut state);
             let audio_cfg = state.config.audio.clone();
             state.audio.update_config(&audio_cfg);
             match state.audio.apply_eq().await {
@@ -272,6 +314,7 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
             let mut state = state.write().await;
             state.config.audio.sidetone.enabled = enabled;
             state.config.audio.sidetone.level = level;
+            sync_active_profile(&mut state);
             let audio_cfg = state.config.audio.clone();
             state.audio.update_config(&audio_cfg);
             if let Err(e) = state.audio.apply_sidetone().await {
@@ -288,6 +331,7 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
             let mut state = state.write().await;
             state.config.audio.noise_gate.enabled = enabled;
             state.config.audio.noise_gate.threshold_db = threshold_db;
+            sync_active_profile(&mut state);
             let audio_cfg = state.config.audio.clone();
             state.audio.update_config(&audio_cfg);
             match state.audio.apply_noise_gate().await {
@@ -303,28 +347,52 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
         }
 
         // --- Voice Enhancer ---
-        Request::SetVoiceEnhancer { mode, custom_bands } => {
+        Request::SetVoiceEnhancer { mode, custom_bands: _ } => {
             let mut state = state.write().await;
             use epos_shared::config::VoiceMode;
-            let voice_mode = match mode.as_str() {
-                "warm" => VoiceMode::Warm,
-                "clear" => VoiceMode::Clear,
-                "custom" => VoiceMode::Custom,
-                _ => VoiceMode::Off,
+            // Reject an unknown mode instead of silently falling back to Off:
+            // a casing typo ("Warm") or a future name would otherwise disable
+            // the enhancer while still answering Ok, which reads as "the
+            // button does nothing".
+            let Some(voice_mode) = VoiceMode::from_wire(&mode) else {
+                return Response::Error {
+                    message: format!(
+                        "Unknown voice enhancer mode '{}' (expected one of: {})",
+                        mode,
+                        VoiceMode::WIRE_NAMES.join(", ")
+                    ),
+                };
             };
             state.config.audio.voice_enhancer.mode = voice_mode;
-            state.config.audio.voice_enhancer.custom_bands = custom_bands;
+            // "Custom" is a VIEW of the playback EQ, not an independent copy.
+            // Ignore whatever the client sent and always derive it from the
+            // current EQ bands, so there is exactly one source of truth and the
+            // value can never drift. SetEq keeps it in sync while Custom is
+            // selected.
+            state.config.audio.voice_enhancer.custom_bands = if voice_mode
+                == epos_shared::config::VoiceMode::Custom
+            {
+                Some(state.config.audio.eq.bands.clone())
+            } else {
+                // Non-custom modes carry no bands; storing stale ones only
+                // invited confusion when switching back.
+                None
+            };
+            sync_active_profile(&mut state);
             let audio_cfg = state.config.audio.clone();
             state.audio.update_config(&audio_cfg);
             match state.audio.apply_voice_enhancer().await {
                 Ok(_changed) => {
                     // DSP confs are seeded per-role (pipewire-epos@voice) by
                     // write_instance_conf, which restarts only that instance.
-                    // MAIN is never touched → Discord keeps mic link to the
-                    // static Audio/Source anchor epos-voice-output (MAIN conf.d
-                    // 51-epos-voice-enhancer.conf in this daemon's install).
+                    // MAIN is never touched, so application mic links stay
+                    // pinned across the instance restart.
                 }
-                Err(e) => warn!("Failed to apply voice enhancer: {}", e),
+                Err(e) => {
+                    return Response::Error {
+                        message: format!("Failed to apply voice enhancer: {}", e),
+                    }
+                }
             }
             Response::Ok
         }
@@ -332,14 +400,22 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
         // --- Mic ---
         Request::SetMicGain { gain } => {
             let mut state = state.write().await;
+            // mic_gain is a UI percentage. The IPC boundary is public (HTTP
+            // bridge on 127.0.0.1 + the Unix socket), so clamp here instead of
+            // trusting the caller: an out-of-range value was previously passed
+            // straight to `amixer` as e.g. "5000%".
+            let gain = gain.min(100);
             state.config.audio.mic_gain = gain;
+            sync_active_profile(&mut state);
             // Sync into the pipeline's config copy — apply_mic_gain reads
             // self.config.mic_gain, and without this the handler applied the
             // previous value instead of the requested one.
             let audio_cfg = state.config.audio.clone();
             state.audio.update_config(&audio_cfg);
             if let Err(e) = state.audio.apply_mic_gain().await {
-                warn!("Failed to apply mic gain: {}", e);
+                return Response::Error {
+                    message: format!("Failed to apply mic gain: {}", e),
+                };
             }
             Response::Ok
         }
@@ -400,8 +476,20 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
         Request::SetActiveProfile { name } => {
             let mut state = state.write().await;
             if let Some(profile) = state.config.profiles.iter().find(|p| p.name == name) {
-                state.config.audio = profile.audio.clone();
+                let profile_audio = profile.audio.clone();
+                let profile_mode = profile.mode;
+                state.config.audio = profile_audio;
                 state.config.active_profile = name;
+                // A profile also carries the audio mode (7.1 for MOVIE/MUSIC,
+                // stereo for FLAT/ESPORT). The smart-button path already
+                // applies it; the GUI path did not, so switching profile from
+                // the GUI left the previous mode (and its LED) in place.
+                state.config.mode = profile_mode;
+                if let Some(ref mut led) = state.led {
+                    if let Err(e) = led.set_mode(profile_mode) {
+                        warn!("Failed to set LED mode on profile switch: {}", e);
+                    }
+                }
                 // Sync the selected profile into the pipeline's own config copy
                 // BEFORE applying — apply_full() reads self.config, so without
                 // this the OLD pipeline config would be applied and the switch
@@ -442,11 +530,16 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
             if state.config.profiles.len() < before {
                 // If we deleted the active profile, fall back to Flat (or first remaining).
                 if state.config.active_profile == name {
+                    // Match the flat profile case-insensitively: Config::default()
+                    // and Profile::flat() use "FLAT", the checked-in
+                    // config/default.json uses "Flat", and a user-created profile
+                    // can use anything. An exact "Flat" match silently missed the
+                    // real default and fell through to an arbitrary profile.
                     let fallback = state
                         .config
                         .profiles
                         .iter()
-                        .find(|p| p.name == "Flat")
+                        .find(|p| p.name.eq_ignore_ascii_case(FLAT_PROFILE_NAME))
                         .or_else(|| state.config.profiles.first())
                         .cloned();
                     if let Some(profile) = fallback {
@@ -469,7 +562,8 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
                     } else {
                         // No profiles left: reset to defaults.
                         state.config.audio = AudioConfig::default();
-                        state.config.active_profile = String::from("Flat");
+                        state.config.active_profile =
+                            epos_shared::config::FLAT_PROFILE_NAME.to_string();
                         let audio_cfg = state.config.audio.clone();
                         state.audio.update_config(&audio_cfg);
                         match state.audio.apply_full().await {
@@ -516,6 +610,14 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
             match config::load() {
                 Ok(new_config) => {
                     state.config = new_config;
+                    // Sync the reloaded config into the pipeline's own copy
+                    // BEFORE applying. apply_full() reads self.config, so
+                    // without this the OLD pipeline config would be applied
+                    // and the reload would be silently ignored while GetEq
+                    // already reports the new values. Same fix as
+                    // SetActiveProfile above.
+                    let audio_cfg = state.config.audio.clone();
+                    state.audio.update_config(&audio_cfg);
                     match state.audio.apply_full().await {
                         Ok(changed) => {
                             if changed {
@@ -704,4 +806,134 @@ async fn process_http_body(
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epos_shared::config::{EqBand, VoiceEnhancerConfig, VoiceMode};
+
+    fn profile(name: &str, mic_gain: u32) -> epos_shared::Profile {
+        let mut audio = AudioConfig::default();
+        audio.mic_gain = mic_gain;
+        epos_shared::Profile {
+            name: name.into(),
+            mode: epos_shared::AudioMode::Stereo,
+            audio,
+            created_at: "2026-01-01".into(),
+        }
+    }
+
+    /// A live edit must land in the profile the user is currently on, so
+    /// switching away and back does not silently undo their work.
+    #[test]
+    fn live_edit_is_written_into_the_active_profile() {
+        let mut profiles = vec![profile("FLAT", 80), profile("MUSIC", 50)];
+        let mut live = AudioConfig::default();
+        live.mic_gain = 37;
+        live.voice_enhancer.mode = VoiceMode::Warm;
+
+        sync_profile_audio(&mut profiles, "MUSIC", &live);
+
+        assert_eq!(profiles[1].audio.mic_gain, 37);
+        assert_eq!(profiles[1].audio.voice_enhancer.mode, VoiceMode::Warm);
+    }
+
+    /// Only the active profile may be touched; the others are presets the user
+    /// did not edit.
+    #[test]
+    fn other_profiles_are_left_untouched() {
+        let mut profiles = vec![profile("FLAT", 80), profile("MUSIC", 50)];
+        let mut live = AudioConfig::default();
+        live.mic_gain = 37;
+
+        sync_profile_audio(&mut profiles, "MUSIC", &live);
+
+        assert_eq!(profiles[0].audio.mic_gain, 80, "FLAT must be unchanged");
+    }
+
+    /// An empty/unknown active-profile name must not panic and must not rewrite
+    /// an arbitrary profile.
+    #[test]
+    fn unknown_active_profile_is_a_no_op() {
+        let mut profiles = vec![profile("FLAT", 80)];
+        let mut live = AudioConfig::default();
+        live.mic_gain = 37;
+
+        sync_profile_audio(&mut profiles, "", &live);
+        sync_profile_audio(&mut profiles, "DOES-NOT-EXIST", &live);
+
+        assert_eq!(profiles[0].audio.mic_gain, 80);
+    }
+
+    /// While Custom is selected, editing the playback EQ must immediately
+    /// change the voice bands. This is the behaviour that was missing: the
+    /// custom bands used to be a frozen snapshot from the moment the button was
+    /// clicked.
+    #[test]
+    fn editing_eq_while_custom_updates_the_voice_bands() {
+        let mut audio = AudioConfig::default();
+        audio.voice_enhancer = VoiceEnhancerConfig {
+            mode: VoiceMode::Custom,
+            custom_bands: None,
+        };
+
+        let new_eq = epos_shared::config::EqConfig {
+            enabled: true,
+            bands: vec![
+                EqBand { freq: 1000, gain_db: 6.0, q: 1.0 },
+                EqBand { freq: 4000, gain_db: -3.0, q: 1.4 },
+            ],
+        };
+        apply_eq_to_audio(&mut audio, new_eq);
+
+        assert_eq!(
+            audio.voice_enhancer.custom_bands,
+            Some(audio.eq.bands.clone()),
+            "custom bands must track the EQ instead of going stale"
+        );
+        assert_eq!(audio.voice_enhancer.custom_bands.unwrap()[0].gain_db, 6.0);
+    }
+
+    /// A second EQ edit must replace the bands, not accumulate or be ignored.
+    #[test]
+    fn repeated_eq_edits_keep_custom_in_step() {
+        let mut audio = AudioConfig::default();
+        audio.voice_enhancer.mode = VoiceMode::Custom;
+
+        for gain in [-1.0f32, 2.0, 4.5] {
+            let eq = epos_shared::config::EqConfig {
+                enabled: true,
+                bands: vec![EqBand { freq: 8000, gain_db: gain, q: 1.0 }],
+            };
+            apply_eq_to_audio(&mut audio, eq);
+            assert_eq!(
+                audio.voice_enhancer.custom_bands.as_ref().unwrap()[0].gain_db,
+                gain,
+                "custom must follow every successive EQ edit"
+            );
+        }
+    }
+
+    /// When the voice mode is NOT custom, editing the EQ must not invent voice
+    /// bands — Warm/Clear are fixed presets and Off has none.
+    #[test]
+    fn non_custom_modes_do_not_get_eq_derived_bands() {
+        for mode in [VoiceMode::Off, VoiceMode::Warm, VoiceMode::Clear] {
+            let mut audio = AudioConfig::default();
+            audio.voice_enhancer = VoiceEnhancerConfig {
+                mode,
+                custom_bands: None,
+            };
+            let eq = epos_shared::config::EqConfig {
+                enabled: true,
+                bands: vec![EqBand { freq: 1000, gain_db: 5.0, q: 1.0 }],
+            };
+            apply_eq_to_audio(&mut audio, eq);
+            assert!(
+                audio.voice_enhancer.custom_bands.is_none(),
+                "{mode:?} must not accumulate EQ-derived bands"
+            );
+        }
+    }
 }

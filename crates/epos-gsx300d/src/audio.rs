@@ -2,6 +2,7 @@ use anyhow::Result;
 use epos_shared::config::{AudioConfig, VoiceMode};
 use epos_shared::device::DeviceInfo;
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -25,6 +26,10 @@ pub struct AudioPipeline {
     config: AudioConfig,
     device: Option<DeviceInfo>,
     pub restarts: Arc<RestartBus>,
+    /// Monotonic counter bumped by every `apply_full()`. The delayed mic-gain
+    /// reapply task captures its epoch and aborts if a newer apply has since
+    /// started, so a stale task can never overwrite a newer gain value.
+    gain_epoch: Arc<AtomicU64>,
 }
 
 /// Debounced restart bus: audio handlers record which epos instance(s) changed
@@ -62,12 +67,55 @@ impl Default for RestartBus {
     }
 }
 
+/// Hard limits for every EQ / voice band interpolated into a generated
+/// PipeWire config. They are deliberately conservative: the values are written
+/// verbatim into a config file that PipeWire parses, so a malformed, stale, or
+/// hostile config must never be able to inject NaN/Inf, a zero/negative
+/// frequency, a runaway Q, or enough bands to exhaust the per-instance
+/// `MemoryMax=64M / TasksMax=32` budget and silence the audio path.
+pub const BAND_FREQ_MIN_HZ: f32 = 20.0;
+pub const BAND_FREQ_MAX_HZ: f32 = 20_000.0;
+pub const BAND_Q_MIN: f32 = 0.1;
+pub const BAND_Q_MAX: f32 = 30.0;
+pub const BAND_GAIN_LIMIT_DB: f32 = 24.0;
+/// Bands flatter than this are no-ops and are dropped entirely.
+pub const BAND_GAIN_EPSILON_DB: f32 = 0.1;
+pub const MAX_EQ_BANDS: usize = 32;
+
+/// Normalise a band list into the `(freq, gain_db, q)` tuples that are safe to
+/// interpolate into a generated PipeWire config.
+///
+/// - non-finite gain/Q are dropped (NaN/Inf would be written out verbatim)
+/// - frequencies outside the audible band are dropped
+/// - gain and Q are clamped into safe ranges rather than dropped
+/// - flat bands and bands past `MAX_EQ_BANDS` are dropped
+pub fn sanitize_bands(bands: &[epos_shared::config::EqBand]) -> Vec<(u32, f32, f32)> {
+    let mut out = Vec::with_capacity(bands.len().min(MAX_EQ_BANDS));
+    for b in bands.iter().take(MAX_EQ_BANDS) {
+        if !b.gain_db.is_finite() || !b.q.is_finite() {
+            continue;
+        }
+        let freq = b.freq as f32;
+        if freq < BAND_FREQ_MIN_HZ || freq > BAND_FREQ_MAX_HZ {
+            continue;
+        }
+        let gain = b.gain_db.clamp(-BAND_GAIN_LIMIT_DB, BAND_GAIN_LIMIT_DB);
+        if gain.abs() < BAND_GAIN_EPSILON_DB {
+            continue;
+        }
+        let q = b.q.clamp(BAND_Q_MIN, BAND_Q_MAX);
+        out.push((b.freq, gain, q));
+    }
+    out
+}
+
 impl AudioPipeline {
     pub fn new(config: &AudioConfig) -> Self {
         Self {
             config: config.clone(),
             device: None,
             restarts: Arc::new(RestartBus::new()),
+            gain_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -95,10 +143,25 @@ impl AudioPipeline {
         // couple of seconds after this setup runs. That overwrites the
         // numid=4 Mic Capture Volume we just set. Re-apply the gain once
         // the node activation has settled so our value wins.
+        //
+        // Guarded by an epoch: a NEWER apply_full() (a gain change, a profile
+        // switch, a reload) bumps the epoch, and this task then aborts. Without
+        // it, changing the gain within the 4s window let this stale task
+        // re-apply the OLD value, silently reverting the user's newer setting.
+        let epoch = self.gain_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         let gain = self.config.mic_gain;
         let device = self.device.clone();
+        let gain_epoch = Arc::clone(&self.gain_epoch);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(4)).await;
+            if gain_epoch.load(Ordering::SeqCst) != epoch {
+                debug!(
+                    "Skipping stale mic-gain reapply (epoch {} superseded by {})",
+                    epoch,
+                    gain_epoch.load(Ordering::SeqCst)
+                );
+                return;
+            }
             if let Some(dev) = device {
                 let _ = apply_mic_gain_oneshot(&dev, gain).await;
             }
@@ -199,9 +262,19 @@ impl AudioPipeline {
     }
 
     /// Apply EQ from config — write the eq instance conf.
-    /// Returns true if the on-disk conf changed (restart needed).
+    ///
+    /// Also regenerates the voice instance conf, because voice mode `custom`
+    /// mirrors these same bands. Without this the stored custom_bands were
+    /// updated correctly while the running voice filter-chain kept the old
+    /// values, so the UI showed the new EQ but the mic sounded unchanged.
+    ///
+    /// Returns true if either on-disk conf changed (restart needed).
     pub async fn apply_eq(&mut self) -> Result<bool> {
-        self.write_eq_conf()
+        let mut changed = self.write_eq_conf()?;
+        if self.config.voice_enhancer.mode == VoiceMode::Custom {
+            changed |= self.write_voice_conf()?;
+        }
+        Ok(changed)
     }
 
     // ─── Voice + Noise Gate (pipewire-epos@voice) ──────────────
@@ -231,13 +304,11 @@ impl AudioPipeline {
                     (4000, 4.0, 0.8),
                     (6000, 3.0, 1.2),
                 ],
-                VoiceMode::Custom => ve
-                    .custom_bands
-                    .unwrap_or_default()
-                    .iter()
-                    .filter(|b| b.gain_db.abs() >= 0.1)
-                    .map(|b| (b.freq, b.gain_db, b.q))
-                    .collect(),
+                VoiceMode::Custom => {
+                    // Sanitised: custom bands arrive straight from the client
+                    // (and from config.json), so they are untrusted input.
+                    sanitize_bands(ve.custom_bands.as_deref().unwrap_or(&[]))
+                }
                 VoiceMode::Off => Vec::new(),
             };
             (
@@ -400,10 +471,8 @@ fn generate_eq_instance_conf(bands: &[epos_shared::config::EqBand], sink: &str) 
     let mut prev: Option<String> = None;
     let mut active = 0usize;
 
-    for (i, band) in bands.iter().enumerate() {
-        if band.gain_db.abs() < 0.1 {
-            continue;
-        }
+    // Sanitised: the EQ bands arrive from the client and from config.json.
+    for (i, (freq, gain, q)) in sanitize_bands(bands).into_iter().enumerate() {
         let name = format!("eq_band_{i}");
         nodes.push_str(&format!(
             r#"
@@ -413,9 +482,9 @@ fn generate_eq_instance_conf(bands: &[epos_shared::config::EqBand], sink: &str) 
                         label = bq_peaking
                         control = {{ "Freq" = {freq} "Q" = {q} "Gain" = {gain} }}
                     }}"#,
-            freq = band.freq,
-            q = band.q,
-            gain = band.gain_db,
+            freq = freq,
+            q = q,
+            gain = gain,
         ));
         if let Some(p) = prev.take() {
             links.push_str(&format!(
@@ -633,12 +702,18 @@ pub(crate) async fn restart_epos_instance(role: &str) -> bool {
     }
 
     // Health check: the instance must be up AND its control socket reachable
-    // (`pw-cli -r pipewire-epos-<role> info 0`). A conf parse/module error
-    // makes the daemon exit → systemd crash-loop → unit inactive, so
-    // reachability implies the generated conf loaded cleanly. Never touches
-    // the main instance.
+    // (`pw-cli -r pipewire-epos-<role> info 0`) AND actually publish the DSP
+    // node this role exists to provide.
+    //
+    // Socket-only checking was not enough: an instance can be perfectly
+    // reachable while its filter-chain module failed to register (a bad
+    // generated conf, a missing LADSPA plugin such as rnnoise, a taken node
+    // name). The audio path is then silent while the daemon reports success,
+    // which is exactly the "the button does nothing" failure mode. Verifying
+    // the node exists closes that gap. Never touches the main instance.
     for attempt in 0..3 {
-        if instance_reachable(role).await {
+        if instance_reachable(role).await && instance_node_present(role, role_node_name(role)).await
+        {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(700)).await;
@@ -658,6 +733,41 @@ async fn instance_reachable(role: &str) -> bool {
         .await
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// The node each role must publish into the MAIN graph for its DSP path to be
+/// usable. Used by the post-restart health check.
+fn role_node_name(role: &str) -> &'static str {
+    match role {
+        "voice" => "epos-voice-output",
+        "eq" => "epos-eq-input",
+        "sidetone" => "epos-sidetone",
+        // RestartBus::request asserts role ∈ {eq, voice, sidetone}; keep a
+        // total match so this can never panic on a new role.
+        _ => "",
+    }
+}
+
+/// Does the epos instance actually publish `node` into the main graph?
+///
+/// Queried against the MAIN instance (`-r pipewire-0`) on purpose: the nodes
+/// are published cross-instance by design, so asking the per-role instance
+/// would not prove the application-visible path exists.
+async fn instance_node_present(role: &str, node: &str) -> bool {
+    if node.is_empty() {
+        return false;
+    }
+    match tokio::process::Command::new("pw-cli")
+        .args(["-r", "pipewire-0", "info", "0"])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).contains(node),
+        _ => {
+            warn!("epos instance {role}: node check for '{node}' failed — assuming unhealthy");
+            false
+        }
+    }
 }
 
 /// Set the GSX 300 capture gain via amixer, standalone so it can be
@@ -704,7 +814,21 @@ async fn apply_mic_gain_oneshot(device: &DeviceInfo, gain: u32) -> Result<()> {
     }
 
     if !success {
-        warn!("amixer mic gain failed: {}", last_stderr);
+        // Previously this only logged a warning and returned Ok(()), so a
+        // failed amixer call was reported to the GUI as a successful gain
+        // change and the bad value was persisted. Surface it as an error.
+        let detail = if last_stderr.is_empty() {
+            "amixer reported no usable capture control".to_string()
+        } else {
+            last_stderr
+        };
+        warn!("amixer mic gain failed: {}", detail);
+        return Err(anyhow::anyhow!(
+            "Failed to set mic gain to {}% on card {}: {}",
+            gain,
+            card,
+            detail
+        ));
     }
     Ok(())
 }
@@ -715,5 +839,143 @@ impl Drop for AudioPipeline {
         // instance (systemd Restart=always), not a daemon-owned child, so there
         // is nothing to reap here. Restarting/maintaining that instance is the
         // RestartBus worker's job.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epos_shared::config::EqBand;
+
+    fn band(freq: u32, gain_db: f32, q: f32) -> EqBand {
+        EqBand { freq, gain_db, q }
+    }
+
+    /// A band inside every documented limit must survive untouched, so normal
+    /// EQ editing is never altered by the safety layer.
+    #[test]
+    fn valid_band_is_preserved_verbatim() {
+        let out = sanitize_bands(&[band(1000, -3.0, 1.2)]);
+        assert_eq!(out, vec![(1000u32, -3.0f32, 1.2f32)]);
+    }
+
+    /// The two Warm/Clear presets must survive the sanitiser, otherwise the
+    /// built-in voice modes would be silently broken by the safety layer.
+    #[test]
+    fn built_in_voice_presets_survive_sanitisation() {
+        let warm = [
+            (200u32, 4.0f32, 0.8f32),
+            (350, 3.0, 1.0),
+            (500, 2.0, 1.0),
+            (4000, -1.0, 1.2),
+            (8000, -2.0, 1.0),
+        ];
+        let bands: Vec<EqBand> = warm.iter().map(|&(f, g, q)| band(f, g, q)).collect();
+        assert_eq!(sanitize_bands(&bands), warm.to_vec());
+
+        let clear = [
+            (200u32, -2.0f32, 1.0f32),
+            (500, -1.0, 1.0),
+            (2500, 3.0, 1.0),
+            (4000, 4.0, 0.8),
+            (6000, 3.0, 1.2),
+        ];
+        let bands: Vec<EqBand> = clear.iter().map(|&(f, g, q)| band(f, g, q)).collect();
+        assert_eq!(sanitize_bands(&bands), clear.to_vec());
+    }
+
+    /// A flat (or near-flat) band is a no-op filter; it must be dropped rather
+    /// than written into the PipeWire config as a useless bq_peaking node.
+    #[test]
+    fn flat_bands_are_dropped() {
+        assert!(sanitize_bands(&[band(1000, 0.0, 1.0)]).is_empty());
+        // 0.05 dB is below the 0.1 dB epsilon.
+        assert!(sanitize_bands(&[band(1000, 0.05, 1.0)]).is_empty());
+        assert!(sanitize_bands(&[band(1000, -0.05, 1.0)]).is_empty());
+    }
+
+    /// freq is a u32, so 0 is representable and WAS reaching the generated
+    /// config as `"Freq" = 0`. Sub-audible and ultrasonic bands are dropped.
+    #[test]
+    fn out_of_band_frequencies_are_dropped() {
+        assert!(sanitize_bands(&[band(0, 6.0, 1.0)]).is_empty());
+        assert!(sanitize_bands(&[band(19, 6.0, 1.0)]).is_empty());
+        assert!(sanitize_bands(&[band(20001, 6.0, 1.0)]).is_empty());
+        // Boundaries are inside the allowed range.
+        assert_eq!(sanitize_bands(&[band(20, 6.0, 1.0)]), vec![(20u32, 6.0f32, 1.0f32)]);
+        assert_eq!(sanitize_bands(&[band(20000, 6.0, 1.0)]), vec![(20000u32, 6.0f32, 1.0f32)]);
+    }
+
+    /// Non-finite values would be interpolated verbatim into the PipeWire
+    /// config file. They must never survive.
+    #[test]
+    fn non_finite_values_are_dropped() {
+        assert!(sanitize_bands(&[band(1000, f32::NAN, 1.0)]).is_empty());
+        assert!(sanitize_bands(&[band(1000, f32::INFINITY, 1.0)]).is_empty());
+        assert!(sanitize_bands(&[band(1000, f32::NEG_INFINITY, 1.0)]).is_empty());
+        assert!(sanitize_bands(&[band(1000, 6.0, f32::NAN)]).is_empty());
+        assert!(sanitize_bands(&[band(1000, 6.0, f32::INFINITY)]).is_empty());
+    }
+
+    /// Out-of-range gain/Q are clamped, not dropped: the band still carries the
+    /// user's intent, just bounded to a safe range.
+    #[test]
+    fn gain_and_q_are_clamped_not_dropped() {
+        assert_eq!(sanitize_bands(&[band(1000, 100.0, 1.0)]), vec![(1000u32, 24.0f32, 1.0f32)]);
+        assert_eq!(sanitize_bands(&[band(1000, -100.0, 1.0)]), vec![(1000u32, -24.0f32, 1.0f32)]);
+        assert_eq!(sanitize_bands(&[band(1000, 6.0, 0.0)]), vec![(1000u32, 6.0f32, 0.1f32)]);
+        assert_eq!(sanitize_bands(&[band(1000, 6.0, -5.0)]), vec![(1000u32, 6.0f32, 0.1f32)]);
+        assert_eq!(sanitize_bands(&[band(1000, 6.0, 1000.0)]), vec![(1000u32, 6.0f32, 30.0f32)]);
+    }
+
+    /// An unbounded band list could exhaust the per-instance
+    /// MemoryMax=64M/TasksMax=32 budget and silence the audio path.
+    #[test]
+    fn band_count_is_capped() {
+        let many: Vec<EqBand> = (0..500).map(|i| band(100 + i, 3.0, 1.0)).collect();
+        assert_eq!(sanitize_bands(&many).len(), MAX_EQ_BANDS);
+    }
+
+    /// A mixed list: only the safe, in-range, non-flat bands may appear, in
+    /// their original order.
+    #[test]
+    fn mixed_list_keeps_only_safe_bands_in_order() {
+        let out = sanitize_bands(&[
+            band(100, 5.0, 1.0),    // keep
+            band(0, 5.0, 1.0),      // drop: freq 0
+            band(200, 0.0, 1.0),    // drop: flat
+            band(300, 50.0, 1.0),   // keep, gain clamped to 24
+            band(400, 3.0, 0.0),    // keep, q clamped to 0.1
+            band(50000, 3.0, 1.0),  // drop: ultrasonic
+        ]);
+        assert_eq!(
+            out,
+            vec![
+                (100u32, 5.0f32, 1.0f32),
+                (300, 24.0, 1.0),
+                (400, 3.0, 0.1),
+            ]
+        );
+    }
+
+    /// Custom mode with no usable bands must produce an empty chain, which the
+    /// caller turns into a passthrough `copy` node.
+    #[test]
+    fn empty_and_all_flat_custom_bands_yield_empty_chain() {
+        assert!(sanitize_bands(&[]).is_empty());
+        assert!(sanitize_bands(&[band(100, 0.0, 1.0), band(200, 0.0, 1.0)]).is_empty());
+    }
+
+    /// Custom bands are stored verbatim in the config, and the sanitiser is
+    /// what stands between an untrusted config file and the generated PipeWire
+    /// conf. A custom band list that survived sanitising must reach the filter
+    /// graph as the same (freq, gain, q) tuples.
+    #[test]
+    fn custom_bands_reach_the_graph_unchanged() {
+        let custom = vec![band(250, 4.5, 1.0), band(3000, -2.0, 0.7)];
+        assert_eq!(
+            sanitize_bands(&custom),
+            vec![(250u32, 4.5f32, 1.0f32), (3000u32, -2.0f32, 0.7f32)]
+        );
     }
 }
