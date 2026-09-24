@@ -357,12 +357,11 @@ async fn main() -> Result<()> {
                     }
                     // Mirror the dial onto the real PipeWire sink so the displayed
                     // value always matches the actual output level.
-                    // Read the target outside the read lock: it costs a
-                    // `pactl get-default-sink`, and holding the global lock across
-                    // a subprocess is how the hotplug poll and the IPC handlers
-                    // get stalled by one slow call.
-                    let sink = volume_sink(&s).await;
-                    apply_sink_volume(&sink, next).await;
+                    // The writer resolves the sink itself, outside the state lock:
+                    // it costs a `pactl get-default-sink`, and holding the global
+                    // lock across a subprocess is how the hotplug poll and the IPC
+                    // handlers get stalled by one slow call.
+                    apply_volume(&s, next).await;
                     // Update the tracked value only AFTER the sink has been
                     // commanded, so a watcher poll that runs mid-apply sees
                     // "actual == tracked" (both still old) instead of a false
@@ -416,9 +415,9 @@ async fn main() -> Result<()> {
         led_heartbeat_loop(state_clone).await;
     });
 
-    // Keep the tracked volume synced with the real EPOS sink level so external
-    // volume changes (keyboard, DE controls, wpctl, apps) are reflected in the
-    // GUI dial and don't get reverted by the next dial turn.
+    // Keep the tracked volume synced with the level of the sink that is actually
+    // playing, so external volume changes (keyboard, DE controls, wpctl, apps)
+    // are reflected in the GUI dial and don't get reverted by the next dial turn.
     let state_clone = state.clone();
     let _volume_watch_handle = tokio::spawn(async move {
         volume_watch_loop(state_clone).await;
@@ -504,15 +503,24 @@ async fn volume_sink(state: &Arc<RwLock<IpcState>>) -> String {
     audio::volume_target_sink(&default, &epos, audio::EQ_SINK_NAME)
 }
 
-/// Apply a host-side dial volume (0-100) to the sink that is actually playing, so
-/// the hardware dial value and the real output level always agree.
-async fn apply_sink_volume(sink: &str, percent: i32) {
+/// Apply a host-side dial volume (0-100) to the sink that is actually playing.
+///
+/// Takes the shared state rather than a sink name **on purpose**. The bug this
+/// replaces was a caller passing whichever sink it happened to have in hand,
+/// which is correct only while the headset is what the user is listening to: the
+/// boot path did exactly that on every daemon start, writing the tracked level
+/// onto a device nobody was hearing. Resolving inside the writer means there is
+/// no way to reach `pactl set-sink-volume` without going through the same policy
+/// the reader uses, so the two cannot drift apart.
+async fn apply_volume(state: &Arc<RwLock<IpcState>>, percent: i32) {
+    let sink = volume_sink(state).await;
     if sink.is_empty() {
+        debug!("Volume write skipped: no sink is currently carrying audio");
         return;
     }
     let pct = format!("{}%", percent.clamp(0, 100));
     match tokio::process::Command::new("pactl")
-        .args(["set-sink-volume", sink, &pct])
+        .args(["set-sink-volume", &sink, &pct])
         .output()
         .await
     {
@@ -529,7 +537,7 @@ async fn apply_sink_volume(sink: &str, percent: i32) {
     }
 }
 
-/// Read the current EPOS sink volume (0-100) straight from PipeWire/PulseAudio.
+/// Read a sink's volume (0-100) straight from PipeWire/PulseAudio.
 /// Returns None if the sink is gone or the query fails.
 async fn read_sink_volume(sink: &str) -> Option<i32> {
     if sink.is_empty() {
@@ -705,6 +713,7 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
                 .and_then(|d| d.hidraw.as_ref())
                 .map(hwinfo::probe)
                 .unwrap_or_default();
+            let vol = state.read().await.volume.load(std::sync::atomic::Ordering::Relaxed);
             let mut st = state.write().await;
             // Names come from the fresh scan above (cache was empty when we
             // entered this branch).
@@ -735,21 +744,21 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
                 if let Err(e) = st.audio.route_input().await {
                     warn!("Failed to route input on reconnect: {}", e);
                 }
-                // Restore host-side dial volume onto the real sink so the
-                // knob position matches the actual output level after (re)plug.
-                let vol = st.volume.load(std::sync::atomic::Ordering::Relaxed);
-                let sink = audio::volume_target_sink(
-                    &audio::AudioPipeline::read_default_sink().await.unwrap_or_default(),
-                    &st.pipewire_nodes
-                        .as_ref()
-                        .map(|(snk, _)| snk.clone())
-                        .unwrap_or_default(),
-                    audio::EQ_SINK_NAME,
-                );
+                // Restore host-side dial volume onto whatever is actually playing,
+                // so the knob position matches the real output level after a
+                // replug. The tracked value is read here, but the write itself
+                // happens after the lock is released: the writer resolves the sink
+                // with a `pactl` call, and holding the global lock across a
+                // subprocess stalls every IPC handler behind it.
                 st.last_volume_target
                     .store(vol, std::sync::atomic::Ordering::Relaxed);
-                apply_sink_volume(&sink, vol).await;
-                info!("Volume restored to {}% on EPOS sink", vol);
+            }
+            st.device = device;
+            drop(st);
+            apply_volume(&state, vol).await;
+            info!("Volume restored to {}% after reconnect", vol);
+            {
+                let mut st = state.write().await;
                 // Re-open LED hidraw (device may have re-enumerated) and sync mode
                 let desired_mode = st.config.mode;
                 if let Some(ref mut led) = st.led {
@@ -762,7 +771,6 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
                     info!("LED re-synced to {:?} after reconnect", desired_mode);
                 }
             }
-            st.device = device;
         } else if !is_connected && was_connected {
             info!("EPOS GSX 300 disconnected");
             let mut st = state.write().await;
@@ -782,15 +790,18 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
             {
                 if let Some(ref d) = device {
                     st.pipewire_nodes = Some((d.pipewire_sink.clone(), d.pipewire_source.clone()));
-                    // First connect after boot: push the saved dial volume
-                    // onto the sink once so display == actual output.
+                    // First connect after boot: push the saved dial volume onto
+                    // whichever sink is actually playing, so display == actual
+                    // output. This used to write to the EPOS sink unconditionally,
+                    // which on every daemon start put the tracked level onto a
+                    // device the user was not listening to — the original report,
+                    // still present in this one path after the others were fixed.
                     let vol = st.volume.load(std::sync::atomic::Ordering::Relaxed);
-                    let sink = d.pipewire_sink.clone();
                     st.last_volume_target
                         .store(vol, std::sync::atomic::Ordering::Relaxed);
                     drop(st);
-                    apply_sink_volume(&sink, vol).await;
-                    tracing::info!("Volume restored to {}% on EPOS sink (boot)", vol);
+                    apply_volume(&state, vol).await;
+                    tracing::info!("Volume restored to {}% at boot", vol);
                     let mut st = state.write().await;
                     st.device = device;
                     // Boot with the device already plugged: the steady-state
