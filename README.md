@@ -132,8 +132,11 @@ codec. Key facts that shape the daemon design:
   gate therefore runs in mono (`noise_suppressor_mono`).
 - **EQ 9-band is host-side** (PipeWire filter-chain), because the chip's
   built-in 5-band hardware EQ is not exposed over USB by the firmware.
-- **Sidetone** (REVERBERATION in the GUI) is the one device-resident
-  DSP feature and is controlled via vendor HID commands.
+- **Sidetone** (REVERBERATION in the GUI) is a **host-side** PipeWire
+  `loopback` inside the `pipewire-epos@sidetone` instance — capture the mono
+  mic source, play into the EPOS sink with a volume prop. It is *not* a
+  device-resident DSP and involves no vendor HID write, so it carries no
+  firmware-flash risk. (Earlier docs claimed otherwise; that was wrong.)
 - **HID protocol** (fully decoded, see `src/led.rs` header): Report 0x01
   = volume dial (incremental detents only, **±2% per detent**, measured on
   hardware; no absolute readback), 0x02 = LED / button state (2-bit output,

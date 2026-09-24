@@ -39,7 +39,7 @@ Owner: Magnus (slimulv1). Repo: [epos-gsx300-linux](https://github.com/slimulv1/
 
 - **44.1 kHz is NOT native** — keep 48 kHz as global clock. rnnoise also requires 48k.
 - 96 kHz exists but global clock is 48k (A2+ config); leaving 48k is correct.
-- **Sidetone** is device-resident (REVERBERATION), not host-processed.
+- **Sidetone** is **host-side**: a PipeWire `loopback` in the `pipewire-epos@sidetone` instance (mono mic capture -> EPOS sink, volume prop). It is not device-resident and involves no vendor HID write, so it carries no firmware-flash risk.
 - **EQ is host-side.** The chip HAS a 5-band hardware EQ internally (see §6),
   but it is preset-only and NOT exposed via USB. 9-band LADSPA host EQ is the
   correct design for Linux.
@@ -247,8 +247,8 @@ and LED re-assert heartbeat are the correct and only designs.
 | 9-band LADSPA EQ | HW EQ preset-only, USB-locked | ✅ Correct |
 | Noise gate (mono, rnnoise) | Captures is genuinely mono | ✅ Correct |
 | 48 kHz global | Chip native (no 44.1k) | ✅ Correct |
-| Sidetone device-resident | REVERBERATION in DSP | ✅ Correct |
-| LED clamp ≤0x03 | Firmware ignores >0x03 | ✅ Correct |
+| Sidetone device-resident | Host-side PipeWire loopback, not chip DSP | ❌ Was wrong, corrected 2026-09-24 |
+| LED clamp ≤0x03, blue=0x02 red=0x01 | Firmware ignores >0x03; descriptor colour labels are inverted | ⚠️ Clamp correct, colour map was backwards until 2026-09-24 |
 
 ## 7. Tooling
 
