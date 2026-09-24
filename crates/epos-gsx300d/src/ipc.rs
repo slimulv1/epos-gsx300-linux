@@ -46,6 +46,21 @@ pub fn request_is_mutation(req: &Request) -> bool {
     )
 }
 
+/// Whether a handled request should be followed by a config save.
+///
+/// Only mutations are saved, so the GUI's 3s status poll never churns the file.
+/// Among mutations, success is not always spelled `Response::Ok`: `ToggleMode`
+/// answers `Response::Mode(new_mode)` so the GUI can update its toggle straight
+/// from the reply instead of waiting for the next poll, and gating on `Ok`
+/// alone meant the stereo/7.1 switch reached the LED and the status but never
+/// the disk. Every other mutating handler does answer `Ok`.
+///
+/// `Response::Error` is never saved: the handler failed, and persisting it
+/// would record a change the daemon could not apply.
+pub fn response_should_persist(response: &Response, is_mutation: bool) -> bool {
+    is_mutation && matches!(response, Response::Ok | Response::Mode(_))
+}
+
 /// Mirror the live audio config back into the currently-active profile.
 ///
 /// Previously the live setters (SetEq / SetVoiceEnhancer / SetNoiseGate /
@@ -212,7 +227,7 @@ async fn handle_client(stream: UnixStream, state: Arc<RwLock<IpcState>>) -> Resu
 
         // Persist config only after mutating requests. Read-only requests
         // (the GUI polls GetStatus every 3s) must not churn the file.
-        if matches!(response, Response::Ok) && is_mutation {
+        if response_should_persist(&response, is_mutation) {
             let st = state.read().await;
             if let Err(e) = crate::save_config(&st) {
                 warn!("Failed to save config: {}", e);
@@ -1011,7 +1026,7 @@ async fn process_http_body(
     let response = handle_request(request, state.clone()).await;
 
     // Persist config after mutations (same rule as Unix socket)
-    if matches!(response, Response::Ok) && is_mutation {
+    if response_should_persist(&response, is_mutation) {
         let st = state.read().await;
         if let Err(e) = crate::save_config(&st) {
             warn!("Failed to save config (http): {}", e);
@@ -1387,5 +1402,54 @@ mod tests {
         assert!(parse_request_head(b"").is_none());
         assert!(parse_request_head(b"not-a-request-line\r\n\r\n").is_none());
         assert!(parse_request_head(b"GET\r\n\r\n").is_none());
+    }
+
+    // ─── What counts as a successful, persistable change ──────
+    //
+    // The save gate tested `matches!(response, Response::Ok)`, which quietly
+    // excluded `ToggleMode`: that handler answers `Response::Mode` so the GUI
+    // can move its toggle without polling. Switching stereo/7.1 therefore
+    // changed the LED and the reported mode, and a restart reverted it —
+    // while `SetMode`, the dropdown beside the same button, went through a
+    // handler answering `Ok` and did persist. Measured on the running daemon:
+    // the toggle left the file at `stereo` while the daemon reported
+    // `surround71`.
+
+    /// The regression: the toggle's own success shape must reach disk.
+    #[test]
+    fn the_mode_toggle_is_persisted() {
+        assert!(
+            response_should_persist(&Response::Mode(AudioMode::Surround71), true),
+            "ToggleMode answers Response::Mode, and that change must be saved"
+        );
+    }
+
+    /// The ordinary shape keeps working.
+    #[test]
+    fn a_plain_ok_is_persisted_when_it_mutates() {
+        assert!(response_should_persist(&Response::Ok, true));
+    }
+
+    /// A failure is never persisted, however the request was classified.
+    #[test]
+    fn an_error_is_never_persisted() {
+        assert!(!response_should_persist(
+            &Response::Error {
+                message: "Failed to apply EQ".into()
+            },
+            true
+        ));
+    }
+
+    /// Read-only traffic must not churn the file, whatever it answers with.
+    /// `GetMode` also answers `Response::Mode`, so this is the case that keeps
+    /// widening the gate from being a mistake.
+    #[test]
+    fn read_only_requests_never_persist() {
+        assert!(!response_should_persist(
+            &Response::Mode(AudioMode::Stereo),
+            false
+        ));
+        assert!(!response_should_persist(&Response::Ok, false));
     }
 }
