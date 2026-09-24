@@ -77,20 +77,11 @@ async fn main() -> Result<()> {
     // by the config watcher, then silently reverted on the next daemon start
     // from the stale top-level copy — verified before this change.
     let mut config = config;
-    if !config.active_profile.is_empty() {
-        if let Some(p) = config
-            .profiles
-            .iter()
-            .find(|p| p.name.eq_ignore_ascii_case(&config.active_profile))
-        {
-            if serde_json::to_value(&p.audio).ok() != serde_json::to_value(&config.audio).ok() {
-                info!(
-                    "Applying audio from active profile '{}' (top-level copy was stale)",
-                    p.name
-                );
-                config.audio = p.audio.clone();
-            }
-        }
+    if config::resolve_active_profile_audio(&mut config) {
+        info!(
+            "Applying audio from active profile '{}' (top-level copy was stale)",
+            config.active_profile
+        );
     }
 
     // Initialize audio pipeline

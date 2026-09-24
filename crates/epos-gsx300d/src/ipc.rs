@@ -829,7 +829,19 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
             // config that was momentarily gone turned a reload into a factory
             // reset that discarded the user's profiles.
             match config::load_existing() {
-                Ok(new_config) => {
+                Ok(mut new_config) => {
+                    // The active profile is the source of truth for live audio,
+                    // exactly as at start-up. Without this, a Reload adopted a
+                    // stale top-level copy and undid whatever the profile said —
+                    // the watcher had already been doing this correctly, so the
+                    // same edit was applied by one path and reverted by another.
+                    if crate::config::resolve_active_profile_audio(&mut new_config) {
+                        info!(
+                            "Reload: applying audio from active profile '{}' \
+                             (top-level copy was stale)",
+                            new_config.active_profile
+                        );
+                    }
                     state.config = new_config;
                     // Sync the reloaded config into the pipeline's own copy
                     // BEFORE applying. apply_full() reads self.config, so

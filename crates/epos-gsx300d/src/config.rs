@@ -15,6 +15,36 @@ pub fn config_path() -> PathBuf {
     config_dir().join("config.json")
 }
 
+/// Make the active profile the source of truth for `config.audio`.
+///
+/// The top-level `audio` is a copy, and copies drift. A live edit writes the
+/// active profile and the top level together, but a hand edit to the file
+/// usually touches only one of them. Whoever adopts a config has to decide
+/// which wins, and the decision has to be the same everywhere: a band changed
+/// in the profile was applied by the config watcher and then silently undone on
+/// the next daemon start, which read the stale top-level copy instead.
+///
+/// Returns whether the audio was replaced, so a caller can say so rather than
+/// staying quiet. A name matching no profile changes nothing at all — resolving
+/// "no active profile" into defaults would be a silent factory reset.
+pub fn resolve_active_profile_audio(config: &mut Config) -> bool {
+    if config.active_profile.is_empty() {
+        return false;
+    }
+    let Some(profile) = config
+        .profiles
+        .iter()
+        .find(|p| p.name.eq_ignore_ascii_case(&config.active_profile))
+    else {
+        return false;
+    };
+    if serde_json::to_value(&profile.audio).ok() == serde_json::to_value(&config.audio).ok() {
+        return false;
+    }
+    config.audio = profile.audio.clone();
+    true
+}
+
 /// Load the config for daemon startup.
 ///
 /// This is the only caller allowed to author a config file, and only when the
@@ -222,6 +252,76 @@ mod tests {
         let loaded = load_from(&path).expect("load back what was saved");
 
         assert_eq!(loaded.device.volume, Some(37));
+    }
+
+    /// The top-level `audio` is a copy, and copies drift. A live edit writes
+    /// the active profile and the top level, but a hand edit to the file
+    /// usually touches one of them, so whoever adopts a config has to decide
+    /// which wins. The rule is the same everywhere or an edit applied through
+    /// one path gets reverted by another — which is what happened: a band
+    /// changed in the profile was applied by the watcher, then silently undone
+    /// on the next daemon start from the stale top-level copy.
+    #[test]
+    fn the_active_profile_wins_over_a_stale_top_level_copy() {
+        let mut config = Config::default();
+        let mut profile = epos_shared::Profile::flat();
+        profile.audio.mic_gain = 37;
+        config.profiles = vec![profile];
+        config.active_profile = "FLAT".to_string();
+        config.audio.mic_gain = 100; // the stale copy
+
+        let changed = resolve_active_profile_audio(&mut config);
+
+        assert!(changed, "a stale top-level copy must be replaced");
+        assert_eq!(config.audio.mic_gain, 37);
+    }
+
+    /// Already in step: nothing to do, and the caller is told so it can stay
+    /// quiet instead of logging a change that did not happen.
+    #[test]
+    fn an_already_resolved_config_is_left_alone() {
+        let mut config = Config::default();
+        let mut profile = epos_shared::Profile::flat();
+        profile.audio.mic_gain = 37;
+        config.profiles = vec![profile];
+        config.active_profile = "FLAT".to_string();
+        config.audio.mic_gain = 37;
+
+        assert!(!resolve_active_profile_audio(&mut config));
+        assert_eq!(config.audio.mic_gain, 37);
+    }
+
+    /// Matching is case-insensitive, per the shared profile contract: the
+    /// shipped config says "FLAT" and others in the wild say "Flat".
+    #[test]
+    fn the_profile_is_matched_ignoring_case() {
+        let mut config = Config::default();
+        let mut profile = epos_shared::Profile::flat();
+        profile.audio.mic_gain = 42;
+        config.profiles = vec![profile];
+        config.active_profile = "flat".to_string();
+        config.audio.mic_gain = 100;
+
+        assert!(resolve_active_profile_audio(&mut config));
+        assert_eq!(config.audio.mic_gain, 42);
+    }
+
+    /// A name that matches nothing must leave the audio completely alone. This
+    /// is the dangerous direction: resolving "no profile" into defaults would be
+    /// a silent factory reset of the user's settings.
+    #[test]
+    fn a_dangling_active_profile_never_resets_the_audio() {
+        for active in ["", "DOES-NOT-EXIST"] {
+            let mut config = Config::default();
+            config.active_profile = active.to_string();
+            config.audio.mic_gain = 88;
+
+            assert!(
+                !resolve_active_profile_audio(&mut config),
+                "{active:?} must not claim to have resolved anything"
+            );
+            assert_eq!(config.audio.mic_gain, 88, "{active:?} must not touch audio");
+        }
     }
 
     /// Saving is atomic at the pathname, so a reader sees either the old file
