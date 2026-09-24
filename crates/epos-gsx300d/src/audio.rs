@@ -34,7 +34,9 @@ pub struct AudioPipeline {
 
 /// Debounced restart bus: audio handlers record which epos instance(s) changed
 /// and notify; the worker in main.rs performs the actual restarts (union,
-/// dedup, parallel for profile-wide changes) off the IPC lock.
+/// dedup, and **concurrently** — see `pipewire_reload_worker`) off the IPC
+/// lock. Every restart is time-bounded internally, so a slow or unresponsive
+/// role can never starve the others.
 pub struct RestartBus {
     pub notify: Notify,
     pending: Mutex<BTreeSet<String>>,
@@ -791,30 +793,45 @@ pub(crate) async fn restart_epos_instance(role: &str) -> bool {
     // "indirect" (instances are pulled from graphical-session.wants), which
     // is the complete-install state we care about.
     let template_file = "pipewire-epos@.service";
-    let exists = tokio::process::Command::new("systemctl")
-        .args(["--user", "list-unit-files", template_file])
-        .output()
-        .await
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains(template_file))
-        .unwrap_or(false);
+    let exists = matches!(
+        run_probe(
+            "systemctl",
+            &["--user", "list-unit-files", template_file],
+            PROBE_BUDGET
+        )
+        .await,
+        Probe::Ran(out) if out.contains(template_file)
+    );
     if !exists {
         warn!("epos instance unit {svc} not found — install not complete, EPOS silent");
         return false;
     }
 
-    let status = tokio::process::Command::new("systemctl")
-        .args(["--user", "restart", &svc])
-        .status()
-        .await;
-    let ok = match status {
-        Ok(s) if s.success() => true,
-        Ok(s) => {
+    // `systemctl restart` legitimately takes a second or two, but it gets a cap
+    // for the same reason the probes do: an unbounded await here would stall the
+    // reload worker just as effectively as the pw-cli wedge did.
+    const RESTART_CMD_BUDGET: Duration = Duration::from_secs(20);
+    let restart = tokio::time::timeout(
+        RESTART_CMD_BUDGET,
+        tokio::process::Command::new("systemctl")
+            .args(["--user", "restart", &svc])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await;
+    let ok = match restart {
+        Ok(Ok(s)) if s.success() => true,
+        Ok(Ok(s)) => {
             warn!("epos instance restart {svc} returned {:?}", s.code());
             false
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             warn!("epos instance restart {svc} failed: {}", e);
+            false
+        }
+        Err(_) => {
+            warn!("epos instance restart {svc} exceeded {RESTART_CMD_BUDGET:?} — abandoned");
             false
         }
     };
@@ -823,8 +840,7 @@ pub(crate) async fn restart_epos_instance(role: &str) -> bool {
     }
 
     // Health check: the instance must be up AND its control socket reachable
-    // (`pw-cli -r pipewire-epos-<role> info 0`) AND actually publish the DSP
-    // node this role exists to provide.
+    // AND actually publish the DSP node this role exists to provide.
     //
     // Socket-only checking was not enough: an instance can be perfectly
     // reachable while its filter-chain module failed to register (a bad
@@ -832,41 +848,193 @@ pub(crate) async fn restart_epos_instance(role: &str) -> bool {
     // name). The audio path is then silent while the daemon reports success,
     // which is exactly the "the button does nothing" failure mode. Verifying
     // the node exists closes that gap. Never touches the main instance.
-    for attempt in 0..3 {
-        if instance_reachable(role).await && instance_node_present(role, role_node_name(role)).await
-        {
-            return true;
+    //
+    // The whole retry sequence is bounded: the caller must always get its turn
+    // back, even if every attempt stalls.
+    let verify = async {
+        // A disabled role publishes nothing, so there is no node to demand.
+        // An enabled one must publish its node, otherwise the conf was written
+        // but the running instance never loaded it — the silent "the button
+        // does nothing" failure this check exists to catch.
+        let expected = expected_node(role);
+        for attempt in 0..3 {
+            let up = instance_reachable(role).await;
+            let node_ok = match &expected {
+                Some(n) => instance_node_present(role, n).await,
+                None => true,
+            };
+            if up && node_ok {
+                return true;
+            }
+            if attempt == 1 {
+                warn!(
+                    "epos instance {role}: unhealthy after restart \
+                     (unit_active={up}, node_published={node_ok}) — retry once"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(700)).await;
         }
-        tokio::time::sleep(Duration::from_millis(700)).await;
-        if attempt == 1 {
-            warn!("epos instance {role}: not reachable after restart — retry once");
+        false
+    };
+    match tokio::time::timeout(RESTART_VERIFY_BUDGET, verify).await {
+        Ok(healthy) => {
+            if !healthy {
+                warn!("epos instance {role}: still not reachable — EPOS path silent (fail-closed)");
+            }
+            healthy
+        }
+        Err(_) => {
+            warn!(
+                "epos instance {role}: verification exceeded {RESTART_VERIFY_BUDGET:?} \
+                 — treating as unhealthy (fail-closed)"
+            );
+            false
         }
     }
-    warn!("epos instance {role}: still not reachable — EPOS path silent (fail-closed)");
-    false
 }
 
-/// Is the epos instance's own PipeWire control socket up and answering?
-async fn instance_reachable(role: &str) -> bool {
-    tokio::process::Command::new("pw-cli")
-        .args(["-r", &format!("pipewire-epos-{role}"), "info", "0"])
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+/// Wall-clock cap for any external probe this module runs.
+///
+/// Generous enough for `systemctl is-active` and `pw-dump` (both measured at
+/// well under 50 ms), small enough that a wedged tool cannot stall the reload
+/// worker for more than a couple of seconds.
+const PROBE_BUDGET: Duration = Duration::from_secs(5);
+
+/// Total wall-clock cap for one role's post-restart verification, covering
+/// every retry attempt. A role that cannot be verified in this window is
+/// reported unhealthy and the worker moves on to the next role.
+const RESTART_VERIFY_BUDGET: Duration = Duration::from_secs(12);
+
+/// Result of a capped, non-interactive subprocess probe.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Probe {
+    /// The process was started and exited; stdout is captured.
+    Ran(String),
+    /// The process outlived the budget and was killed.
+    TimedOut,
+    /// The process could not be started at all.
+    SpawnFailed(String),
 }
 
-/// The node each role must publish into the MAIN graph for its DSP path to be
-/// usable. Used by the post-restart health check.
-fn role_node_name(role: &str) -> &'static str {
-    match role {
+/// Run `program args...` with stdin closed and a hard wall-clock cap.
+///
+/// Every external probe goes through here. Two properties are load-bearing:
+///
+/// * **stdin is `/dev/null`.** `pw-cli` validates its arguments and, on a bad
+///   one, drops into an interactive command loop instead of exiting. With an
+///   inherited stdin that blocks forever — which is exactly how
+///   `pw-cli -r … info 0` (rejected with "unknown global '0'") wedged the
+///   reload worker permanently on 2026-09-24.
+/// * **The wait is capped and the child is killed on drop.** `kill_on_drop`
+///   plus `timeout` means a stuck probe leaves no orphan behind.
+///
+/// The exit status is deliberately not folded into the outcome: callers that
+/// care use `systemctl is-active`'s stdout, and a non-zero status is normal
+/// for `is-active` on a stopped unit.
+async fn run_probe(program: &str, args: &[&str], budget: Duration) -> Probe {
+    let child = tokio::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    match tokio::time::timeout(budget, child).await {
+        Ok(Ok(o)) => Probe::Ran(String::from_utf8_lossy(&o.stdout).into_owned()),
+        Ok(Err(e)) => Probe::SpawnFailed(e.to_string()),
+        Err(_) => {
+            warn!("probe `{program}` exceeded {budget:?} — abandoned");
+            Probe::TimedOut
+        }
+    }
+}
+
+/// Does a `pw-dump` of the MAIN graph publish `node`?
+///
+/// `pw-dump` emits JSON, so the name is read out of each object's
+/// `props["node.name"]` rather than grepped as text. A substring match would be
+/// wrong in both directions: `epos-voice` would "find" `epos-voice-output`,
+/// and a node merely mentioned in some other field would count as present.
+/// Unparseable output is treated as "not present" so a broken probe can never
+/// be mistaken for a healthy instance.
+fn dump_has_node(dump: &str, node: &str) -> bool {
+    if node.is_empty() {
+        return false;
+    }
+    let root: serde_json::Value = match serde_json::from_str(dump) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("pw-dump output is not valid JSON ({e}) — node check cannot be trusted");
+            return false;
+        }
+    };
+    fn walk(v: &serde_json::Value, node: &str) -> bool {
+        match v {
+            serde_json::Value::Object(m) => {
+                if m
+                    .get("props")
+                    .and_then(|p| p.get("node.name"))
+                    .and_then(|n| n.as_str())
+                    == Some(node)
+                {
+                    return true;
+                }
+                m.values().any(|x| walk(x, node))
+            }
+            serde_json::Value::Array(a) => a.iter().any(|x| walk(x, node)),
+            _ => false,
+        }
+    }
+    walk(&root, node)
+}
+
+/// The MAIN-graph node this role must publish for its DSP path to be usable,
+/// or `None` when the role is disabled and so legitimately publishes nothing.
+///
+/// Read from the generated conf rather than hardcoded, for two reasons:
+/// a disabled role has no node, so demanding one would report a permanent
+/// false failure; and the sidetone node is `epos-sidetone-output`, not the
+/// `epos-sidetone` that was hardcoded before — that name matches nothing, so
+/// the check could never succeed.
+///
+/// `eq` is the exception: `epos-eq-input` is the static null-sink installed in
+/// MAIN by `40-epos-eq-virtualsink.conf` and exists whether or not the EQ
+/// filter is engaged, so it is always expected.
+fn expected_node(role: &str) -> Option<String> {
+    if role == "eq" {
+        return Some(EQ_SINK_NAME.to_string());
+    }
+    let marker = match role {
         "voice" => "epos-voice-output",
-        "eq" => "epos-eq-input",
-        "sidetone" => "epos-sidetone",
+        "sidetone" => "epos-sidetone-output",
         // RestartBus::request asserts role ∈ {eq, voice, sidetone}; keep a
         // total match so this can never panic on a new role.
-        _ => "",
+        _ => return None,
+    };
+    let conf = std::fs::read_to_string(AudioPipeline::instance_conf_path(role)).ok()?;
+    conf.contains(&format!("node.name = \"{marker}\""))
+        .then(|| marker.to_string())
+}
+
+/// Is the epos instance up?
+///
+/// Deliberately does **not** use `pw-cli`: that tool has an interactive
+/// fallback and blocked here, wedging the caller indefinitely. The systemd
+/// unit being active plus the instance's control socket existing answers the
+/// same question using commands that cannot block, and
+/// [`instance_node_present`] separately proves the DSP node is actually
+/// published where the audio path needs it.
+async fn instance_reachable(role: &str) -> bool {
+    let unit = format!("pipewire-epos@{role}.service");
+    let active = matches!(
+        run_probe("systemctl", &["--user", "is-active", &unit], PROBE_BUDGET).await,
+        Probe::Ran(out) if out.trim() == "active"
+    );
+    let socket_present = dirs::runtime_dir()
+        .map(|dir| dir.join(format!("pipewire-epos-{role}")).exists())
+        .unwrap_or(false);
+    if !active || !socket_present {
+        debug!("epos instance {role}: unit_active={active} socket={socket_present}");
     }
+    active && socket_present
 }
 
 /// Does the epos instance actually publish `node` into the main graph?
@@ -878,12 +1046,12 @@ async fn instance_node_present(role: &str, node: &str) -> bool {
     if node.is_empty() {
         return false;
     }
-    match tokio::process::Command::new("pw-cli")
-        .args(["-r", "pipewire-0", "info", "0"])
-        .output()
-        .await
-    {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).contains(node),
+    // `pw-dump` is a batch tool: no interactive fallback, ~15 ms, and `-r
+    // pipewire-0` pins it to the MAIN graph explicitly so an inherited
+    // PIPEWIRE_REMOTE cannot point it at a per-role instance instead. This is
+    // where the role's node has to appear for the path to be usable.
+    match run_probe("pw-dump", &["-r", "pipewire-0"], PROBE_BUDGET).await {
+        Probe::Ran(dump) => dump_has_node(&dump, node),
         _ => {
             warn!("epos instance {role}: node check for '{node}' failed — assuming unhealthy");
             false
@@ -1135,5 +1303,106 @@ mod tests {
             sanitize_bands(&custom),
             vec![(250u32, 4.5f32, 1.0f32), (3000u32, -2.0f32, 0.7f32)]
         );
+    }
+
+    // ── Capped subprocess probes ──────────────────────────────────────────
+    //
+    // Regression: the post-restart health check ran
+    //   pw-cli -r pipewire-epos-<role> info 0
+    // through a bare `.output().await`. `pw-cli` rejects the bogus object id
+    // ("unknown global '0'") and then falls back to its interactive command
+    // loop, blocking on stdin forever. The restart worker awaited that future
+    // with no cap, so the worker wedged permanently on the first DSP change
+    // and no epos instance was ever restarted again. A live hung `pw-cli`
+    // child of the daemon was observed doing exactly this.
+    //
+    // The contract these tests pin down is the fix: a probe ALWAYS returns,
+    // and it can never wait on stdin.
+
+    /// A command that never exits must be abandoned at the budget, not awaited
+    /// forever. This is the wedge that silently froze the whole reload worker.
+    #[tokio::test]
+    async fn probe_gives_up_on_a_command_that_never_exits() {
+        let started = std::time::Instant::now();
+        let outcome = run_probe("sleep", &["30"], Duration::from_millis(150)).await;
+        assert_eq!(outcome, Probe::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "probe must return near its budget, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// stdin is closed, so a tool that tries to read it (or drop into an
+    /// interactive prompt) gets EOF and exits instead of blocking.
+    #[tokio::test]
+    async fn probe_cannot_block_on_stdin() {
+        // `cat` with an inherited terminal/stdin would block forever. With a
+        // null stdin it sees EOF immediately and returns empty.
+        let outcome = run_probe("cat", &[], Duration::from_secs(5)).await;
+        match outcome {
+            Probe::Ran(stdout) => assert_eq!(stdout, ""),
+            other => panic!("expected a clean empty read, got {other:?}"),
+        }
+    }
+
+    /// The happy path still returns real stdout — the cap must not truncate
+    /// or discard data from probes that do answer.
+    #[tokio::test]
+    async fn probe_returns_stdout_when_the_command_answers() {
+        let outcome = run_probe("echo", &["epos-voice-output"], Duration::from_secs(5)).await;
+        assert_eq!(outcome, Probe::Ran("epos-voice-output\n".to_string()));
+    }
+
+    /// A missing binary is a spawn failure, reported as such — never a hang and
+    /// never silently reported as a healthy probe.
+    #[tokio::test]
+    async fn probe_reports_a_missing_program() {
+        let outcome = run_probe(
+            "epos-no-such-probe-binary",
+            &[],
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(matches!(outcome, Probe::SpawnFailed(_)), "got {outcome:?}");
+    }
+
+    /// The node-presence check reads real `pw-dump` output, which is JSON. An
+    /// earlier version matched a `node.name = "…"` text shape that `pw-dump`
+    /// never emits, so it reported every role as unhealthy. This pins the real
+    /// format, and pins that a missing node cannot pass by accident.
+    #[test]
+    fn node_presence_reads_real_pw_dump_json() {
+        // Trimmed from a real `pw-dump -r pipewire-0` run.
+        let dump = r#"[ { "info": { "props": { "node.name": "epos-sidetone-output",
+                  "media.class": "Stream/Output/Audio" } } },
+                { "info": { "props": { "node.name": "epos-eq-input" } } } ]"#;
+        assert!(dump_has_node(dump, "epos-sidetone-output"));
+        assert!(dump_has_node(dump, "epos-eq-input"));
+        // Absent, and a prefix must not match a real node.
+        assert!(!dump_has_node(dump, "epos-voice-output"));
+        assert!(!dump_has_node(dump, "epos-sidetone"));
+    }
+
+    /// Corrupt probe output must read as "not present", never as healthy.
+    #[test]
+    fn unparseable_dump_is_not_treated_as_healthy() {
+        assert!(!dump_has_node("not json at all", "epos-voice-output"));
+        assert!(!dump_has_node("[{\"info\":{\"props\":{}}}]", "epos-voice-output"));
+    }
+
+    /// `epos-eq-input` is the static null-sink and must be expected whether or
+    /// not the EQ is engaged — it is what apps target either way.
+    #[test]
+    fn eq_role_always_expects_the_anchor_sink() {
+        assert_eq!(expected_node("eq").as_deref(), Some("epos-eq-input"));
+    }
+
+    /// An unknown role expects nothing rather than panicking. The restart bus
+    /// already constrains the role set, but a total match keeps this safe.
+    #[test]
+    fn unknown_role_expects_no_node() {
+        assert_eq!(expected_node("nonsense"), None);
+        assert_eq!(expected_node(""), None);
     }
 }

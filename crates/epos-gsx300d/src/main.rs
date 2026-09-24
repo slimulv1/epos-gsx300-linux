@@ -724,8 +724,24 @@ async fn pipewire_reload_worker(state: Arc<RwLock<IpcState>>) {
             "EPOS instance restart (debounced) for: {}",
             pending.iter().cloned().collect::<Vec<_>>().join(", ")
         );
-        for role in &pending {
-            audio::restart_epos_instance(role).await;
+        // Restart the roles concurrently, not in sequence. A role that is slow
+        // or wedged must not delay the others: with a sequential loop one stuck
+        // role silently cancelled every restart behind it, which is how a
+        // voice instance ended up running a 68-minute-old conf. Each
+        // `restart_epos_instance` is internally time-bounded, and spawning
+        // them together means a failure in one cannot starve the rest.
+        let mut handles = Vec::with_capacity(pending.len());
+        for role in pending {
+            handles.push(tokio::spawn(async move {
+                let name = role.clone();
+                let ok = audio::restart_epos_instance(&role).await;
+                if !ok {
+                    warn!("EPOS instance {name} did not come up cleanly");
+                }
+            }));
+        }
+        for h in handles {
+            let _ = h.await;
         }
     }
 }
