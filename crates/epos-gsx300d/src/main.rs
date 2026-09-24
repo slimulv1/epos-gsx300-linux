@@ -19,7 +19,7 @@ use epos_shared::config::SmartButtonAction;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -479,9 +479,42 @@ async fn main() -> Result<()> {
 
     // Run Unix socket IPC server and HTTP bridge (web dev GUI) in parallel
     info!("Daemon ready, starting IPC server...");
-    let (_, _) = tokio::join!(ipc::run_server(state.clone()), ipc::run_http_bridge(state),);
 
-    Ok(())
+    // These two were joined as `let (_, _) =`, so both `Result`s were dropped:
+    // a failed bind was invisible. If the Unix socket cannot be served the GUI
+    // has no way in at all, and the daemon is not doing its job, so that ends
+    // the process and lets systemd report it. The HTTP bridge only exists for
+    // the vite dev server, so failing to take port 9898 — a leftover listener,
+    // or a second daemon — must not take the real interface down with it, but it
+    // must not pass unnoticed either.
+    let (ipc_result, bridge_result) =
+        tokio::join!(ipc::run_server(state.clone()), ipc::run_http_bridge(state.clone()),);
+
+    if let Err(e) = &bridge_result {
+        error!(
+            "HTTP dev bridge unavailable on 127.0.0.1:9898: {e}. \
+             The Unix socket interface is unaffected; only the browser dev GUI \
+             cannot connect."
+        );
+    }
+
+    // Both listeners ended. That is never a healthy steady state: the Unix
+    // server returns `Ok` only by erroring out, so reaching this point means the
+    // daemon cannot serve its one real interface and should not keep holding
+    // the headset, the HID device and the capture element.
+    //
+    // Exit here rather than returning `Err`, because returning would drop the
+    // tokio runtime, and dropping the runtime waits for its blocking tasks and
+    // worker threads — some of which sit in synchronous HID I/O. Measured: a
+    // second daemon that refused to start kept running past 25s instead of
+    // exiting, still holding `/dev/hidraw3`. A fatal start-up condition has to
+    // release the hardware on the spot and let systemd report the failure.
+    let fatal = match &ipc_result {
+        Err(e) => format!("IPC server failed: {e}"),
+        Ok(()) => "IPC server stopped unexpectedly".to_string(),
+    };
+    error!("{fatal} — daemon cannot serve requests, exiting");
+    std::process::exit(1);
 }
 
 /// The sink whose volume the dial and the GUI reflect: whichever one is actually

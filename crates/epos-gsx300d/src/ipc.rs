@@ -9,7 +9,7 @@ use epos_shared::config::AudioMode;
 use epos_shared::config::FLAT_PROFILE_NAME;
 use epos_shared::ipc::{Request, Response};
 use epos_shared::Config;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
@@ -169,13 +169,77 @@ pub struct IpcState {
     pub smart_button_seq: std::sync::atomic::AtomicU64,
 }
 
+/// What a pre-existing socket at the IPC path actually means.
+///
+/// The path alone cannot tell these apart: a live daemon and a daemon that was
+/// killed without cleaning up both leave a file there, and the only difference
+/// is whether anything accepts a connection on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingSocket {
+    /// Nothing at the path.
+    Absent,
+    /// The path exists and nothing accepted a connection: a leftover.
+    Stale,
+    /// The path exists and something answered: a live daemon owns it.
+    Live,
+}
+
+/// What to do with the path before binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketAction {
+    /// Bind directly.
+    Bind,
+    /// Remove the leftover, then bind.
+    Replace,
+}
+
+/// Decide whether the IPC socket may be taken over.
+///
+/// Unlinking whatever is at the path — which is what this did before — is what
+/// let a second daemon pull the socket out from under a running one. The first
+/// daemon keeps its workers and its claim on the headset, the second takes the
+/// socket, and neither reports anything. Refusing to start is the honest answer
+/// when the socket is live; removing it is only right when nothing answered.
+fn socket_precondition(existing: ExistingSocket, path: &Path) -> Result<SocketAction> {
+    match existing {
+        ExistingSocket::Absent => Ok(SocketAction::Bind),
+        ExistingSocket::Stale => Ok(SocketAction::Replace),
+        ExistingSocket::Live => anyhow::bail!(
+            "another epos-gsx300d is already listening on {}; \
+             refusing to start a second daemon over it",
+            path.display()
+        ),
+    }
+}
+
+/// Classify what is at `path` right now.
+async fn classify_socket(path: &Path) -> ExistingSocket {
+    if !path.exists() {
+        return ExistingSocket::Absent;
+    }
+    // A short timeout, so an unresponsive peer cannot stall startup: a socket
+    // that will not answer within a moment is treated as stale, which is the
+    // recoverable case, rather than as proof of a live daemon.
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        UnixStream::connect(path),
+    )
+    .await
+    {
+        Ok(Ok(_stream)) => ExistingSocket::Live,
+        // Refused, or the path vanished under us: a leftover, or nothing.
+        Ok(Err(_)) | Err(_) => ExistingSocket::Stale,
+    }
+}
+
 pub async fn run_server(state: Arc<RwLock<IpcState>>) -> Result<()> {
     let runtime_dir = dirs::runtime_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let socket_path = runtime_dir.join("epos-gsx300d.sock");
 
-    // Remove stale socket
-    if socket_path.exists() {
-        std::fs::remove_file(&socket_path)?;
+    // Decide before removing anything: see `socket_precondition`.
+    match socket_precondition(classify_socket(&socket_path).await, &socket_path)? {
+        SocketAction::Bind => {}
+        SocketAction::Replace => std::fs::remove_file(&socket_path)?,
     }
 
     // Ensure parent directory exists
@@ -1402,6 +1466,49 @@ mod tests {
         assert!(parse_request_head(b"").is_none());
         assert!(parse_request_head(b"not-a-request-line\r\n\r\n").is_none());
         assert!(parse_request_head(b"GET\r\n\r\n").is_none());
+    }
+
+    // ─── Taking over the IPC socket path ─────────────────────
+    //
+    // The old code unlinked whatever was at the path and then bound. Nothing
+    // asked whether anything was listening, so starting a second daemon
+    // silently pulled the Unix socket out from under the first one: the first
+    // kept its workers and its claim on the headset, the second took the
+    // socket, and neither said anything. Two daemons then fought over one
+    // device.
+
+    /// A live daemon is never displaced. The caller has to be told, because
+    /// the alternative — unlinking and binding anyway — is what produced two
+    /// daemons sharing the headset.
+    #[test]
+    fn a_live_socket_is_never_unlinked() {
+        let action = socket_precondition(ExistingSocket::Live, Path::new("/run/x.sock"))
+            .expect_err("a live socket must stop the second daemon");
+        assert!(
+            action.to_string().contains("already"),
+            "the reason must name the conflict: {action}"
+        );
+    }
+
+    /// A socket left behind by a daemon that died is safe to remove, or the
+    /// daemon could never start again after a crash or a hard reboot.
+    #[test]
+    fn a_stale_socket_is_removed_and_bound_over() {
+        assert_eq!(
+            socket_precondition(ExistingSocket::Stale, Path::new("/run/x.sock"))
+                .expect("a stale socket is recoverable"),
+            SocketAction::Replace
+        );
+    }
+
+    /// Nothing at the path is the normal first-start case.
+    #[test]
+    fn an_absent_socket_is_bound_fresh() {
+        assert_eq!(
+            socket_precondition(ExistingSocket::Absent, Path::new("/run/x.sock"))
+                .expect("an absent socket is the normal case"),
+            SocketAction::Bind
+        );
     }
 
     // ─── What counts as a successful, persistable change ──────
