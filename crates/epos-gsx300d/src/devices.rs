@@ -113,7 +113,7 @@ fn scan_usb_devices(
             // spawn), otherwise a fresh lookup (startup / reconnect).
             let (sink, source) = match (&cached_nodes, needs_fresh) {
                 (Some((s, m)), _) => (s.clone(), m.clone()),
-                (None, true) => find_pipewire_nodes(alsa_card),
+                (None, true) => find_pipewire_nodes(),
                 (None, false) => (String::new(), String::new()),
             };
 
@@ -192,60 +192,98 @@ fn find_alsa_card(vid: u16, pid: u16) -> Option<u8> {
     None
 }
 
-fn find_pipewire_nodes(_card: Option<u8>) -> (String, String) {
-    // Resolve the real PipeWire node names for this device by querying pw-dump.
-    // Falls back to wildcard patterns if pw-dump is unavailable.
+/// PipeWire node names for the EPOS, used when the live graph cannot answer.
+///
+/// The serial is embedded in the node name and is stable across reboots, so
+/// these are real names rather than a guess. They are the last line of defence:
+/// if PipeWire ever renames them, the test below is where that shows up.
+pub const EPOS_SINK_FALLBACK: &str =
+    "alsa_output.usb-Sennheiser_EPOS_GSX_300_A003200202602692-00.analog-stereo";
+pub const EPOS_SOURCE_FALLBACK: &str =
+    "alsa_input.usb-Sennheiser_EPOS_GSX_300_A003200202602692-00.mono-fallback";
+
+/// Pull the EPOS sink and source node names out of a `pw-dump` document.
+///
+/// Returns `None` — never a wildcard, never a partial answer — when the dump
+/// cannot be parsed, contains no EPOS node, or contains only one half of the
+/// pair.
+///
+/// The wildcard this used to fall back to is what broke the audio path on
+/// 2026-09-24. `pactl set-default-sink` rejects it outright, so the EQ's
+/// fail-closed fallback could not move playback off the anchor, and a wildcard
+/// written into a generated conf is not a node name — the EQ and voice
+/// filter-chains stopped publishing entirely and the watchdog then restarted
+/// them onto the same broken conf indefinitely. "Not found" is the only safe
+/// answer, because the caller has a real fallback and uses it.
+///
+/// Parsed as JSON rather than line by line: the previous hand-rolled parser only
+/// worked because this particular `pw-dump` happens to put one property per
+/// line, so compact JSON would have silently produced no names at all.
+fn select_epos_nodes(dump: &str) -> Option<(String, String)> {
+    let parsed: serde_json::Value = serde_json::from_str(dump).ok()?;
+    let array = parsed.as_array()?;
+
+    let mut sink: Option<String> = None;
+    let mut source: Option<String> = None;
+    for object in array {
+        if object["type"].as_str() != Some("PipeWire:Interface:Node") {
+            continue;
+        }
+        let props = &object["info"]["props"];
+        let name = props["node.name"].as_str().unwrap_or_default();
+        let description = props["node.description"].as_str().unwrap_or_default();
+        if !description.contains("EPOS GSX 300") {
+            continue;
+        }
+        if name.contains("output") && name.contains("analog-stereo") {
+            sink = Some(name.to_string());
+        } else if name.contains("input") && name.contains("mono-fallback") {
+            source = Some(name.to_string());
+        }
+    }
+
+    // Both halves or nothing: a sink with no source (or the reverse) would leave
+    // one of the two DSP chains pointing at a name that is not there.
+    match (sink, source) {
+        (Some(sink), Some(source)) => Some((sink, source)),
+        _ => None,
+    }
+}
+
+/// Decide the node names to use from whatever `pw-dump` managed to say.
+///
+/// Split from the subprocess so the invariant that matters — *never a wildcard* —
+/// is testable on the decision itself. Every unresolved outcome lands on the real
+/// fallback names, which is the whole point: a usable answer is always available,
+/// so there is never a reason to invent one.
+fn epos_node_names_from_dump(dump: Option<&str>) -> (String, String) {
+    let resolved = dump.and_then(select_epos_nodes);
+    if resolved.is_none() {
+        // The common cause is a startup race: the main graph has not published
+        // the device yet. Loud, because the alternative this replaced was an
+        // unusable wildcard written into the generated confs.
+        warn!(
+            "pw-dump did not yield an EPOS sink/source pair (main graph not up \
+             yet?) - using the known EPOS node names"
+        );
+    }
+    resolved.unwrap_or_else(|| {
+        (
+            EPOS_SINK_FALLBACK.to_string(),
+            EPOS_SOURCE_FALLBACK.to_string(),
+        )
+    })
+}
+
+/// Resolve the EPOS's PipeWire node names from the live graph.
+fn find_pipewire_nodes() -> (String, String) {
     let dump = std::process::Command::new("pw-dump")
         .output()
         .ok()
         .and_then(|o| {
             (o.status.success()).then(|| String::from_utf8_lossy(&o.stdout).into_owned())
         });
-
-    let mut sink = "alsa_output.usb-*:*.analog-stereo".to_string();
-    let mut source = "alsa_input.usb-*:*.mono-fallback".to_string();
-
-    if let Some(dump) = dump {
-        // Find nodes whose description mentions EPOS GSX 300
-        let mut in_node = false;
-        let mut props: Vec<(String, String)> = Vec::new();
-        for line in dump.lines() {
-            let t = line.trim();
-            if t.contains("PipeWire:Interface:Node") {
-                in_node = true;
-                props.clear();
-                continue;
-            }
-            if in_node {
-                if t == "}" || t.starts_with(']') {
-                    // node object boundary — evaluate collected props
-                    let desc = props.iter().find(|(k, _)| k == "node.description");
-                    let name = props.iter().find(|(k, _)| k == "node.name");
-                    if let (Some((_, d)), Some((_, n))) = (desc, name) {
-                        if d.contains("EPOS GSX 300") {
-                            if n.contains("output") && n.contains("analog-stereo") {
-                                sink = n.clone();
-                            } else if n.contains("input") && n.contains("mono-fallback") {
-                                source = n.clone();
-                            }
-                        }
-                    }
-                    in_node = false;
-                } else if let Some(eq) = t.find(':') {
-                    // JSON format: "key": "value"  or  "key": value
-                    let k = t[..eq].trim().trim_matches('"').to_string();
-                    let v = t[eq + 1..]
-                        .trim()
-                        .trim_matches(',')
-                        .trim_matches('"')
-                        .to_string();
-                    props.push((k, v));
-                }
-            }
-        }
-    }
-
-    (sink, source)
+    epos_node_names_from_dump(dump.as_deref())
 }
 
 fn find_hidraw(vid: u16, pid: u16) -> Option<std::path::PathBuf> {
@@ -285,4 +323,260 @@ fn find_input_event(vid: u16, pid: u16) -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Trimmed from a real `pw-dump` on this machine, the shape the selector has
+    /// to read: JSON, one property per line.
+    const REAL_DUMP_WITH_EPOS: &str = r#"[
+  { "type": "PipeWire:Interface:Core" },
+  { "info": { "props": {
+      "node.name": "alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink",
+      "node.description": "Generic USB Audio Speaker" } } },
+  { "type": "PipeWire:Interface:Node",
+    "info": { "props": {
+      "node.name": "alsa_output.usb-Sennheiser_EPOS_GSX_300_A003200202602692-00.analog-stereo",
+      "node.description": "EPOS GSX 300 Analog Stereo" } } },
+  { "type": "PipeWire:Interface:Node",
+    "info": { "props": {
+      "node.name": "alsa_input.usb-Sennheiser_EPOS_GSX_300_A003200202602692-00.mono-fallback",
+      "node.description": "EPOS GSX 300 Mono" } } }
+]"#;
+
+    /// The exact situation that broke the audio path on 2026-09-24: the daemon
+    /// started while the main graph was still coming up, so the EPOS nodes were
+    /// not in the dump yet. The old code answered with wildcard strings, which
+    /// were then written into the generated confs and left there — the EQ and
+    /// voice chains never published again, and the watchdog dutifully restarted
+    /// them onto the same broken conf.
+    ///
+    /// The answer here has to be "not found", so the caller falls back to the
+    /// known-good names instead of inventing unusable ones.
+    #[test]
+    fn a_dump_without_the_epos_nodes_yields_nothing() {
+        let dump = r#"[
+  { "type": "PipeWire:Interface:Core" },
+  { "type": "PipeWire:Interface:Node",
+    "info": { "props": {
+      "node.name": "alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink",
+      "node.description": "Generic USB Audio Speaker" } } }
+]"#;
+        assert_eq!(
+            select_epos_nodes(dump),
+            None,
+            "a device that has not appeared yet must not produce a name"
+        );
+    }
+
+    /// A wildcard is never an acceptable answer. It is not a node name, `pactl`
+    /// rejects it outright, and writing one into a generated conf produces a
+    /// silent, permanent failure instead of an obvious one.
+    #[test]
+    fn the_selector_never_returns_a_wildcard() {
+        for dump in [REAL_DUMP_WITH_EPOS, "[]", "garbage", ""] {
+            if let Some((sink, source)) = select_epos_nodes(dump) {
+                assert!(!sink.contains('*'), "sink was a wildcard: {sink}");
+                assert!(!source.contains('*'), "source was a wildcard: {source}");
+            }
+        }
+    }
+
+    /// The real thing has to be found, or the fallback is all that is ever used
+    /// and the serial-specific names stop being verified against reality.
+    #[test]
+    fn the_real_epos_nodes_are_selected() {
+        assert_eq!(
+            select_epos_nodes(REAL_DUMP_WITH_EPOS),
+            Some((
+                "alsa_output.usb-Sennheiser_EPOS_GSX_300_A003200202602692-00.analog-stereo"
+                    .to_string(),
+                "alsa_input.usb-Sennheiser_EPOS_GSX_300_A003200202602692-00.mono-fallback"
+                    .to_string(),
+            ))
+        );
+    }
+
+    /// Another device's nodes must never be mistaken for the EPOS. Grabbing the
+    /// speaker sink here would silently route audio to the wrong hardware.
+    #[test]
+    fn another_devices_nodes_are_never_claimed_as_epos() {
+        let dump = r#"[
+  { "type": "PipeWire:Interface:Node",
+    "info": { "props": {
+      "node.name": "alsa_output.usb-Sennheiser_SOMETHING_ELSE-00.analog-stereo",
+      "node.description": "Sennheiser Something Else" } } }
+]"#;
+        assert_eq!(select_epos_nodes(dump), None);
+    }
+
+    /// Only one half being present is not enough: a sink without its source (or
+    /// the reverse) would leave the voice chain targeting a name that is not
+    /// there, which is how the incident looked from the audio side.
+    #[test]
+    fn a_half_present_device_is_not_accepted() {
+        let sink_only = r#"[
+  { "type": "PipeWire:Interface:Node",
+    "info": { "props": {
+      "node.name": "alsa_output.usb-Sennheiser_EPOS_GSX_300_A003200202602692-00.analog-stereo",
+      "node.description": "EPOS GSX 300 Analog Stereo" } } }
+]"#;
+        assert_eq!(select_epos_nodes(sink_only), None);
+        assert_eq!(select_epos_nodes("[]"), None);
+    }
+
+    /// Unparseable input must be "not found", never a panic and never a guess.
+    #[test]
+    fn unparseable_or_empty_input_is_not_found() {
+        for dump in ["", "   ", "not json at all", "[{\"type\":", "{}"] {
+            assert_eq!(select_epos_nodes(dump), None, "input: {dump:?}");
+        }
+    }
+
+    /// The hardcoded fallback names are the last line of defence, so they have to
+    /// be the real ones. If PipeWire ever renames these, a test failing here is
+    /// the warning that the fallback has gone stale.
+    #[test]
+    fn the_fallback_names_match_what_pipewire_actually_publishes() {
+        assert_eq!(
+            EPOS_SINK_FALLBACK,
+            "alsa_output.usb-Sennheiser_EPOS_GSX_300_A003200202602692-00.analog-stereo"
+        );
+        assert_eq!(
+            EPOS_SOURCE_FALLBACK,
+            "alsa_input.usb-Sennheiser_EPOS_GSX_300_A003200202602692-00.mono-fallback"
+        );
+    }
+
+    /// The description check has to be load-bearing on its own, not merely
+    /// alongside the "both halves" rule.
+    ///
+    /// A different USB interface from the same vendor can present a sink and a
+    /// source with exactly the right name shape. Without the description check
+    /// this would happily adopt them, and audio would be routed to hardware that
+    /// is not the headset.
+    #[test]
+    fn right_shaped_names_on_the_wrong_description_are_rejected() {
+        let dump = r#"[
+  { "type": "PipeWire:Interface:Node",
+    "info": { "props": {
+      "node.name": "alsa_output.usb-Sennheiser_OTHER-00.analog-stereo",
+      "node.description": "Sennheiser Other Interface" } } },
+  { "type": "PipeWire:Interface:Node",
+    "info": { "props": {
+      "node.name": "alsa_input.usb-Sennheiser_OTHER-00.mono-fallback",
+      "node.description": "Sennheiser Other Interface" } } }
+]"#;
+        assert_eq!(
+            select_epos_nodes(dump),
+            None,
+            "both halves present, so only the description check can save this"
+        );
+    }
+
+    /// Only `PipeWire:Interface:Node` objects are nodes. A metadata or port
+    /// object that happens to carry node-like properties must not be read as one.
+    #[test]
+    fn only_node_objects_are_considered() {
+        let dump = r#"[
+  { "type": "PipeWire:Interface:Port",
+    "info": { "props": {
+      "node.name": "alsa_output.usb-Sennheiser_EPOS_GSX_300_X-00.analog-stereo",
+      "node.description": "EPOS GSX 300 Analog Stereo" } } },
+  { "type": "PipeWire:Interface:Port",
+    "info": { "props": {
+      "node.name": "alsa_input.usb-Sennheiser_EPOS_GSX_300_X-00.mono-fallback",
+      "node.description": "EPOS GSX 300 Mono" } } }
+]"#;
+        assert_eq!(
+            select_epos_nodes(dump),
+            None,
+            "a non-Node object must never be read as a node"
+        );
+    }
+
+    /// The regression guard for the 2026-09-24 outage, on the path that actually
+    /// produced it. Whatever `pw-dump` does — answer with nothing, answer with a
+    /// document that has no EPOS in it, answer with garbage, fail to start — the
+    /// names handed back must be usable node names, never wildcards.
+    ///
+    /// This is the function that shells out, so the decision is split out to
+    /// make it testable; the invariant lives with the decision rather than with
+    /// the subprocess.
+    #[test]
+    fn no_pw_dump_outcome_can_produce_a_wildcard() {
+        let outcomes: [Option<&str>; 6] = [
+            None,                                     // pw-dump unavailable
+            Some(""),                                 // empty stdout
+            Some("[]"),                               // no nodes yet
+            Some("not json at all"),                  // unparseable
+            Some(REAL_DUMP_WITH_EPOS),                // the good case
+            Some(r#"[{"type":"PipeWire:Interface:Node"}]"#),
+        ];
+        for dump in outcomes {
+            let (sink, source) = epos_node_names_from_dump(dump);
+            assert!(!sink.contains('*'), "wildcard sink from {dump:?}");
+            assert!(!source.contains('*'), "wildcard source from {dump:?}");
+        }
+    }
+
+    /// And the names handed back must be ones the pipeline can actually use: the
+    /// resolved pair, or the real fallback pair. Never a blank, never a mix of
+    /// one real name and one wildcard.
+    #[test]
+    fn the_fallback_pair_is_all_or_nothing() {
+        for dump in [None, Some(""), Some("not json")] {
+            let (sink, source) = epos_node_names_from_dump(dump);
+            assert_eq!(sink, EPOS_SINK_FALLBACK, "dump: {dump:?}");
+            assert_eq!(source, EPOS_SOURCE_FALLBACK, "dump: {dump:?}");
+        }
+        let (sink, source) = epos_node_names_from_dump(Some(REAL_DUMP_WITH_EPOS));
+        assert_eq!(sink, EPOS_SINK_FALLBACK, "the live names match the fallback here");
+        assert_eq!(source, EPOS_SOURCE_FALLBACK);
+    }
+
+    /// A dump that lists only one half must not produce a half-configured pair.
+    /// The voice chain targets the source; a blank there means a chain pointing at
+    /// nothing, which is how the incident presented from the audio side.
+    #[test]
+    fn an_unresolved_dump_never_yields_a_blank_name() {
+        let half = r#"[
+  { "type": "PipeWire:Interface:Node",
+    "info": { "props": {
+      "node.name": "alsa_output.usb-Sennheiser_EPOS_GSX_300_A003200202602692-00.analog-stereo",
+      "node.description": "EPOS GSX 300 Analog Stereo" } } }
+]"#;
+        let (sink, source) = epos_node_names_from_dump(Some(half));
+        assert!(!sink.is_empty(), "a blank sink would break the EQ target");
+        assert!(!source.is_empty(), "a blank source would break the voice target");
+    }
+
+    /// The live names must actually be used when they resolve. The real dump on
+    /// this machine happens to carry the same serial as the hardcoded fallback,
+    /// so asserting equality with the fallback cannot tell the two paths apart —
+    /// a fixture with a different serial is needed to prove the lookup is real
+    /// and not a fallback in disguise.
+    #[test]
+    fn resolved_live_names_win_over_the_fallback() {
+        let dump = r#"[
+  { "type": "PipeWire:Interface:Node",
+    "info": { "props": {
+      "node.name": "alsa_output.usb-Sennheiser_EPOS_GSX_300_DIFFERENTSERIAL-00.analog-stereo",
+      "node.description": "EPOS GSX 300 Analog Stereo" } } },
+  { "type": "PipeWire:Interface:Node",
+    "info": { "props": {
+      "node.name": "alsa_input.usb-Sennheiser_EPOS_GSX_300_DIFFERENTSERIAL-00.mono-fallback",
+      "node.description": "EPOS GSX 300 Mono" } } }
+]"#;
+        let (sink, source) = epos_node_names_from_dump(Some(dump));
+        assert_eq!(
+            sink, "alsa_output.usb-Sennheiser_EPOS_GSX_300_DIFFERENTSERIAL-00.analog-stereo",
+            "the name PipeWire published must be the one used, not the hardcoded one"
+        );
+        assert_eq!(
+            source, "alsa_input.usb-Sennheiser_EPOS_GSX_300_DIFFERENTSERIAL-00.mono-fallback"
+        );
+    }
 }

@@ -995,11 +995,13 @@ impl AudioPipeline {
             Some(d) if !d.pipewire_sink.is_empty() && !d.pipewire_source.is_empty() => {
                 (d.pipewire_sink.clone(), d.pipewire_source.clone())
             }
+            // No device, or a detection that could not resolve the names. The
+            // serial-bearing names are real, stable node names, so this is a
+            // working answer rather than a placeholder — and it is what keeps a
+            // startup race from writing an unusable target into the confs.
             _ => (
-                "alsa_output.usb-Sennheiser_EPOS_GSX_300_A003200202602692-00.analog-stereo"
-                    .to_string(),
-                "alsa_input.usb-Sennheiser_EPOS_GSX_300_A003200202602692-00.mono-fallback"
-                    .to_string(),
+                crate::devices::EPOS_SINK_FALLBACK.to_string(),
+                crate::devices::EPOS_SOURCE_FALLBACK.to_string(),
             ),
         }
     }
