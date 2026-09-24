@@ -115,6 +115,15 @@ pub enum Response {
         /// capture has actually been judged, because "not checked" is not the
         /// same claim as "checked and fine".
         mic_input: MicInputState,
+        /// Is the EQ actually in the audio path right now?
+        ///
+        /// Distinct from `eq_active`, which is only the toggle. Once a user can
+        /// select their own output device, playback routed elsewhere means the EQ
+        /// is genuinely bypassed — and `eq_active: true` on its own would report a
+        /// working equaliser that is not touching the sound, which is the exact
+        /// class of "enabled but not actually working" this status has been
+        /// corrected for twice already.
+        eq_in_path: bool,
         active_profile: String,
         mode: AudioMode,
         smart_button_action: String,

@@ -103,6 +103,12 @@ export interface DeviceStatus {
    * duplicate it. This field exists for IPC consumers that have no meter.
    */
   mic_input?: "Signal" | "Silent" | "Unknown";
+  /**
+   * Whether the EQ is genuinely in the audio path, as opposed to merely switched
+   * on. They differ once playback is routed somewhere else, which the user can now
+   * choose to do. Optional: added after the first Status shape.
+   */
+  eq_in_path?: boolean;
   active_profile: string;
   mode: AudioMode;
   smart_button_action?: string;

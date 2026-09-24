@@ -44,6 +44,11 @@ pub struct AudioPipeline {
     /// Microphone signal watchdog: the probe state, what is currently being
     /// reported, and when the last probe ran.
     mic_watch: Mutex<MicWatch>,
+    /// The output sink the user is currently using, when it is not one of ours.
+    ///
+    /// Only so the "the EQ is bypassed while you are on this device" line is
+    /// emitted once per change rather than on every 5 s poll.
+    last_user_sink: Mutex<Option<String>>,
 }
 
 /// Microphone signal watchdog bookkeeping.
@@ -125,23 +130,76 @@ pub enum OutputRoute {
 /// audio away from whatever device the user is actually using.
 ///
 /// Pure policy, deliberately free of I/O so it can be tested directly.
+/// What to do with the default sink on this poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputDecision {
+    /// Point the default sink at the given route.
+    Set(OutputRoute),
+    /// The user selected a different device. Leave it alone.
+    RespectUserChoice,
+    /// Nothing to do: the device is absent.
+    Untouched,
+}
+
+/// Which sink the default should point at, if any.
+///
+/// The daemon owns exactly two sinks — the EQ anchor and the raw hardware sink —
+/// and normalises between them. Any other *published* sink was chosen by
+/// somebody, so it is left alone.
+///
+/// That rule exists because the previous one was not a rule at all. The watchdog
+/// re-asserted the default on every poll, so a user who selected the speakers had
+/// their choice undone five seconds later, and the volume control went back to
+/// adjusting the headset with it. Being unable to choose a device is worse than
+/// the EQ not being applied, and the EQ not being applied is now *reported*
+/// rather than hidden.
 pub fn desired_output_route(
     eq_enabled: bool,
     device_connected: bool,
     chain_present: bool,
-) -> Option<OutputRoute> {
+    current_default: &str,
+    raw_sink: &str,
+    published_sinks: &[String],
+) -> OutputDecision {
     if !device_connected {
-        return None;
+        return OutputDecision::Untouched;
+    }
+    if is_user_choice(current_default, raw_sink, EQ_SINK_NAME, published_sinks) {
+        return OutputDecision::RespectUserChoice;
     }
     // `Processed` points apps at `epos-eq-input`, a null-sink that only
     // produces audio while the EQ filter-chain is draining its monitor. With
     // the chain absent that is a sink into a void, so an enabled-but-broken EQ
     // must resolve to the raw hardware sink instead of the anchor.
-    Some(if eq_enabled && chain_present {
+    OutputDecision::Set(if eq_enabled && chain_present {
         OutputRoute::Processed
     } else {
         OutputRoute::Raw
     })
+}
+
+/// Is `current` a device somebody chose, rather than one this daemon manages?
+///
+/// Three things have to hold, and each rules out a way of getting this wrong:
+/// it must be known (a blank is a question, not an answer), it must be
+/// published (otherwise it is a leftover from a device that has gone), and it
+/// must not be ours (the anchor and the raw hardware sink are ours to
+/// normalise, or the EQ route could never be repaired).
+fn is_user_choice(current: &str, raw: &str, anchor: &str, published: &[String]) -> bool {
+    !current.is_empty()
+        && !sink_is_managed(current, raw)
+        && current != anchor
+        && published.iter().any(|sink| sink == current)
+}
+
+/// Is the EQ actually in the audio path right now?
+///
+/// True only when the EQ is enabled *and* playback is routed through its anchor.
+/// With the user on another device the EQ is genuinely bypassed, and reporting
+/// "active" without this would be the same silent-not-working failure this
+/// project has been removing one at a time.
+pub fn eq_in_path(eq_enabled: bool, current_default_sink: &str) -> bool {
+    eq_enabled && current_default_sink == EQ_SINK_NAME
 }
 
 /// Is `sink` one this daemon sets itself?
@@ -479,18 +537,54 @@ pub const VOICE_SOURCE_NAME: &str = "epos-voice-output";
 /// headset is absent, or the processed node is not currently published. The
 /// last case matters most: pointing the default source at a node that does not
 /// exist turns "no voice processing" into "no microphone at all".
-pub fn desired_input_route(
+/// What to do with the default source on this poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputDecision<'a> {
+    /// Point the default source here. Borrowed rather than `&'static` because the
+    /// raw source is a device name held in the pipeline, not a constant.
+    Set(&'a str),
+    /// The user selected a different microphone. Leave it alone.
+    RespectUserChoice,
+    /// Nothing to do: the device is absent.
+    Untouched,
+}
+
+/// Which source the default should point at.
+///
+/// Same rule as the output side, for the same reason: `route_input` ran on every
+/// poll and re-asserted the processed source, so a microphone the user selected
+/// was undoable within five seconds — the identical defect, one direction over.
+pub fn desired_input_route<'a>(
     voice_active: bool,
     noise_gate: bool,
     device_connected: bool,
     processed_node_present: bool,
-) -> Option<&'static str> {
+    current_default: &str,
+    raw_source: &'a str,
+    published_sources: &[String],
+) -> InputDecision<'a> {
     if !device_connected {
-        return None;
+        return InputDecision::Untouched;
     }
-    (voice_active || noise_gate)
-        .then_some(VOICE_SOURCE_NAME)
-        .filter(|_| processed_node_present)
+    if is_user_choice(
+        current_default,
+        raw_source,
+        VOICE_SOURCE_NAME,
+        published_sources,
+    ) {
+        return InputDecision::RespectUserChoice;
+    }
+    let processing = voice_active || noise_gate;
+    if processing && processed_node_present {
+        InputDecision::Set(VOICE_SOURCE_NAME)
+    } else if processing {
+        // The processed source is gone. Falling back to the raw microphone keeps
+        // the user able to speak; the previous behaviour was identical, but
+        // expressed through the same decision as everything else.
+        InputDecision::Set(raw_source)
+    } else {
+        InputDecision::Set(raw_source)
+    }
 }
 
 impl AudioPipeline {
@@ -504,6 +598,7 @@ impl AudioPipeline {
             eq_chain_recovered_polls: AtomicU32::new(0),
             role_health: Mutex::new(BTreeMap::new()),
             mic_watch: Mutex::new(MicWatch::default()),
+            last_user_sink: Mutex::new(None),
         };
         // Same funnel as update_config, so a hand-edited config.json is bounded
         // at startup too and not only on later IPC updates.
@@ -810,6 +905,16 @@ impl AudioPipeline {
                 self.restarts.request(role);
             }
         }
+    }
+
+    /// Is the EQ in the audio path as things stand right now?
+    ///
+    /// Read live rather than cached: the user can move playback at any moment, and
+    /// a status that said "in the path" from a value read thirty seconds ago would
+    /// be its own small lie.
+    pub async fn eq_in_path_now(&self) -> bool {
+        let current = Self::read_default_sink().await.unwrap_or_default();
+        eq_in_path(self.config.eq.enabled, &current)
     }
 
     /// The current watchdog state for `role`, defaulting for a role seen first
@@ -1221,29 +1326,54 @@ impl AudioPipeline {
 
         let processed_present =
             Self::main_graph_probe(VOICE_SOURCE_NAME).await == ChainProbe::Present;
-        let Some(target) = desired_input_route(
+        let raw_source = self
+            .device
+            .as_ref()
+            .map(|d| d.pipewire_source.as_str())
+            .unwrap_or_default();
+        // Which sources exist, so a default the user picked can be told apart from
+        // a leftover naming a device that has gone.
+        let published = Self::main_node_list()
+            .await
+            .map(|list| {
+                list.lines()
+                    .filter_map(|line| line.trim().strip_prefix("node.name = \""))
+                    .filter_map(|rest| rest.split('"').next())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        match desired_input_route(
             voice_active,
             noise_gate,
             device_connected,
             processed_present,
-        ) else {
-            // Nothing to route to. If we had been pointing at the processed
-            // node and it is gone, fall back to the raw device so the user is
-            // not left with a dead default source.
-            if current.as_deref() == Some(VOICE_SOURCE_NAME) {
-                if let Some(raw) = self.device.as_ref().map(|d| d.pipewire_source.as_str()) {
-                    if !raw.is_empty() {
-                        Self::set_default_source(raw).await?;
-                        warn!("Processed mic disappeared — default source restored to {raw}");
-                        return Ok(true);
-                    }
-                }
+            current.as_deref().unwrap_or_default(),
+            raw_source,
+            &published,
+        ) {
+            InputDecision::Untouched => Ok(false),
+            InputDecision::RespectUserChoice => {
+                // A microphone the user selected is not ours to take. Reported so
+                // the voice processing being bypassed is visible rather than
+                // silent.
+                debug!("Default source left on the user's choice: {current:?}");
+                Ok(false)
             }
-            return Ok(false);
-        };
-        Self::set_default_source(target).await?;
-        info!("Input routed to {target} (voice processing active)");
-        Ok(true)
+            InputDecision::Set(target) => {
+                if current.as_deref() == Some(target) {
+                    return Ok(false);
+                }
+                Self::set_default_source(target).await?;
+                if processing {
+                    info!("Input routed to {target} (voice processing active)");
+                } else {
+                    info!("Input routed to {target} (voice processing off)");
+                }
+                Ok(true)
+            }
+        }
     }
 
     async fn set_default_source(source: &str) -> Result<()> {
@@ -1283,11 +1413,55 @@ impl AudioPipeline {
             }
             None => false,
         };
-        let Some(route) = desired_output_route(eq_enabled, device_connected, chain_present) else {
-            // Device absent: leave the user's current default alone.
-            return Ok(false);
-        };
         let (raw_sink, _) = self.node_names();
+        // The current default and the set of published sinks, so a device the
+        // user selected can be told apart from one of ours and from a leftover.
+        let previous = Self::read_default_sink().await;
+        let published = Self::main_node_list()
+            .await
+            .map(|list| {
+                list.lines()
+                    .filter_map(|line| line.trim().strip_prefix("node.name = \""))
+                    .filter_map(|rest| rest.split('"').next())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let route = match desired_output_route(
+            eq_enabled,
+            device_connected,
+            chain_present,
+            previous.as_deref().unwrap_or_default(),
+            &raw_sink,
+            &published,
+        ) {
+            OutputDecision::Untouched => return Ok(false),
+            OutputDecision::RespectUserChoice => {
+                // The user picked a different device, so it stays. Logged once per
+                // change rather than every poll, because the consequence matters:
+                // with the EQ on, playback elsewhere means the EQ is not in the
+                // path, and that is now reported through `eq_in_path` rather than
+                // quietly pretended otherwise.
+                if previous.as_deref() != self.last_user_sink.lock().unwrap().as_deref() {
+                    if let Ok(mut remembered) = self.last_user_sink.lock() {
+                        *remembered = previous.clone();
+                    }
+                    info!(
+                        "Output left on {} as chosen — the EQ is bypassed while \
+                         playback is not routed through it",
+                        previous.as_deref().unwrap_or("the current sink")
+                    );
+                }
+                return Ok(false);
+            }
+            OutputDecision::Set(route) => route,
+        };
+        // Coming back to one of our own sinks: forget the remembered choice so a
+        // later switch away is reported again.
+        if let Ok(mut remembered) = self.last_user_sink.lock() {
+            *remembered = None;
+        }
         let target = match route {
             OutputRoute::Processed => EQ_SINK_NAME.to_string(),
             OutputRoute::Raw => raw_sink.clone(),
@@ -2676,16 +2850,16 @@ mod tests {
     #[test]
     fn eq_on_with_device_routes_to_processed_sink() {
         assert_eq!(
-            desired_output_route(true, true, true),
-            Some(OutputRoute::Processed)
+            desired_output_route(true, true, true, "", "", &[]),
+            OutputDecision::Set(OutputRoute::Processed)
         );
     }
 
     /// With EQ OFF, playback must go straight to the EPOS hardware sink.
     #[test]
     fn eq_off_with_device_routes_to_raw_sink() {
-        assert_eq!(desired_output_route(false, true, false),
-              Some(OutputRoute::Raw));
+        assert_eq!(desired_output_route(false, true, false, "", "", &[]),
+              OutputDecision::Set(OutputRoute::Raw));
     }
 
     /// While the EPOS is unplugged the daemon must NOT claim the default sink.
@@ -2695,8 +2869,8 @@ mod tests {
     fn absent_device_never_touches_the_default_sink() {
         for eq_enabled in [true, false] {
             assert_eq!(
-                desired_output_route(eq_enabled, false, true),
-                None,
+                desired_output_route(eq_enabled, false, true, "", "", &[]),
+                OutputDecision::Untouched,
                 "eq_enabled={eq_enabled} must not touch the default while absent"
             );
         }
@@ -3028,16 +3202,110 @@ mod tests {
     // not actually published, pointing the default at it would leave the user
     // with no working microphone at all.
 
+    /// The microphone side has the same defect the output side had, and the same
+    /// fix: a source the user picked is left alone. Measured as the output case
+    /// — `route_input` asserted the processed source on every 5 s poll, so a
+    /// different microphone could not be used for longer than one poll.
+    #[test]
+    fn a_users_chosen_microphone_is_not_taken_back() {
+        let mic = "alsa_input.usb-Generic_USB_Audio-00.HiFi_7_1__Mic__source";
+        let sources = vec![
+            mic.to_string(),
+            "alsa_input.usb-EPOS-00.mono-fallback".to_string(),
+        ];
+        assert_eq!(
+            desired_input_route(
+                true,
+                true,
+                true,
+                true,
+                mic,
+                "alsa_input.usb-EPOS-00.mono-fallback",
+                &sources,
+            ),
+            InputDecision::RespectUserChoice,
+            "the voice chain being active is not a reason to overrule the mic \
+             the user selected"
+        );
+    }
+
+    /// The processed source is ours, so it is still ours to normalise: with
+    /// processing on and no other choice made, the default belongs there.
+    #[test]
+    fn our_own_microphone_is_still_normalised() {
+        let raw = "alsa_input.usb-EPOS-00.mono-fallback";
+        assert_eq!(
+            desired_input_route(true, false, true, true, raw, raw, &[raw.to_string()]),
+            InputDecision::Set(VOICE_SOURCE_NAME)
+        );
+        assert_eq!(
+            desired_input_route(false, false, true, true, raw, raw, &[raw.to_string()]),
+            InputDecision::Set(raw),
+            "processing off: the raw microphone"
+        );
+    }
+
+    /// The processed microphone is ours even though `sink_is_managed` knows
+    /// nothing about it.
+    ///
+    /// That helper is written in terms of the *output* sinks — the EQ anchor and
+    /// the raw hardware sink. The processed source is a different name entirely,
+    /// so the "not one of ours" test does not cover it and the explicit anchor
+    /// exclusion is the only thing keeping the daemon from treating its own
+    /// microphone as a user choice. Found by mutation: dropping the exclusion left
+    /// every existing test green, because the raw-source cases are covered
+    /// elsewhere. This one is not.
+    #[test]
+    fn our_own_processed_microphone_is_not_mistaken_for_a_user_choice() {
+        let raw = crate::devices::EPOS_SOURCE_FALLBACK;
+        let published = vec![VOICE_SOURCE_NAME.to_string(), raw.to_string()];
+        assert_eq!(
+            desired_input_route(
+                true,
+                false,
+                true,
+                true,
+                VOICE_SOURCE_NAME,
+                raw,
+                &published,
+            ),
+            InputDecision::Set(VOICE_SOURCE_NAME),
+            "the processed mic is ours; treating it as the user's choice would \
+             mean never routing to it again"
+        );
+    }
+
+    /// A source that is no longer published is not a choice.
+    #[test]
+    fn a_default_microphone_that_no_longer_exists_is_not_a_user_choice() {
+        let raw = "alsa_input.usb-EPOS-00.mono-fallback";
+        let gone = "alsa_input.usb-Something-Else-00.mono-fallback";
+        assert_eq!(
+            desired_input_route(true, false, true, true, gone, raw, &[raw.to_string()]),
+            InputDecision::Set(VOICE_SOURCE_NAME)
+        );
+    }
+
+    /// Headset unplugged: leave the default source alone entirely.
+    #[test]
+    fn an_absent_device_never_touches_the_default_microphone() {
+        let raw = "alsa_input.usb-EPOS-00.mono-fallback";
+        assert_eq!(
+            desired_input_route(true, true, false, true, "", raw, &[raw.to_string()]),
+            InputDecision::Untouched
+        );
+    }
+
     /// Voice processing active -> the processed source.
     #[test]
     fn processed_mic_is_desired_when_voice_work_is_on() {
         assert_eq!(
-            desired_input_route(true, false, true, true).as_deref(),
-            Some(VOICE_SOURCE_NAME)
+            desired_input_route(true, false, true, true, "", "", &[]),
+            InputDecision::Set(VOICE_SOURCE_NAME)
         );
         assert_eq!(
-            desired_input_route(false, true, true, true).as_deref(),
-            Some(VOICE_SOURCE_NAME),
+            desired_input_route(false, true, true, true, "", "", &[]),
+            InputDecision::Set(VOICE_SOURCE_NAME),
             "the noise gate alone also needs the processed source"
         );
     }
@@ -3045,26 +3313,40 @@ mod tests {
     /// Nothing enabled -> stay on the raw mic.
     #[test]
     fn raw_mic_is_desired_when_no_voice_work_is_on() {
-        assert_eq!(desired_input_route(false, false, true, true), None);
+        let raw = crate::devices::EPOS_SOURCE_FALLBACK;
+        assert_eq!(
+            desired_input_route(false, false, true, true, "", raw, &[]),
+            InputDecision::Set(raw)
+        );
     }
 
     /// The processed node missing from MAIN must never become the default:
     /// that is the difference between "no processing" and "no microphone".
+    ///
+    /// The old shape of this policy returned "no decision" here and let the caller
+    /// do the restore in a separate branch. The outcome it guarded is unchanged —
+    /// the decision now names the raw microphone directly — so the assertion is on
+    /// the destination rather than on the absence of one.
     #[test]
     fn processed_mic_is_not_desired_when_the_node_is_absent() {
+        let raw = crate::devices::EPOS_SOURCE_FALLBACK;
         assert_eq!(
-            desired_input_route(true, false, true, false),
-            None,
+            desired_input_route(true, false, true, false, "", raw, &[]),
+            InputDecision::Set(raw),
             "routing to a source that does not exist would mute every app"
         );
-        assert_eq!(desired_input_route(false, true, true, false), None);
+        assert_eq!(
+            desired_input_route(false, true, true, false, "", raw, &[]),
+            InputDecision::Set(raw)
+        );
     }
 
     /// Disconnected: leave the user's current default alone rather than
     /// forcing a route we cannot honour.
     #[test]
     fn no_input_route_is_desired_while_disconnected() {
-        assert_eq!(desired_input_route(true, true, false, true), None);
+        assert_eq!(desired_input_route(true, true, false, true, "", "", &[]),
+            InputDecision::Untouched);
     }
 
     // ── The EQ must never be advertised unless its chain actually exists ──
@@ -3083,8 +3365,8 @@ mod tests {
     #[test]
     fn eq_route_falls_back_to_raw_when_the_chain_is_missing() {
         assert_eq!(
-            desired_output_route(true, true, false),
-            Some(OutputRoute::Raw),
+            desired_output_route(true, true, false, "", "", &[]),
+            OutputDecision::Set(OutputRoute::Raw),
             "routing to epos-eq-input without epos-eq-capture would silence apps"
         );
     }
@@ -3093,23 +3375,25 @@ mod tests {
     #[test]
     fn eq_route_uses_the_anchor_when_the_chain_is_present() {
         assert_eq!(
-            desired_output_route(true, true, true),
-            Some(OutputRoute::Processed)
+            desired_output_route(true, true, true, "", "", &[]),
+            OutputDecision::Set(OutputRoute::Processed)
         );
     }
 
     /// EQ off is unaffected: raw sink whether or not a chain lingers.
     #[test]
     fn eq_off_always_means_raw_sink() {
-        assert_eq!(desired_output_route(false, true, false), Some(OutputRoute::Raw));
-        assert_eq!(desired_output_route(false, true, true), Some(OutputRoute::Raw));
+        assert_eq!(desired_output_route(false, true, false, "", "", &[]), OutputDecision::Set(OutputRoute::Raw));
+        assert_eq!(desired_output_route(false, true, true, "", "", &[]), OutputDecision::Set(OutputRoute::Raw));
     }
 
     /// Disconnected: leave the default alone, as before.
     #[test]
     fn no_output_route_is_desired_while_disconnected() {
-        assert_eq!(desired_output_route(true, false, true), None);
-        assert_eq!(desired_output_route(false, false, false), None);
+        assert_eq!(desired_output_route(true, false, true, "", "", &[]),
+            OutputDecision::Untouched);
+        assert_eq!(desired_output_route(false, false, false, "", "", &[]),
+            OutputDecision::Untouched);
     }
 
     /// The health check must judge the EQ by its chain node when the EQ is
@@ -4189,5 +4473,156 @@ mod tests {
                 "sink: {sink}"
             );
         }
+    }
+
+    // ── The user's device choice outranks this daemon ───────────────────────
+    //
+    // Measured before this change: the user set the default sink to the speakers,
+    // the volume control correctly followed them, and **five seconds later** the
+    // watchdog put it back to the EQ anchor — so the dial ended up adjusting the
+    // headset again. The whole device choice was undoable by a poll.
+    //
+    // The rule now: the daemon owns exactly two sinks, the EQ anchor and the raw
+    // hardware sink, and normalises between them. Any other *published* sink was
+    // chosen by somebody, so it is left alone — and because playback stays there,
+    // the volume control has something real to control.
+    //
+    // The cost is stated rather than hidden: with the EQ on and playback
+    // elsewhere, the EQ is genuinely not in the audio path. That is reported
+    // (`eq_in_path`) rather than papered over, which is the same rule this
+    // project has applied to every other "the feature is on but not actually
+    // working" case.
+
+    /// The reported bug, in policy form: the speakers are the default, they are a
+    /// real published sink, and the daemon must not drag the user back.
+    #[test]
+    fn a_users_chosen_sink_is_not_taken_back() {
+        let speakers = vec![
+            "alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink".to_string(),
+            "alsa_output.usb-EPOS-00.analog-stereo".to_string(),
+        ];
+        assert_eq!(
+            desired_output_route(
+                true,
+                true,
+                true,
+                "alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink",
+                "alsa_output.usb-EPOS-00.analog-stereo",
+                &speakers,
+            ),
+            OutputDecision::RespectUserChoice,
+            "the EQ being on is not a reason to overrule a device the user picked"
+        );
+    }
+
+    /// The same, with the EQ off. The daemon used to pull the route back to the
+    /// raw headset in this case too.
+    #[test]
+    fn a_users_chosen_sink_survives_even_with_the_eq_off() {
+        let speakers = vec!["bluez_sink.00_00_00_00_00_00.a2dp_sink".to_string()];
+        assert_eq!(
+            desired_output_route(
+                false,
+                true,
+                false,
+                "bluez_sink.00_00_00_00_00_00.a2dp_sink",
+                "alsa_output.usb-EPOS-00.analog-stereo",
+                &speakers,
+            ),
+            OutputDecision::RespectUserChoice
+        );
+    }
+
+    /// Our own two sinks are still ours to normalise, otherwise the EQ route
+    /// could never be repaired. Choosing the raw headset explicitly while the EQ
+    /// is on resolves to the anchor, which is what "the EQ is on" means.
+    #[test]
+    fn the_daemons_own_sinks_are_still_normalised() {
+        let raw = "alsa_output.usb-EPOS-00.analog-stereo";
+        assert_eq!(
+            desired_output_route(true, true, true, raw, raw, &[raw.to_string()]),
+            OutputDecision::Set(OutputRoute::Processed),
+            "the raw sink with the EQ on resolves to the anchor"
+        );
+        assert_eq!(
+            desired_output_route(false, true, false, raw, raw, &[raw.to_string()]),
+            OutputDecision::Set(OutputRoute::Raw)
+        );
+        assert_eq!(
+            desired_output_route(
+                false,
+                true,
+                false,
+                EQ_SINK_NAME,
+                raw,
+                &[raw.to_string()]
+            ),
+            OutputDecision::Set(OutputRoute::Raw),
+            "the anchor with the EQ off resolves to raw hardware"
+        );
+    }
+
+    /// A sink that is *not* published is not a user choice, it is a leftover. A
+    /// vanished device must not be able to freeze the route somewhere useless.
+    #[test]
+    fn a_default_sink_that_no_longer_exists_is_not_a_user_choice() {
+        let raw = "alsa_output.usb-EPOS-00.analog-stereo";
+        assert_eq!(
+            desired_output_route(
+                true,
+                true,
+                true,
+                "alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink",
+                raw,
+                &[raw.to_string()],
+            ),
+            OutputDecision::Set(OutputRoute::Processed),
+            "a sink that is not in the graph cannot be what the user is listening to"
+        );
+    }
+
+    /// No device: leave the default alone, as before. Stealing it from whatever
+    /// the user is really using is the failure this whole path exists to avoid.
+    #[test]
+    fn an_absent_device_never_touches_the_default() {
+        let raw = "alsa_output.usb-EPOS-00.analog-stereo";
+        assert_eq!(
+            desired_output_route(true, false, true, "", raw, &[raw.to_string()]),
+            OutputDecision::Untouched
+        );
+        assert_eq!(
+            desired_output_route(true, false, true, "some_other_sink", raw, &["some_other_sink".to_string()]),
+            OutputDecision::Untouched,
+            "not even a user choice may pull the default while the device is gone"
+        );
+    }
+
+    /// An unknown default is not a choice, it is a question. Ask the daemon what
+    /// it wants rather than treating the blank as an answer.
+    #[test]
+    fn an_unknown_default_is_not_treated_as_a_user_choice() {
+        let raw = "alsa_output.usb-EPOS-00.analog-stereo";
+        assert_eq!(
+            desired_output_route(true, true, true, "", raw, &[raw.to_string()]),
+            OutputDecision::Set(OutputRoute::Processed)
+        );
+    }
+
+    /// The EQ must only claim to be in the audio path when playback is actually
+    /// routed through its anchor. This is what keeps "the user chose the speakers"
+    /// from becoming "the EQ is silently off".
+    #[test]
+    fn the_eq_is_only_in_the_path_when_playback_sits_on_the_anchor() {
+        let speakers = "alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink";
+        assert!(
+            eq_in_path(true, EQ_SINK_NAME),
+            "on the anchor with the EQ on: in the path"
+        );
+        assert!(
+            !eq_in_path(true, speakers),
+            "playback elsewhere with the EQ on: the EQ is bypassed, and saying \
+             otherwise is the lie this avoids"
+        );
+        assert!(!eq_in_path(false, EQ_SINK_NAME), "EQ off: never in the path");
     }
 }
