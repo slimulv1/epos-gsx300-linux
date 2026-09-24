@@ -798,6 +798,16 @@ fn generate_eq_instance_conf(bands: &[epos_shared::config::EqBand], sink: &str) 
         info!("EQ: {} active band(s)", active);
     }
 
+    // NOTE: the EQ capture side deliberately has NO `node.dont-fallback`.
+    //
+    // It is the correct fail-closed property on a playback stream, and the
+    // voice chain verifiably runs with it. But on a capture whose target is
+    // the anchor's monitor, it makes the module abandon the target lookup and
+    // fail with "defined target not found", so the chain never publishes and
+    // the EQ is a silent no-op. Measured both ways on 2026-09-24: with the
+    // property the chain is absent; without it the chain runs and a 500 Hz
+    // band moves the output by +14.8 dB / -7.8 dB as configured. The playback
+    // side keeps it so EQ'd audio cannot spill to another sink.
     let module = format!(
         r#"
     {{ name = libpipewire-module-filter-chain
@@ -817,7 +827,6 @@ fn generate_eq_instance_conf(bands: &[epos_shared::config::EqBand], sink: &str) 
             node.name = "epos-eq-capture"
             target.object = "epos-eq-input.monitor"
             remote.name = "pipewire-0"
-            node.dont-fallback = true
         }}
         playback.props = {{
             node.name = "epos-eq-output"
@@ -1581,11 +1590,32 @@ mod tests {
         assert!(!dump_has_node("[{\"info\":{\"props\":{}}}]", "epos-voice-output"));
     }
 
-    /// `epos-eq-input` is the static null-sink and must be expected whether or
-    /// not the EQ is engaged — it is what apps target either way.
+    /// With the EQ disabled the conf carries a passthrough graph, so the only
+    /// thing the role can be expected to publish is the static anchor.
     #[test]
-    fn eq_role_always_expects_the_anchor_sink() {
-        assert_eq!(expected_node("eq").as_deref(), Some("epos-eq-input"));
+    fn eq_role_with_passthrough_graph_expects_only_the_anchor() {
+        let conf = generate_eq_instance_conf(&[], "sink");
+        assert!(
+            !conf.contains("eq_band_"),
+            "sanity: an empty band list must produce a passthrough graph"
+        );
+        assert_eq!(eq_expected_node(&conf), EQ_SINK_NAME);
+    }
+
+    /// With bands in the graph the chain node is what must be published, so a
+    /// dead EQ is reported as unhealthy instead of healthy-by-anchor.
+    #[test]
+    fn eq_role_with_bands_expects_the_chain_node() {
+        let conf = generate_eq_instance_conf(
+            &[epos_shared::config::EqBand {
+                freq: 1000,
+                gain_db: 6.0,
+                q: 1.0,
+            }],
+            "sink",
+        );
+        assert!(conf.contains("eq_band_"), "sanity: the band must reach the graph");
+        assert_eq!(eq_expected_node(&conf), "epos-eq-capture");
     }
 
     /// An unknown role expects nothing rather than panicking. The restart bus
@@ -1705,11 +1735,60 @@ mod tests {
                 !conf.contains("node.passive"),
                 "{role}: node.passive prevents the chain from ever linking"
             );
-            assert!(
-                conf.contains("node.dont-fallback = true"),
-                "{role}: fail-closed must use node.dont-fallback"
-            );
         }
+    }
+
+    /// The EQ capture side must NOT carry `node.dont-fallback`.
+    ///
+    /// It is the correct fail-closed property on a playback stream, and the
+    /// voice chain runs with it, but on the EQ capture -- whose target is the
+    /// anchor's monitor -- the module gives up the target lookup and fails
+    /// with "defined target not found", leaving the whole EQ chain
+    /// unpublished. Measured both ways: with it the chain is absent, without
+    /// it the chain runs and the band shapes the output.
+    #[test]
+    fn eq_capture_side_never_sets_dont_fallback() {
+        let conf = generate_eq_instance_conf(&[], "sink");
+        let capture = conf
+            .split("capture.props")
+            .nth(1)
+            .and_then(|rest| rest.split("playback.props").next())
+            .expect("eq conf has a capture side");
+        assert!(
+            !capture.contains("node.dont-fallback"),
+            "eq capture: node.dont-fallback breaks target resolution and the \
+             chain never publishes"
+        );
+    }
+
+    /// The EQ playback side keeps it, so EQ'd audio cannot spill to another
+    /// sink if the headset disappears.
+    #[test]
+    fn eq_playback_side_keeps_dont_fallback() {
+        let conf = generate_eq_instance_conf(&[], "sink");
+        let playback = conf
+            .split("playback.props")
+            .nth(1)
+            .expect("eq conf has a playback side");
+        assert!(
+            playback.contains("node.dont-fallback = true"),
+            "eq playback: fail-closed must be kept so audio cannot leak to \
+             another sink when the headset is gone"
+        );
+    }
+
+    /// The voice chain is verified working with `node.dont-fallback` on both
+    /// sides; its targets are ALSA nodes, where the property does not interfere
+    /// with resolution. Pinned so nobody "harmonises" it away.
+    #[test]
+    fn voice_chain_keeps_dont_fallback_on_both_sides() {
+        let conf = generate_voice_instance_conf("source", true, 50.0, &VoiceMode::Warm, &[]);
+        assert_eq!(
+            conf.matches("node.dont-fallback = true").count(),
+            2,
+            "voice: dont-fallback is verified working on both sides; removing \
+             it would be an unmeasured change"
+        );
     }
 
     // ── Routing the capture path ──────────────────────────────────────────
