@@ -67,6 +67,39 @@ impl Default for RestartBus {
     }
 }
 
+/// Static fail-closed null-sink in the MAIN graph, installed once by
+/// `40-epos-eq-virtualsink.conf`. The `pipewire-epos@eq` instance captures
+/// its monitor and plays the EQ'd result to the raw hardware sink.
+pub const EQ_SINK_NAME: &str = "epos-eq-input";
+
+/// Which sink new playback streams should attach to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputRoute {
+    /// `epos-eq-input` — playback goes through the 9-band EQ.
+    Processed,
+    /// The EPOS hardware sink — playback bypasses the EQ.
+    Raw,
+}
+
+/// Decide which sink should be the PipeWire default, given the EQ toggle and
+/// whether the device is present.
+///
+/// `None` means "do not touch the default sink". While the EPOS is absent there
+/// is no `Raw` sink to point at, and forcibly claiming the default would yank
+/// audio away from whatever device the user is actually using.
+///
+/// Pure policy, deliberately free of I/O so it can be tested directly.
+pub fn desired_output_route(eq_enabled: bool, device_connected: bool) -> Option<OutputRoute> {
+    if !device_connected {
+        return None;
+    }
+    Some(if eq_enabled {
+        OutputRoute::Processed
+    } else {
+        OutputRoute::Raw
+    })
+}
+
 /// Hard limits for every EQ / voice band interpolated into a generated
 /// PipeWire config. They are deliberately conservative: the values are written
 /// verbatim into a config file that PipeWire parses, so a malformed, stale, or
@@ -239,6 +272,94 @@ impl AudioPipeline {
                     .to_string(),
             ),
         }
+    }
+
+    // ─── Output routing (EQ on/off) ───────────────────────────
+    //
+    // Playback reaches the EQ only if new streams attach to the
+    // `epos-eq-input` anchor. Apps otherwise pick the raw EPOS hardware sink
+    // and the whole filter-chain is bypassed.
+    //
+    // WHY THE DEFAULT SINK AND NOT A WIREPLUMBER RULE
+    // Both alternatives were tried and measured on this machine
+    // (WirePlumber 0.5.17):
+    //   * `target.object` in a device-node rule redirects ZERO streams.
+    //   * rewriting each Stream's target feeds the `pipewire-epos@eq`
+    //     instance's own output back into `epos-eq-input` (feedback loop),
+    //     because that output targets the hardware sink by construction.
+    // Moving the default sink changes which sink NEW streams attach to and
+    // never touches existing stream targets, so the EQ instance's output is
+    // never a redirect candidate and no loop is possible.
+    //
+    // Fail-closed: if the EQ instance is down, audio disappears into the
+    // always-present null-sink anchor — silence, never a leak to A2+.
+
+    /// Point the PipeWire default sink at `sink`. No-op on an empty name.
+    async fn set_default_sink(sink: &str) -> Result<()> {
+        if sink.is_empty() {
+            return Ok(());
+        }
+        let out = tokio::process::Command::new("pactl")
+            .args(["set-default-sink", sink])
+            .output()
+            .await?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "pactl set-default-sink {} failed: {}",
+                sink,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
+    /// Current PipeWire default sink name, or `None` if it cannot be read.
+    async fn read_default_sink() -> Option<String> {
+        let out = tokio::process::Command::new("pactl")
+            .args(["get-default-sink"])
+            .output()
+            .await
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// Align the default sink with the EQ toggle. Returns true if it changed.
+    ///
+    /// Only acts on a difference, so a manual override in pavucontrol is
+    /// preserved until the next transition (EQ toggled, or device replugged)
+    /// rather than being fought on every poll.
+    pub async fn route_output(&self) -> Result<bool> {
+        let eq_enabled = self.config.eq.enabled;
+        let device_connected = self
+            .device
+            .as_ref()
+            .is_some_and(|d| !d.pipewire_sink.is_empty());
+        let Some(route) = desired_output_route(eq_enabled, device_connected) else {
+            // Device absent: leave the user's current default alone.
+            return Ok(false);
+        };
+        let (raw_sink, _) = self.node_names();
+        let target = match route {
+            OutputRoute::Processed => EQ_SINK_NAME.to_string(),
+            OutputRoute::Raw => raw_sink,
+        };
+        if target.is_empty() {
+            return Ok(false);
+        }
+        if Self::read_default_sink().await.as_deref() == Some(target.as_str()) {
+            return Ok(false);
+        }
+        Self::set_default_sink(&target).await?;
+        info!(
+            "Output routed to {} (EQ {})",
+            target,
+            if eq_enabled { "on" } else { "off" }
+        );
+        Ok(true)
     }
 
     // ─── 9-Band EQ (pipewire-epos@eq) ─────────────────────────
@@ -964,6 +1085,43 @@ mod tests {
     fn empty_and_all_flat_custom_bands_yield_empty_chain() {
         assert!(sanitize_bands(&[]).is_empty());
         assert!(sanitize_bands(&[band(100, 0.0, 1.0), band(200, 0.0, 1.0)]).is_empty());
+    }
+
+    /// With EQ ON and the device present, new playback streams must attach to
+    /// the processed anchor, otherwise the filter-chain is bypassed entirely.
+    #[test]
+    fn eq_on_with_device_routes_to_processed_sink() {
+        assert_eq!(
+            desired_output_route(true, true),
+            Some(OutputRoute::Processed)
+        );
+    }
+
+    /// With EQ OFF, playback must go straight to the EPOS hardware sink.
+    #[test]
+    fn eq_off_with_device_routes_to_raw_sink() {
+        assert_eq!(desired_output_route(false, true), Some(OutputRoute::Raw));
+    }
+
+    /// While the EPOS is unplugged the daemon must NOT claim the default sink.
+    /// There is no raw EPOS sink to fall back to, and stealing the default
+    /// would yank audio away from whatever device the user is really using.
+    #[test]
+    fn absent_device_never_touches_the_default_sink() {
+        for eq_enabled in [true, false] {
+            assert_eq!(
+                desired_output_route(eq_enabled, false),
+                None,
+                "eq_enabled={eq_enabled} must not touch the default while absent"
+            );
+        }
+    }
+
+    /// The anchor name must match the one installed by
+    /// 40-epos-eq-virtualsink.conf, otherwise routing points at nothing.
+    #[test]
+    fn processed_route_uses_the_installed_anchor_name() {
+        assert_eq!(EQ_SINK_NAME, "epos-eq-input");
     }
 
     /// Custom bands are stored verbatim in the config, and the sanitiser is

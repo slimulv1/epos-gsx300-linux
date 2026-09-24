@@ -294,6 +294,13 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
             sync_active_profile(&mut state);
             let audio_cfg = state.config.audio.clone();
             state.audio.update_config(&audio_cfg);
+            // Toggling EQ must also move the default sink, otherwise new
+            // streams keep attaching to the raw hardware sink and the change
+            // is invisible. Failures here are reported but do not fail the
+            // request: the filter graph itself was still written.
+            if let Err(e) = state.audio.route_output().await {
+                warn!("Failed to route output after EQ change: {}", e);
+            }
             match state.audio.apply_eq().await {
                 Ok(changed) => {
                     // DSP confs are seeded per-role (pipewire-epos@eq) by

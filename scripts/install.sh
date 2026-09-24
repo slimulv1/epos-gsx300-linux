@@ -27,7 +27,6 @@ UDEV_RULE="70-epos-gsx300.rules"
 SERVICE="epos-gsx300d.service"
 EPOS_PW_SERVICE="pipewire-epos@.service"
 EQ_NULL_SINK_CONF="40-epos-eq-virtualsink.conf"
-EQ_ROUTE_CONF="51-epos-eq-route.conf"
 DESKTOP_FILE="epos-gsx300-gui.desktop"
 ICON_SIZE=128
 
@@ -97,12 +96,12 @@ _install_pw_epos() {
     install -m 0644 "$ROOT/systemd/$EQ_NULL_SINK_CONF" "$PW_CONF_DIR/$EQ_NULL_SINK_CONF"
     ok "MAIN fail-closed null-sink anchor -> $PW_CONF_DIR/$EQ_NULL_SINK_CONF"
 
-    if [[ -f "$ROOT/systemd/$EQ_ROUTE_CONF" ]]; then
-        # Optional WirePlumber routing rule — installed but INACTIVE by
-        # default (see header comment; validation-phase opt-in).
-        install -m 0644 "$ROOT/systemd/$EQ_ROUTE_CONF" "$WP_CONF_DIR/$EQ_ROUTE_CONF"
-        ok "WirePlumber EQ routing rule (inactive placeholder) -> $WP_CONF_DIR/$EQ_ROUTE_CONF"
-    fi
+    # No WirePlumber routing rule is installed. Output routing is owned by the
+    # daemon (AudioPipeline::route_output): it moves the PipeWire default sink
+    # to epos-eq-input when the EQ is enabled. A WirePlumber rule was tried and
+    # measured to be either a no-op (target.object on a device node) or a
+    # feedback loop (rewriting stream targets catches the EQ instance's own
+    # output). Do not reintroduce one.
 
     _cleanup_old_main_dsp_confs
 
@@ -223,7 +222,8 @@ _uninstall() {
     done
     rm -f "$BIN_DIR/$BIN_NAME" "$SERVICE_DIR/$SERVICE" "$SERVICE_DIR/$EPOS_PW_SERVICE"
     rm -f "$PW_CONF_DIR/$EQ_NULL_SINK_CONF"
-    rm -f "$WP_CONF_DIR/$EQ_ROUTE_CONF"
+    # Remove the retired WirePlumber routing rule if an older install left one.
+    rm -f "$WP_CONF_DIR/51-epos-eq-route.conf"
     rm -rf "$EPOS_CONF_DIR"
     ok "removed daemon binary + services + epos instance confs + null-sink anchor"
 

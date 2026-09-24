@@ -93,5 +93,5 @@ banner "Xong — Option B (3i) đã live. Ghi nhớ:"
 printf '  - Mọi thay đổi DSP (EQ/voice/noise/sidetone) từ giờ chỉ restart các\n'
 printf '    instance pipewire-epos@eq|voice|sidetone — main KHÔNG đụng vào nữa.\n'
 printf '  - App EPOS target cố định vào %s (anchor tĩnh) nên fail-closed.\n' "$ANCHOR_SINK"
-printf '  - Bước route WirePlumber (51-epos-eq-route.conf) vẫn INACTIVE — đánh\n'
-printf '    giá ở phase validation trước khi bật (xem header conf).\n'
+printf '  - EQ routing do DAEMON quản lý: bật EQ thì daemon dời default sink\n'
+printf '    sang %s, tắt thì dời về sink EPOS gốc.\n' "$ANCHOR_SINK"

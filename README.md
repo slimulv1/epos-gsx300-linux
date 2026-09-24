@@ -208,6 +208,19 @@ EQ / noise gate / voice enhancer from the GUI:
   (`pipewire.conf.d/40-epos-eq-virtualsink.conf`). If the EQ instance drops,
   the anchor keeps the link — the side goes silent (fail-closed) instead of
   Discord re-routing to the default device.
+- **EQ routing is owned by the daemon.** When the EQ is enabled the daemon
+  moves the PipeWire default sink to `epos-eq-input`; when it is disabled it
+  moves back to the raw EPOS sink. New playback streams therefore attach to
+  whichever path is selected. This runs on toggle, on boot and on device
+  reconnect, and only acts when the current default actually differs, so a
+  manual choice in `pavucontrol` is preserved until the next transition.
+- A WirePlumber routing rule is deliberately **not** installed. Both variants
+  were tried and measured on WirePlumber 0.5.17: `target.object` on a device
+  node redirects zero streams, and rewriting each stream's target feeds the
+  `pipewire-epos@eq` instance's own output back into `epos-eq-input`, which
+  is a feedback loop. Moving the default sink changes which sink *new* streams
+  attach to and never rewrites existing stream targets, so the EQ instance's
+  output is never a candidate and the loop cannot form.
 - The **mic** side has no main-graph anchor. `epos-voice-output` is published
   by the `pipewire-epos@voice` instance itself, so it disappears while that
   instance restarts. The earlier `51-epos-voice-enhancer.conf` main-instance

@@ -590,6 +590,11 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
                     }
                     Err(e) => warn!("Failed to apply audio config on connect: {}", e),
                 }
+                // Re-assert the output route: the sink node names can change on
+                // re-enumeration, so the default may now point at a stale node.
+                if let Err(e) = st.audio.route_output().await {
+                    warn!("Failed to route output on reconnect: {}", e);
+                }
                 // Restore host-side dial volume onto the real sink so the
                 // knob position matches the actual output level after (re)plug.
                 let vol = st.volume.load(std::sync::atomic::Ordering::Relaxed);
@@ -645,6 +650,13 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
                     tracing::info!("Volume restored to {}% on EPOS sink (boot)", vol);
                     let mut st = state.write().await;
                     st.device = device;
+                    // Boot with the device already plugged: the steady-state
+                    // branch never calls apply_full, so the output route has to
+                    // be asserted here or a persisted EQ=on would be ignored
+                    // until the next toggle.
+                    if let Err(e) = st.audio.route_output().await {
+                        warn!("Failed to route output on boot: {}", e);
+                    }
                     continue;
                 }
             }
