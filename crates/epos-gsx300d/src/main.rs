@@ -975,6 +975,28 @@ fn first_connect_owes_pipeline(pipeline_has_device: bool) -> bool {
     !pipeline_has_device
 }
 
+/// Decide whether a hand-edited `device.volume` should be put on the sink.
+///
+/// Pure. The watcher used to copy the value into `st.config` and nothing else,
+/// which left the daemon's trackers saying one thing and the file another. The
+/// volume watcher then read the real sink, adopted that level over the edit, and
+/// the next save wrote it back — so editing the volume in the file did nothing,
+/// with a log line that only said "non-audio settings updated".
+///
+/// Clamped rather than trusted: the file is hand-editable and the dial's range
+/// is 0-100. Unchanged means no action, so a watcher that only re-reads the
+/// same file never disturbs the sink.
+fn external_volume_to_apply(
+    previous: Option<i32>,
+    edited: Option<i32>,
+) -> Option<i32> {
+    let edited = edited?;
+    if previous == Some(edited) {
+        return None;
+    }
+    Some(edited.clamp(0, 100))
+}
+
 /// Background task: watch config file for external edits and hot-apply them.
 ///
 /// Persists the daemon's config to disk and records the exact bytes written so
@@ -1177,6 +1199,22 @@ async fn config_watch_loop(state: Arc<RwLock<IpcState>>) {
             }
         }
 
+        // A hand-edited `device.volume` has to reach the sink, not just the
+        // config: otherwise the 1s volume watcher reads the real sink, adopts
+        // that level over the edit, and the next save writes it back — the edit
+        // does nothing, silently. Computed before the config is replaced so the
+        // previous value is the one actually in force.
+        let edited_volume = external_volume_to_apply(
+            st.config.device.volume,
+            new_config.device.volume,
+        );
+        if let Some(percent) = edited_volume {
+            st.volume
+                .store(percent, std::sync::atomic::Ordering::Relaxed);
+            st.last_volume_target
+                .store(percent, std::sync::atomic::Ordering::Relaxed);
+        }
+
         st.config = new_config;
 
         if audio_changed || active_profile_changed {
@@ -1211,6 +1249,17 @@ async fn config_watch_loop(state: Arc<RwLock<IpcState>>) {
             info!("Config hot-reload: non-audio settings updated");
         }
         *lock(&st.last_written) = Some(disk_bytes);
+        // Release the lock before touching the sink: the write costs a `pactl`
+        // pair, and a writer resolving the sink under the global lock is exactly
+        // what this file has been removing.
+        drop(st);
+        if let Some(percent) = edited_volume {
+            apply_volume(&state, percent).await;
+            info!(
+                "Config hot-reload: volume set to {}% from the edited file",
+                percent
+            );
+        }
     }
 }
 
@@ -1321,6 +1370,43 @@ fn emit_smart_notify(st: &IpcState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Volume arriving from an edited config file ──────────
+    //
+    // The watcher adopted a hand-edited `device.volume` into `st.config` and
+    // left the daemon's own trackers alone. The value therefore went nowhere:
+    // the 1s volume watcher read the real sink, saw the tracked level differ,
+    // adopted the sink's value over it, and the next save wrote that back. The
+    // edit was undone silently, and the log said only "non-audio settings
+    // updated".
+
+    /// An edited volume is applied, and clamped rather than trusted.
+    #[test]
+    fn an_edited_volume_is_taken_and_clamped() {
+        assert_eq!(external_volume_to_apply(Some(30), Some(45)), Some(45));
+        assert_eq!(
+            external_volume_to_apply(Some(30), Some(500)),
+            Some(100),
+            "a hand-edited value must be clamped"
+        );
+        assert_eq!(external_volume_to_apply(Some(30), Some(-20)), Some(0));
+    }
+
+    /// Unchanged, or no longer specified: nothing to do. Returning a value here
+    /// would put the sink to a level nobody asked for.
+    #[test]
+    fn an_unchanged_or_absent_volume_is_left_alone() {
+        assert_eq!(external_volume_to_apply(Some(30), Some(30)), None);
+        assert_eq!(external_volume_to_apply(Some(30), None), None);
+    }
+
+    /// A value appearing where the file previously had none is a real edit: the
+    /// daemon falls back to 100 when the field is absent, so 30 in the file is
+    /// the user asking for 30, not a no-op.
+    #[test]
+    fn a_volume_appearing_where_there_was_none_is_applied() {
+        assert_eq!(external_volume_to_apply(None, Some(30)), Some(30));
+    }
 
     /// The silent-wrong-state case. Start-up detection missed the headset, so
     /// `main` never called `set_device` or `apply_full`; the loop's own scan
