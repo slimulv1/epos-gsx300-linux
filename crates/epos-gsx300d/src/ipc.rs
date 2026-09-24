@@ -679,6 +679,162 @@ fn chrono_now() -> String {
 // Serves POST /ipc on 127.0.0.1:9898, translating JSON requests to the
 // same handler the Unix socket uses. Includes CORS headers so the Vue
 // dev server (localhost:5173) can reach it from a browser.
+//
+// The bridge speaks the FULL IPC surface — SetEq, SetMicGain,
+// DeleteProfile, Reload, Quit — so how permissive it is decides whether
+// any page the user visits can drive the headset. Two rules keep the
+// dev-server workflow without handing that surface to the open web:
+//
+//   * only the vite dev origin may call it, checked before the body is
+//     even read, and
+//   * only `Content-Type: application/json` is dispatched, so every
+//     browser call is a preflighted one and JSON smuggled through a
+//     `text/plain` "simple request" cannot sidestep the origin check.
+//
+// A request with no Origin at all is a local tool (curl, a script), not
+// a web page. It is allowed: the Unix socket already trusts local
+// callers, so this widens nothing.
+
+/// Largest request head we buffer; two lines need far less.
+const MAX_HEAD: usize = 8 * 1024;
+
+/// Largest request body we buffer. IPC calls are small config updates,
+/// so this sits far above any legitimate one while stopping a hostile
+/// Content-Length from growing the buffer without bound.
+const MAX_BODY: usize = 64 * 1024;
+
+/// How long a client may take to send its head or body before we drop it.
+/// Without this, a connection that opens and says nothing pins a task and
+/// a file descriptor for the remaining life of the daemon.
+const CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Origins allowed to call the bridge. Vite is pinned to port 5173 with
+/// `strictPort`, and `localhost` and `127.0.0.1` are distinct origins
+/// even though both name this machine, so both are listed.
+const ALLOWED_ORIGINS: &[&str] = &["http://localhost:5173", "http://127.0.0.1:5173"];
+
+/// The parts of a request head that the bridge's policy depends on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequestHead {
+    method: String,
+    path: String,
+    origin: Option<String>,
+    content_type: Option<String>,
+    content_length: Option<usize>,
+}
+
+/// What the bridge should do with a request, before any body is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadDecision {
+    /// Answer the CORS preflight; do not read a body.
+    Preflight,
+    /// Read the body and hand the request to `handle_request`.
+    Dispatch,
+    /// Refuse with this HTTP status. The body is always a JSON `Error`, so
+    /// the dev GUI still gets something it can display.
+    Reject(u16),
+}
+
+/// A web page must name an origin we recognise. `None` means the client sent
+/// no `Origin` at all, which a browser never does for a cross-origin POST —
+/// that is a local tool, inside the same trust boundary as the Unix socket.
+fn origin_allowed(origin: Option<&str>) -> bool {
+    match origin {
+        None => true,
+        Some(origin) => ALLOWED_ORIGINS.contains(&origin),
+    }
+}
+
+/// Deliberately strict: this is what forces every browser call through a
+/// CORS preflight, and a preflight is answered from `ALLOWED_ORIGINS`. If a
+/// non-JSON type were accepted, a page could POST JSON as a "simple request"
+/// with no preflight at all and simply discard the unreadable response.
+fn content_type_is_json(value: Option<&str>) -> bool {
+    value
+        .and_then(|value| value.split(';').next())
+        .map(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"))
+        .unwrap_or(false)
+}
+
+fn reject_message(status: u16) -> &'static str {
+    match status {
+        400 => "Malformed request",
+        403 => "Origin not allowed",
+        404 => "Not found",
+        405 => "Method not allowed",
+        413 => "Request body too large",
+        415 => "Content-Type must be application/json",
+        _ => "Bad request",
+    }
+}
+
+/// The policy, in one pure function: given a parsed head, either answer a
+/// preflight, dispatch, or refuse. Order matters — origin first, so a
+/// foreign page is turned away before its body is read or its Content-Length
+/// trusted.
+fn decide_head(head: &RequestHead) -> HeadDecision {
+    if !origin_allowed(head.origin.as_deref()) {
+        return HeadDecision::Reject(403);
+    }
+    if head.path != "/ipc" {
+        return HeadDecision::Reject(404);
+    }
+    if head.method == "OPTIONS" {
+        return HeadDecision::Preflight;
+    }
+    if head.method != "POST" {
+        return HeadDecision::Reject(405);
+    }
+    if !content_type_is_json(head.content_type.as_deref()) {
+        return HeadDecision::Reject(415);
+    }
+    match head.content_length {
+        Some(length) if length > MAX_BODY => HeadDecision::Reject(413),
+        _ => HeadDecision::Dispatch,
+    }
+}
+
+/// Parse a request head (everything before the blank line). Returns `None`
+/// for anything that is not a plausible HTTP request, so junk can never be
+/// mistaken for a dispatchable call.
+fn parse_request_head(head: &[u8]) -> Option<RequestHead> {
+    let text = String::from_utf8_lossy(head);
+    let mut lines = text.split("\r\n");
+    let mut request_line = lines.next()?.split_whitespace();
+    let method = request_line.next()?.to_string();
+    let path = request_line.next()?.to_string();
+
+    let mut parsed = RequestHead {
+        method,
+        path,
+        origin: None,
+        content_type: None,
+        content_length: None,
+    };
+
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        // `split_once` keeps colons inside the value, unlike `splitn(2, ':')`
+        // on a trimmed line would suggest; the name is compared case-folded
+        // because header names are case-insensitive.
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim().to_string();
+        match name.trim().to_ascii_lowercase().as_str() {
+            "origin" => parsed.origin = Some(value),
+            "content-type" => parsed.content_type = Some(value),
+            // A length we cannot parse is treated as absent, which for a POST
+            // means an empty body and a 400 rather than a silent dispatch.
+            "content-length" => parsed.content_length = value.parse().ok(),
+            _ => {}
+        }
+    }
+
+    Some(parsed)
+}
 
 pub async fn run_http_bridge(state: Arc<RwLock<IpcState>>) -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:9898").await?;
@@ -701,100 +857,142 @@ pub async fn run_http_bridge(state: Arc<RwLock<IpcState>>) -> Result<()> {
     }
 }
 
-async fn handle_http_client(mut stream: TcpStream, state: Arc<RwLock<IpcState>>) -> Result<()> {
-    // Read request head (until \r\n\r\n) — cap at 8 KiB to avoid abuse.
-    let mut head = Vec::new();
-    let mut buf = [0u8; 1024];
-    let mut content_length: Option<usize> = None;
+fn status_line(status: u16) -> &'static str {
+    match status {
+        200 => "200 OK",
+        403 => "403 Forbidden",
+        404 => "404 Not Found",
+        405 => "405 Method Not Allowed",
+        413 => "413 Payload Too Large",
+        415 => "415 Unsupported Media Type",
+        _ => "400 Bad Request",
+    }
+}
 
-    loop {
-        let n = stream.read(&mut buf).await?;
+/// Every response is JSON, including refusals, because the dev GUI already
+/// knows how to read `{"type":"Error",...}` and would otherwise show nothing.
+/// Building it from the enum rather than by `format!` also means a parse-error
+/// message containing a quote can no longer break the document.
+fn error_body(message: &str) -> String {
+    serde_json::to_string(&Response::Error {
+        message: message.to_string(),
+    })
+    .unwrap_or_else(|_| r#"{"type":"Error","payload":{"message":"Error"}}"#.to_string())
+}
+
+/// `Access-Control-Allow-Origin` is echoed back only for an origin the
+/// allowlist accepted. The previous `*` let any page on the web read the
+/// reply, and since the bridge speaks the full IPC surface, that included
+/// DeleteProfile and Quit.
+async fn write_http(
+    stream: &mut TcpStream,
+    status: u16,
+    cors_origin: Option<&str>,
+    extra_headers: &str,
+    body: &str,
+) -> Result<()> {
+    let mut response = format!("HTTP/1.1 {}\r\n", status_line(status));
+    if let Some(origin) = cors_origin {
+        response.push_str(&format!("Access-Control-Allow-Origin: {origin}\r\n"));
+    }
+    response.push_str(extra_headers);
+    response.push_str("Content-Type: application/json\r\n");
+    response.push_str("Connection: close\r\n");
+    response.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+    response.push_str(body);
+    stream.write_all(response.as_bytes()).await?;
+    Ok(())
+}
+
+async fn handle_http_client(mut stream: TcpStream, state: Arc<RwLock<IpcState>>) -> Result<()> {
+    // Read the head, bounded in size and in time. The old loop had neither a
+    // body cap nor a deadline, so a client that opened a connection and said
+    // nothing pinned this task and its file descriptor for good.
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 1024];
+    let head_end = loop {
+        if raw.len() > MAX_HEAD {
+            let body = error_body(reject_message(413));
+            return write_http(&mut stream, 413, None, "", &body).await;
+        }
+        let read = tokio::time::timeout(CLIENT_TIMEOUT, stream.read(&mut buf)).await;
+        let n = match read {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e.into()),
+            // Client stalled before finishing its head: nothing to answer.
+            Err(_) => return Ok(()),
+        };
         if n == 0 {
-            break;
-        }
-        head.extend_from_slice(&buf[..n]);
-        if let Some(pos) = find_subslice(&head, b"\r\n\r\n") {
-            let header_block = &head[..pos];
-            // Parse Content-Length
-            for line in header_block.split(|&b| b == b'\n') {
-                let line_str = String::from_utf8_lossy(line).trim().to_string();
-                if let Some(v) = line_str
-                    .to_ascii_lowercase()
-                    .strip_prefix("content-length:")
-                {
-                    content_length = v.trim().parse::<usize>().ok();
-                }
-            }
-            // Now read the body (already partially in head)
-            let body = Vec::from(&head[pos + 4..]);
-            let mut body = body;
-            if let Some(cl) = content_length {
-                while body.len() < cl {
-                    let n = stream.read(&mut buf).await?;
-                    if n == 0 {
-                        break;
-                    }
-                    body.extend_from_slice(&buf[..n]);
-                }
-                body.truncate(cl);
-            }
-            return process_http_body(stream, body, state).await;
-        }
-        if head.len() > 8192 {
-            // Malformed / oversized request
-            let _ = stream
-                .write_all(
-                    b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-                )
-                .await;
+            // Closed before a complete head.
             return Ok(());
         }
-    }
+        raw.extend_from_slice(&buf[..n]);
+        if let Some(pos) = find_subslice(&raw, b"\r\n\r\n") {
+            break pos;
+        }
+    };
 
-    // Connection closed without full request — nothing to do.
-    Ok(())
+    let Some(head) = parse_request_head(&raw[..head_end]) else {
+        let body = error_body(reject_message(400));
+        return write_http(&mut stream, 400, None, "", &body).await;
+    };
+
+    // A refused request never reaches the daemon, and never gets a CORS
+    // header back.
+    let cors = head
+        .origin
+        .as_deref()
+        .filter(|origin| origin_allowed(Some(origin)));
+
+    match decide_head(&head) {
+        HeadDecision::Preflight => {
+            let headers = "Access-Control-Allow-Methods: POST, OPTIONS\r\n\
+                            Access-Control-Allow-Headers: Content-Type\r\n\
+                            Access-Control-Max-Age: 86400\r\n";
+            write_http(&mut stream, 200, cors, headers, "").await
+        }
+        HeadDecision::Reject(status) => {
+            let body = error_body(reject_message(status));
+            write_http(&mut stream, status, cors, "", &body).await
+        }
+        HeadDecision::Dispatch => {
+            // The policy has already rejected an over-long declared length,
+            // so this clamp is belt and braces rather than the guard.
+            let wanted = head.content_length.unwrap_or(0).min(MAX_BODY);
+            let mut body = raw[head_end + 4..].to_vec();
+            while body.len() < wanted {
+                let read = tokio::time::timeout(CLIENT_TIMEOUT, stream.read(&mut buf)).await;
+                let n = match read {
+                    Ok(Ok(n)) => n,
+                    Ok(Err(e)) => return Err(e.into()),
+                    Err(_) => break,
+                };
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&buf[..n]);
+            }
+            body.truncate(wanted);
+            process_http_body(stream, body, cors.map(str::to_string), state).await
+        }
+    }
 }
 
 async fn process_http_body(
     mut stream: TcpStream,
     body: Vec<u8>,
+    cors_origin: Option<String>,
     state: Arc<RwLock<IpcState>>,
 ) -> Result<()> {
     let body_str = String::from_utf8_lossy(&body);
 
-    // CORS preflight (OPTIONS)
-    // We can't easily read the method here after body parsing, so handle
-    // POST bodies only; preflight sent without body is answered below.
-    if body_str.trim().is_empty() {
-        let resp = "HTTP/1.1 200 OK\r\n\
-                    Access-Control-Allow-Origin: *\r\n\
-                    Access-Control-Allow-Methods: POST, OPTIONS\r\n\
-                    Access-Control-Allow-Headers: Content-Type\r\n\
-                    Access-Control-Max-Age: 86400\r\n\
-                    Connection: close\r\n\
-                    Content-Length: 0\r\n\r\n";
-        stream.write_all(resp.as_bytes()).await?;
-        return Ok(());
-    }
-
+    // An empty body is no longer mistaken for a preflight. OPTIONS is
+    // answered from the parsed head, before we ever reach this function.
     let request: Request = match serde_json::from_str(&body_str) {
         Ok(r) => r,
         Err(e) => {
-            let resp_body = format!(
-                "{{\"type\":\"Error\",\"payload\":{{\"message\":\"Invalid request: {}\"}}}}",
-                e
-            );
-            let resp = format!(
-                "HTTP/1.1 400 Bad Request\r\n\
-                 Access-Control-Allow-Origin: *\r\n\
-                 Content-Type: application/json\r\n\
-                 Connection: close\r\n\
-                 Content-Length: {}\r\n\r\n{}",
-                resp_body.len(),
-                resp_body
-            );
-            stream.write_all(resp.as_bytes()).await?;
-            return Ok(());
+            let body = error_body(&format!("Invalid request: {e}"));
+            return write_http(&mut stream, 400, cors_origin.as_deref(), "", &body).await;
         }
     };
 
@@ -811,17 +1009,7 @@ async fn process_http_body(
     }
 
     let json = serde_json::to_string(&response)?;
-    let resp = format!(
-        "HTTP/1.1 200 OK\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Content-Type: application/json\r\n\
-         Connection: close\r\n\
-         Content-Length: {}\r\n\r\n{}",
-        json.len(),
-        json
-    );
-    stream.write_all(resp.as_bytes()).await?;
-    Ok(())
+    write_http(&mut stream, 200, cors_origin.as_deref(), "", &json).await
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -955,5 +1143,239 @@ mod tests {
                 "{mode:?} must not accumulate EQ-derived bands"
             );
         }
+    }
+
+    // ─── HTTP bridge request policy ───────────────────────────
+    //
+    // The bridge is a development affordance for the vite dev server, but it
+    // speaks the full IPC surface — SetEq, DeleteProfile, Quit. These tests
+    // pin the policy that decides which requests may reach `handle_request`.
+
+    fn head(
+        method: &str,
+        origin: Option<&str>,
+        content_type: Option<&str>,
+        content_length: Option<usize>,
+    ) -> RequestHead {
+        RequestHead {
+            method: method.into(),
+            path: "/ipc".into(),
+            origin: origin.map(str::to_string),
+            content_type: content_type.map(str::to_string),
+            content_length,
+        }
+    }
+
+    /// The bug this whole policy exists for: a page on any other origin must
+    /// never reach the daemon, so it can neither read the status nor change
+    /// a setting nor stop the daemon.
+    #[test]
+    fn a_foreign_website_is_refused() {
+        for origin in [
+            "https://evil.example",
+            "http://localhost:5174",
+            "http://127.0.0.1",
+            "http://localhost:5173.evil.example",
+            "null",
+        ] {
+            let h = head("POST", Some(origin), Some("application/json"), Some(2));
+            assert_eq!(
+                decide_head(&h),
+                HeadDecision::Reject(403),
+                "{origin} must be refused"
+            );
+        }
+    }
+
+    /// The workflow that must keep working: the vite dev server, in either
+    /// loopback spelling.
+    #[test]
+    fn the_dev_server_is_allowed_from_either_loopback_spelling() {
+        for origin in ALLOWED_ORIGINS {
+            let h = head("POST", Some(origin), Some("application/json"), Some(2));
+            assert_eq!(
+                decide_head(&h),
+                HeadDecision::Dispatch,
+                "{origin} must keep working"
+            );
+        }
+    }
+
+    /// No Origin means a local tool, not a web page. The Unix socket already
+    /// trusts local callers, so refusing these would only break curl and
+    /// scripts without closing a real hole.
+    #[test]
+    fn a_local_tool_without_an_origin_header_is_allowed() {
+        let h = head("POST", None, Some("application/json"), Some(2));
+        assert_eq!(decide_head(&h), HeadDecision::Dispatch);
+    }
+
+    /// A browser "simple request" carries no preflight, so accepting a
+    /// non-JSON content type would let any page POST JSON to the daemon with
+    /// the response thrown away. Refusing the content type closes the whole
+    /// class, whatever the origin says.
+    #[test]
+    fn a_non_json_post_is_refused_so_simple_requests_cannot_reach_the_daemon() {
+        for content_type in [
+            "text/plain",
+            "application/x-www-form-urlencoded",
+            "multipart/form-data",
+            "",
+        ] {
+            let h = head("POST", None, Some(content_type), Some(2));
+            assert_eq!(
+                decide_head(&h),
+                HeadDecision::Reject(415),
+                "{content_type} must not be dispatched"
+            );
+        }
+    }
+
+    /// A missing content type is as good as a wrong one: without this the
+    /// refusal above could be walked around by simply omitting the header.
+    #[test]
+    fn a_post_without_a_content_type_is_refused() {
+        assert_eq!(
+            decide_head(&head("POST", None, None, Some(2))),
+            HeadDecision::Reject(415)
+        );
+    }
+
+    /// Browsers append a charset, and the dev GUI's fetch may set one.
+    #[test]
+    fn content_type_parameters_do_not_change_the_verdict() {
+        for content_type in [
+            "application/json",
+            "application/json; charset=utf-8",
+            "APPLICATION/JSON",
+            " application/json ; charset=utf-8 ",
+        ] {
+            let h = head("POST", None, Some(content_type), Some(2));
+            assert_eq!(
+                decide_head(&h),
+                HeadDecision::Dispatch,
+                "{content_type} is JSON and must be accepted"
+            );
+        }
+    }
+
+    /// Content-Length was previously honoured with no cap, so one header
+    /// could make the buffer grow until the daemon ran out of memory.
+    #[test]
+    fn an_oversized_body_is_refused_before_it_is_read() {
+        let h = head("POST", None, Some("application/json"), Some(MAX_BODY + 1));
+        assert_eq!(decide_head(&h), HeadDecision::Reject(413));
+
+        let absurd = head("POST", None, Some("application/json"), Some(usize::MAX / 2));
+        assert_eq!(decide_head(&absurd), HeadDecision::Reject(413));
+    }
+
+    /// The cap must sit above every real request, not on top of it.
+    #[test]
+    fn a_body_at_the_cap_is_still_accepted() {
+        let h = head("POST", None, Some("application/json"), Some(MAX_BODY));
+        assert_eq!(decide_head(&h), HeadDecision::Dispatch);
+
+        let none = head("POST", None, Some("application/json"), None);
+        assert_eq!(decide_head(&none), HeadDecision::Dispatch);
+    }
+
+    /// The path was never checked, so any URL on the port reached the daemon.
+    #[test]
+    fn only_the_ipc_path_is_served() {
+        let mut h = head("POST", None, Some("application/json"), Some(2));
+        h.path = "/".into();
+        assert_eq!(decide_head(&h), HeadDecision::Reject(404));
+
+        h.path = "/ipc/../quit".into();
+        assert_eq!(decide_head(&h), HeadDecision::Reject(404));
+    }
+
+    /// The method was never read either, so the "preflight" branch answered
+    /// any empty POST. Now only OPTIONS and POST mean anything.
+    #[test]
+    fn only_post_and_options_reach_the_daemon() {
+        for method in ["GET", "PUT", "DELETE", "HEAD", "get"] {
+            let h = head(method, None, Some("application/json"), Some(2));
+            assert_eq!(
+                decide_head(&h),
+                HeadDecision::Reject(405),
+                "{method} must not be dispatched"
+            );
+        }
+    }
+
+    /// A preflight must be answered as a preflight, not dispatched.
+    #[test]
+    fn an_options_preflight_is_answered_not_dispatched() {
+        let mut origins: Vec<Option<&str>> = vec![None];
+        origins.extend(ALLOWED_ORIGINS.iter().copied().map(Some));
+        for origin in origins {
+            let h = head("OPTIONS", origin, None, None);
+            assert_eq!(decide_head(&h), HeadDecision::Preflight);
+        }
+    }
+
+    /// The origin is checked before the path and before the body, so a
+    /// foreign page is turned away without its bytes being read.
+    #[test]
+    fn a_foreign_origin_is_refused_before_anything_else() {
+        let h = head("POST", Some("https://evil.example"), Some("text/plain"), None);
+        assert_eq!(decide_head(&h), HeadDecision::Reject(403));
+
+        let mut wrong_path = h.clone();
+        wrong_path.path = "/nope".into();
+        assert_eq!(decide_head(&wrong_path), HeadDecision::Reject(403));
+    }
+
+    /// Every refusal needs a message the dev GUI can show.
+    #[test]
+    fn every_rejection_has_a_message() {
+        for status in [400, 403, 404, 405, 413, 415] {
+            assert!(
+                !reject_message(status).is_empty(),
+                "status {status} needs a message"
+            );
+        }
+    }
+
+    /// Parsing has to survive the shapes a real browser sends: a request
+    /// line, mixed-case header names, and a body that arrived in the same
+    /// packet as the head.
+    #[test]
+    fn parse_request_head_reads_the_request_line_and_headers() {
+        let raw = b"POST /ipc HTTP/1.1\r\n\
+                    Host: localhost:9898\r\n\
+                    Origin: http://localhost:5173\r\n\
+                    content-type: application/json; charset=utf-8\r\n\
+                    Content-Length: 17\r\n\
+                    \r\n\
+                    {\"type\":\"GetStatus\"}";
+
+        let parsed = parse_request_head(raw).expect("head must parse");
+        assert_eq!(parsed.method, "POST");
+        assert_eq!(parsed.path, "/ipc");
+        assert_eq!(parsed.origin.as_deref(), Some("http://localhost:5173"));
+        assert_eq!(
+            parsed.content_type.as_deref(),
+            Some("application/json; charset=utf-8")
+        );
+        assert_eq!(parsed.content_length, Some(17));
+    }
+
+    /// A value containing a colon must not be truncated at the first one.
+    #[test]
+    fn parse_request_head_keeps_colons_inside_header_values() {
+        let raw = b"OPTIONS /ipc HTTP/1.1\r\nOrigin: http://localhost:5173\r\n\r\n";
+        let parsed = parse_request_head(raw).expect("head must parse");
+        assert_eq!(parsed.origin.as_deref(), Some("http://localhost:5173"));
+    }
+
+    /// Garbage in must not become a dispatch.
+    #[test]
+    fn an_unparseable_head_yields_nothing() {
+        assert!(parse_request_head(b"").is_none());
+        assert!(parse_request_head(b"not-a-request-line\r\n\r\n").is_none());
+        assert!(parse_request_head(b"GET\r\n\r\n").is_none());
     }
 }
