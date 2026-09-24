@@ -857,6 +857,23 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
             if st.device != device {
                 st.device = device;
             }
+            // Everything below is read-only on the pipeline, and all four calls
+            // take `&self`: they mutate only their own atomics and the mutexes
+            // inside `AudioPipeline` (`eq_chain_missing_polls`, `role_health`,
+            // `mic_watch`, `restarts`). None of them needs the write lock, yet
+            // holding it froze the entire control surface for as long as they
+            // ran -- measured at 2.7 seconds every 63 seconds, which is
+            // `maintain_mic_signal` capturing microphone audio with the global
+            // write lock held. GetStatus, the config watcher, the volume watcher
+            // and every IPC request all queue behind that one lock.
+            //
+            // A read lock lets the 3s status poll run alongside. The scopes must
+            // not nest: tokio's lock is fair and write-preferring, and holding a
+            // read lock while asking for a write one in the same task is the
+            // documented deadlock.
+            drop(st);
+            {
+                let st = state.read().await;
             // Re-assert the capture route on every poll. The processed mic
             // node only exists once the voice instance has restarted and
             // published it, which happens after this branch's earlier work, so
@@ -886,6 +903,7 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
             // claiming that a microphone which is not delivering audio is a
             // healthy one.
             st.audio.maintain_mic_signal().await;
+            }
         }
 
         was_connected = is_connected;
