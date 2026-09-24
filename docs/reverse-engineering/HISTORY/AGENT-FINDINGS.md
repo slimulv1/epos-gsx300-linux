@@ -60,16 +60,22 @@
 > ⚠️ **Important:** these findings are NOT in the research agent texts —
 > they were obtained by writing directly to `/dev/hidraw3` and observing the physical LED.
 
-### 3.1 LED ring protocol — CONFIRMED
+### 3.1 LED ring protocol — colours CORRECTED 2026-09-24
 
 | Byte (Report ID 0x02 OUTPUT, vendor) | LED Effect |
 |--------------------------------------|--------------|
 | `0x00` | Off |
-| `0x01` (bit0) | **BLUE** — stereo (2.0) |
-| `0x02` (bit1) | **RED** — surround (7.1) |
-| `0x03` (both bits) | **PINK** (mix) |
+| `0x01` (bit0) | **RED** — surround (7.1) |
+| `0x02` (bit1) | **BLUE** — stereo (2.0) |
+| `0x03` (both bits) | both bits (mix) |
 
-- Initial guesses in config defaults (`vendor_blue: 0x01`, `vendor_red: 0x02`) were 100% correct.
+- **This table was inverted until 2026-09-24.** It was derived from the
+  descriptor's usage *names* (`ff13.0005` = "blue", `ff13.0006` = "red"), never
+  from watching the ring. Re-measured on hardware by holding one payload at a
+  time and observing the device: `0x01` renders **red**, `0x02` renders
+  **blue**. The descriptor mislabels its colour bits on this firmware.
+- Therefore config defaults use `vendor_blue: 0x02`, `vendor_red: 0x01`.
+  The old claim that the defaults were "100% correct" was wrong.
 - Report ID 0x02 OUTPUT path: vendor (or consumer Report 0x04 payload — probe script supports both).
 
 ### 3.2 Smart button (dial click) protocol — CONFIRMED

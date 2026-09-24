@@ -9,11 +9,14 @@
 //!   Report ID 0x01 (Consumer): volume dial — input bits 0x09E9 (up) / 0x09EA
 //!     (down) / 0x09CF (mute). Incremental detents only; NO absolute readback.
 //!   Report ID 0x02 (Vendor 0xFF13, 1-byte):
-//!     Output 2 bits → usages 0x05 (LED blue) / 0x06 (LED red). The WIRE byte
-//!     written is the logical value, offset by +4 from the usage id:
-//!       0x00 = off, 0x01 = blue, 0x02 = red, 0x03 = pink
-//!     (hardware-confirmed, AGENT-FINDINGS §3.1). Usage-id and wire-value are
-//!     two different numbering systems — do not mix them.
+//!     Output 2 bits → descriptor usages 0x05 (bit0) / 0x06 (bit1). The
+//!     descriptor *names* them blue/red, but the firmware renders them the
+//!     other way round. Hardware-measured 2026-09-24 by writing one payload at
+//!     a time and observing the ring:
+//!       0x00 = off, 0x01 = red, 0x02 = blue, 0x03 = both
+//!     The colour bytes live in `LedProbeConfig` (config.json `led_probe`) for
+//!     precisely this reason — trust the measurement over the descriptor
+//!     labels, which are wrong on this firmware.
 //!     Input  3 bits → wire 0x01 (stereo) / 0x02 (7.1) / 0x04 (long-press),
 //!     hardware-confirmed (AGENT-FINDINGS §3.2). Remaining bits constant
 //!     padding (must be zero).
@@ -313,7 +316,7 @@ impl LedController {
 /// Write vendor Report ID 0x02 (1-byte LED output).
 fn write_vendor_report(file: &mut File, byte: u8) -> Result<()> {
     // The descriptor's output field is only 2 bits (wire values 0x00..=0x03:
-    // off / blue / red / pink — see module doc). The firmware silently ignores
+    // off / red / blue / both — see module doc). The firmware silently ignores
     // any higher bits → clamp to 0x00..=0x03 so a bad config value can never
     // produce a no-op write.
     let byte = byte & 0x03;

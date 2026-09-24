@@ -130,9 +130,26 @@ a different errno for a different reason, on a different device.
 | `0x07` | IN | 32 | 4 B |
 | `0x02` LED (vendor `0xFF13`) | IN + OUT | 8 + 8 | **1 B** |
 
-The two LED usages are `ff13.0005` = bit0 = blue, `ff13.0006` = bit1 = red, so
-the wire byte is `0x00` off / `0x01` blue / `0x02` red / `0x03` pink. Note that
-usage-id and wire-value are two different numbering systems; do not mix them.
+The two LED usages are `ff13.0005` = bit0 and `ff13.0006` = bit1. The
+descriptor labels them "blue" and "red" respectively — **but that labelling is
+wrong on this firmware.** Measured on hardware by writing one payload at a
+time and watching the ring:
+
+| Payload | Descriptor says | Actually renders |
+| --- | --- | --- |
+| `0x01` (bit0, `ff13.0005`) | blue | **red** |
+| `0x02` (bit1, `ff13.0006`) | red | **blue** |
+| `0x00` | off | off |
+| `0x03` | both | both |
+
+So the config uses `vendor_blue: 0x02`, `vendor_red: 0x01`. Stereo is blue and
+7.1 is red, which is the intended behaviour, but it is reached by writing the
+bit the descriptor calls "red". The colour bytes are configurable through
+`LedProbeConfig` for exactly this reason; do not derive them from the
+descriptor.
+
+Note that usage-id and wire-value are two different numbering systems; do not
+mix them.
 
 The device is **full-speed (USB 1.1, 12 Mbps)**, `bcdDevice 0.62`, serial
 `A003200202602692`, and has no `hid-generic` hwdb quirk for
@@ -161,6 +178,6 @@ byte, both known.
 - `main.rs`: startup warning says the ring is not being driven and names the
   replug remedy; heartbeat failure logging drops to `debug` and delegates the
   retry to `recover_if_needed()`.
-- Live config `~/.config/epos-gsx300/config.json` had `vendor_blue: 2,
-  vendor_red: 1` — the reverse of the descriptor and of the crate default.
-  Corrected to `1, 2`. The repository defaults were always right.
+- Live config `~/.config/epos-gsx300/config.json` and the repo defaults now use
+  `vendor_blue: 2, vendor_red: 1`. Note this is the **reverse** of the
+  descriptor's own usage names; see the colour section below.

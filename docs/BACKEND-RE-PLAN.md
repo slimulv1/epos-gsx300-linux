@@ -40,7 +40,7 @@ Status: PLAN (design + verification findings, no code changed yet)
 │  ├─ HidHandler::spawn_reader (hidraw, blocking thread)        │
 │  │    → mpsc channel: ModeChanged/LongPress/VolumeChanged     │
 │  ├─ LedController::new(config.led_probe) → set_mode(mode)     │
-│  │    → report 0x02 packet[1]=vendor_blue(1)/vendor_red(2)    │
+│  │    → report 0x02 packet[1]=vendor_blue(2)/vendor_red(1)    │
 │  ├─ IpcState { config, audio, led, volume:AtomicI32(100) }    │
 │  │                                                             │
 │  ├─ smart-button task   (ModeChanged→Toggle/ToggleEq/Cycle/   │

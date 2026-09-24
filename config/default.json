@@ -7,8 +7,8 @@
   },
   "mode": "stereo",
   "led_probe": {
-    "vendor_blue": 1,
-    "vendor_red": 2,
+    "vendor_blue": 2,
+    "vendor_red": 1,
     "primary_blue": null,
     "primary_red": null,
     "use_report": "vendor"
