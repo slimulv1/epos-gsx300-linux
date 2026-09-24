@@ -75,6 +75,32 @@ pub(crate) fn profile_name_matches(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
 
+/// Check a proposed profile name before it is stored.
+///
+/// Nothing checked this before. The GUI only rejects an exact duplicate, so
+/// with the shipped "FLAT" a user typing "flat" got a second entry the GUI
+/// lists identically and every lookup skips, and an empty name could be
+/// activated at all — after which `sync_profile_audio` returns early and live
+/// edits stop being stored anywhere. Comparing case-insensitively is what makes
+/// the collision visible, since the shared contract already treats names that
+/// way.
+pub fn validate_new_profile_name(
+    profiles: &[epos_shared::Profile],
+    name: &str,
+) -> Result<(), String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("Profile name cannot be empty".to_string());
+    }
+    if profiles
+        .iter()
+        .any(|p| profile_name_matches(p.name.trim(), trimmed))
+    {
+        return Err(format!("A profile named '{}' already exists", trimmed));
+    }
+    Ok(())
+}
+
 /// What deleting a profile should do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeleteOutcome {
@@ -138,7 +164,7 @@ fn sync_profile_audio(profiles: &mut [epos_shared::Profile], active: &str, live:
     // compares this way.
     if let Some(p) = profiles
         .iter_mut()
-        .find(|p| p.name.eq_ignore_ascii_case(active))
+        .find(|p| profile_name_matches(p.name.trim(), active.trim()))
     {
         p.audio = live.clone();
     }
@@ -673,11 +699,21 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
         }
         Request::SetActiveProfile { name } => {
             let mut state = state.write().await;
-            if let Some(profile) = state.config.profiles.iter().find(|p| p.name == name) {
+            if let Some(profile) = state
+                .config
+                .profiles
+                .iter()
+                .find(|p| profile_name_matches(p.name.trim(), name.trim()))
+            {
                 let profile_audio = profile.audio.clone();
                 let profile_mode = profile.mode;
+                // Store the profile's own spelling, not the one the caller typed.
+                // Matching is case-insensitive, so both work, but persisting
+                // the request's spelling slowly fills the file with variants of
+                // the same profile.
+                let canonical_name = profile.name.clone();
                 state.config.audio = profile_audio;
-                state.config.active_profile = name;
+                state.config.active_profile = canonical_name;
                 // A profile also carries the audio mode (7.1 for MOVIE/MUSIC,
                 // stereo for FLAT/ESPORT). The smart-button path already
                 // applies it; the GUI path did not, so switching profile from
@@ -714,6 +750,10 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
         }
         Request::CreateProfile { name, audio } => {
             let mut state = state.write().await;
+            if let Err(why) = validate_new_profile_name(&state.config.profiles, &name) {
+                return Response::Error { message: why };
+            }
+            let name = name.trim().to_string();
             let now = chrono_now();
             state.config.profiles.push(epos_shared::Profile {
                 name: name.clone(),
@@ -1629,6 +1669,49 @@ mod tests {
             after_persist(&Response::Mode(AudioMode::Surround71), Ok(())),
             Response::Mode(AudioMode::Surround71)
         ));
+    }
+
+    // ─── Naming a new profile ────────────────────────────────
+    //
+    // `CreateProfile` accepted whatever it was given. The GUI only checks for
+    // an exact duplicate, so with the shipped "FLAT" a user typing "flat" got
+    // two entries the GUI lists identically, and the second was unreachable:
+    // every lookup takes the first case-insensitive match. An empty name was
+    // worse — activating it made `sync_profile_audio` return early, so live
+    // edits were never stored anywhere.
+
+    #[test]
+    fn an_empty_profile_name_is_refused() {
+        let profiles = vec![profile("FLAT", 80)];
+        for name in ["", "   "] {
+            let outcome = validate_new_profile_name(&profiles, name);
+            assert!(outcome.is_err(), "{name:?} must be refused");
+            let why = outcome.unwrap_err();
+            assert!(why.contains("name"), "the reason must mention the name: {why}");
+        }
+    }
+
+    /// A case-insensitive collision is the duplicate the GUI cannot see.
+    #[test]
+    fn a_case_colliding_profile_name_is_refused() {
+        let profiles = vec![profile("FLAT", 80), profile("Music", 50)];
+        for name in ["flat", "FLAT", "Flat", "music", "MUSIC"] {
+            assert!(
+                validate_new_profile_name(&profiles, name).is_err(),
+                "{name:?} collides with an existing profile and must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_distinct_profile_name_is_accepted() {
+        let profiles = vec![profile("FLAT", 80)];
+        for name in ["ESPORT (TREBLE)", "flat 2", "  spaced  "] {
+            assert!(
+                validate_new_profile_name(&profiles, name).is_ok(),
+                "{name:?} does not collide and must be accepted"
+            );
+        }
     }
 
     // ─── Deleting a profile ──────────────────────────────────

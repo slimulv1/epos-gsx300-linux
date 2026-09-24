@@ -242,7 +242,12 @@ async fn main() -> Result<()> {
                                 // builds, wrap-to-0 in release.
                                 let next_idx = match names
                                     .iter()
-                                    .position(|n| *n == st.config.active_profile)
+                                    .position(|n| {
+                                        crate::ipc::profile_name_matches(
+                                            n.trim(),
+                                            st.config.active_profile.trim(),
+                                        )
+                                    })
                                 {
                                     Some(i) => (i + 1) % names.len(),
                                     None => 0,
@@ -250,8 +255,13 @@ async fn main() -> Result<()> {
                                 Some(names[next_idx].clone())
                             };
                             if let Some(name) = next {
-                                if let Some(profile) =
-                                    st.config.profiles.iter().find(|p| p.name == name)
+                                if let Some(profile) = st
+                                    .config
+                                    .profiles
+                                    .iter()
+                                    .find(|p| {
+                                        crate::ipc::profile_name_matches(p.name.trim(), &name)
+                                    })
                                 {
                                     let profile_audio = profile.audio.clone();
                                     let profile_mode = profile.mode;
