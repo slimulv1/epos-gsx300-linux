@@ -116,7 +116,6 @@ pub struct IpcState {
     /// that change on-disk audio config (EQ / noise gate / voice / profile)
     /// notify it so the actual `systemctl restart pipewire` runs *outside* the
     /// IPC lock (see `pipewire_reload_worker` in main.rs).
-    pub reload_notify: Arc<Notify>,
     /// Shared wake-up for the debounced volume-save worker. The knob handler and
     /// the external-volume watcher both notify it instead of each spawning their
     /// own 2s-debounced save task — a fast knob drag or a held media key would
@@ -213,7 +212,6 @@ async fn send_response(writer: &mut (impl AsyncWriteExt + Unpin), resp: &Respons
 async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Response {
     // Clone the shared reload signal up-front; mutation arms notify it so the
     // actual PipeWire restart runs off the IPC lock.
-    let reload_notify = state.read().await.reload_notify.clone();
     match request {
         // --- Status ---
         Request::GetStatus => {
@@ -504,11 +502,10 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
                 let audio_cfg = state.config.audio.clone();
                 state.audio.update_config(&audio_cfg);
                 match state.audio.apply_full().await {
-                    Ok(changed) => {
-                        if changed {
-                            reload_notify.notify_one();
-                        }
-                    }
+                    // apply_full() already enqueues any required instance restart on the
+                    // RestartBus; `changed` only reports whether a conf actually differed.
+                    Ok(true) => debug!("audio conf changed - instance restart enqueued"),
+                    Ok(false) => debug!("audio conf unchanged - no instance restart"),
                     Err(e) => warn!("Failed to apply profile: {}", e),
                 }
                 Response::Ok
@@ -555,11 +552,10 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
                         let audio_cfg = state.config.audio.clone();
                         state.audio.update_config(&audio_cfg);
                         match state.audio.apply_full().await {
-                            Ok(changed) => {
-                                if changed {
-                                    reload_notify.notify_one();
-                                }
-                            }
+                            // apply_full() already enqueues any required instance restart on the
+                            // RestartBus; `changed` only reports whether a conf actually differed.
+                            Ok(true) => debug!("audio conf changed - instance restart enqueued"),
+                            Ok(false) => debug!("audio conf unchanged - no instance restart"),
                             Err(e) => warn!("Failed to apply fallback profile: {}", e),
                         }
                         info!(
@@ -574,11 +570,10 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
                         let audio_cfg = state.config.audio.clone();
                         state.audio.update_config(&audio_cfg);
                         match state.audio.apply_full().await {
-                            Ok(changed) => {
-                                if changed {
-                                    reload_notify.notify_one();
-                                }
-                            }
+                            // apply_full() already enqueues any required instance restart on the
+                            // RestartBus; `changed` only reports whether a conf actually differed.
+                            Ok(true) => debug!("audio conf changed - instance restart enqueued"),
+                            Ok(false) => debug!("audio conf unchanged - no instance restart"),
                             Err(e) => warn!("Failed to apply default audio: {}", e),
                         }
                         info!("Deleted last profile '{}' → reset to defaults", name);
@@ -626,11 +621,10 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
                     let audio_cfg = state.config.audio.clone();
                     state.audio.update_config(&audio_cfg);
                     match state.audio.apply_full().await {
-                        Ok(changed) => {
-                            if changed {
-                                reload_notify.notify_one();
-                            }
-                        }
+                        // apply_full() already enqueues any required instance restart on the
+                        // RestartBus; `changed` only reports whether a conf actually differed.
+                        Ok(true) => debug!("audio conf changed - instance restart enqueued"),
+                        Ok(false) => debug!("audio conf unchanged - no instance restart"),
                         Err(e) => warn!("Failed to apply reloaded config: {}", e),
                     }
                     Response::Ok

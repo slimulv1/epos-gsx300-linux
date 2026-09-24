@@ -102,7 +102,9 @@ pub enum Response {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum Event {
-    DeviceConnected { alsa_card: u8, name: String },
+    /// `alsa_card` is `None` while ALSA has not enumerated the device yet, so
+    /// a consumer can tell "unknown" apart from card 0 (a real index).
+    DeviceConnected { alsa_card: Option<u8>, name: String },
     DeviceDisconnected,
     ProfileChanged { name: String },
     ModeChanged { mode: AudioMode },

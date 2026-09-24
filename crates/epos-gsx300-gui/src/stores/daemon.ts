@@ -73,7 +73,8 @@ export interface Profile {
 export interface DeviceInfo {
   usb_bus: number;
   usb_addr: number;
-  alsa_card: number;
+  /** null while ALSA has not enumerated the device yet. Card 0 is a real index. */
+  alsa_card: number | null;
   pipewire_sink: string;
   pipewire_source: string;
   hidraw: string | null;

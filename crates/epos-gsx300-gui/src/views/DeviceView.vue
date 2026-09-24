@@ -73,7 +73,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocClick));
         <div class="info-row">
           <MonitorSpeaker :size="14" class="info-icon" />
           <span class="info-label">ALSA</span>
-          <span class="info-value">card {{ store.device.alsa_card }}</span>
+          <span class="info-value">card {{ store.device.alsa_card ?? "not enumerated" }}</span>
         </div>
         <div class="info-row">
           <Radio :size="14" class="info-icon" />

@@ -62,7 +62,12 @@ impl HwSnapshot {
 pub struct DeviceInfo {
     pub usb_bus: u8,
     pub usb_addr: u8,
-    pub alsa_card: u8,
+    /// ALSA card index, or `None` while ALSA has not enumerated the device yet.
+    ///
+    /// `None` is load-bearing: USB can enumerate before `/proc/asound/cardN`
+    /// exists, and 0 is a real card index rather than a "not found" marker, so
+    /// a fabricated 0 would let a mixer write land on unrelated hardware.
+    pub alsa_card: Option<u8>,
     pub pipewire_sink: String,
     pub pipewire_source: String,
     pub hidraw: Option<PathBuf>,

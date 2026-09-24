@@ -106,7 +106,8 @@ fn scan_usb_devices(
             let usb_addr = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
 
             // Find ALSA card number
-            let alsa_card = find_alsa_card(vid, pid).unwrap_or(0);
+            // Stay unknown until ALSA enumerates; 0 is a real card, not a sentinel.
+            let alsa_card = find_alsa_card(vid, pid);
 
             // Find PipeWire node names — from cache when available (no pw-dump
             // spawn), otherwise a fresh lookup (startup / reconnect).
@@ -191,7 +192,7 @@ fn find_alsa_card(vid: u16, pid: u16) -> Option<u8> {
     None
 }
 
-fn find_pipewire_nodes(_card: u8) -> (String, String) {
+fn find_pipewire_nodes(_card: Option<u8>) -> (String, String) {
     // Resolve the real PipeWire node names for this device by querying pw-dump.
     // Falls back to wildcard patterns if pw-dump is unavailable.
     let dump = std::process::Command::new("pw-dump")

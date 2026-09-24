@@ -39,7 +39,11 @@ async fn main() -> Result<()> {
     if let Some(ref d) = device {
         info!(
             "EPOS GSX 300 detected: bus {} addr {} ALSA card {}",
-            d.usb_bus, d.usb_addr, d.alsa_card
+            d.usb_bus,
+            d.usb_addr,
+            d.alsa_card
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "not enumerated yet".to_string())
         );
     } else {
         info!("No EPOS GSX 300 detected — daemon will wait for hotplug");
@@ -124,7 +128,6 @@ async fn main() -> Result<()> {
         device: None,
         pipewire_nodes: None,
         last_written: std::sync::Mutex::new(None),
-        reload_notify: Arc::new(Notify::new()),
         volume_save_notify: Arc::new(Notify::new()),
         smart_button_seq: std::sync::atomic::AtomicU64::new(0),
     }));
@@ -228,11 +231,10 @@ async fn main() -> Result<()> {
                                     let audio_cfg = st.config.audio.clone();
                                     st.audio.update_config(&audio_cfg);
                                     match st.audio.apply_full().await {
-                                        Ok(changed) => {
-                                            if changed {
-                                                st.reload_notify.notify_one();
-                                            }
-                                        }
+                                        // apply_full() already enqueues any required instance restart on the
+                                        // RestartBus; `changed` only reports whether a conf actually differed.
+                                        Ok(true) => debug!("audio conf changed - instance restart enqueued"),
+                                        Ok(false) => debug!("audio conf unchanged - no instance restart"),
                                         Err(e) => warn!("Failed to apply profile: {}", e),
                                     }
                                     if let Err(e) = save_config(&st) {
@@ -422,8 +424,12 @@ async fn main() -> Result<()> {
                     // after the daemon stops.
                     let _ = led.set_mode(AudioMode::Stereo);
                 }
-                // Kill the sidetone loopback child — std::process::exit bypasses
-                // Drop, so without this the orphaned pw-loopback keeps mixing mic.
+                // Nothing to reap here: the sidetone lives inside the
+                // `pipewire-epos@sidetone` systemd instance, not a
+                // daemon-owned child, so `kill_sidetone` is intentionally a
+                // no-op (see AudioPipeline). The old comment here described a
+                // spawned pw-loopback child that no longer exists and
+                // contradicted the implementation.
                 st.audio.kill_sidetone().await;
                 std::process::exit(0);
             }
@@ -596,11 +602,10 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
                 }
                 st.audio.set_device(d);
                 match st.audio.apply_full().await {
-                    Ok(changed) => {
-                        if changed {
-                            st.reload_notify.notify_one();
-                        }
-                    }
+                    // apply_full() already enqueues any required instance restart on the
+                    // RestartBus; `changed` only reports whether a conf actually differed.
+                    Ok(true) => debug!("audio conf changed - instance restart enqueued"),
+                    Ok(false) => debug!("audio conf unchanged - no instance restart"),
                     Err(e) => warn!("Failed to apply audio config on connect: {}", e),
                 }
                 // Re-assert the output route: the sink node names can change on
@@ -835,11 +840,10 @@ async fn config_watch_loop(state: Arc<RwLock<IpcState>>) {
             let audio_cfg = st.config.audio.clone();
             st.audio.update_config(&audio_cfg);
             match st.audio.apply_full().await {
-                Ok(changed) => {
-                    if changed {
-                        st.reload_notify.notify_one();
-                    }
-                }
+                // apply_full() already enqueues any required instance restart on the
+                // RestartBus; `changed` only reports whether a conf actually differed.
+                Ok(true) => debug!("audio conf changed - instance restart enqueued"),
+                Ok(false) => debug!("audio conf unchanged - no instance restart"),
                 Err(e) => warn!("Failed to apply reloaded audio config: {}", e),
             }
             info!("Config hot-reload: audio settings applied");

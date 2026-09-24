@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use epos_shared::config::{AudioConfig, VoiceMode};
 use epos_shared::device::DeviceInfo;
 use std::collections::BTreeSet;
@@ -144,14 +144,43 @@ pub fn sanitize_bands(bands: &[epos_shared::config::EqBand]) -> Vec<(u32, f32, f
     out
 }
 
+/// Bound a mic gain to the 0..=100 percentage that `amixer` is given.
+///
+/// `amixer` accepts `5000%` and silently saturates at full scale, so an
+/// unbounded value both lies about the requested gain and pins the hardware at
+/// maximum. Applied in [`AudioPipeline::update_config`] so every route into the
+/// pipeline is covered — direct IPC, a stored profile, a hand-edited
+/// `config.json`, and `Reload` — not just the IPC edge.
+fn sanitize_mic_gain(gain: u32) -> u32 {
+    gain.min(100)
+}
+
+/// The ALSA card index to hand to `amixer`, or an error when it is not known.
+///
+/// An unknown card is deliberately an error rather than a fallback to 0. ALSA
+/// card 0 is a real sound card, so defaulting to it made an EPOS
+/// unplug/replug race write the EPOS mic gain onto an unrelated device.
+/// Card 0 stays valid when it is genuinely the answer.
+fn usable_alsa_card(card: Option<u8>) -> Result<u8> {
+    card.context(
+        "ALSA card for the GSX 300 is not known yet (USB enumerated before \
+         /proc/asound) — refusing to touch an arbitrary card; the hotplug poll \
+         retries",
+    )
+}
+
 impl AudioPipeline {
     pub fn new(config: &AudioConfig) -> Self {
-        Self {
-            config: config.clone(),
+        let mut pipeline = Self {
+            config: AudioConfig::default(),
             device: None,
             restarts: Arc::new(RestartBus::new()),
             gain_epoch: Arc::new(AtomicU64::new(0)),
-        }
+        };
+        // Same funnel as update_config, so a hand-edited config.json is bounded
+        // at startup too and not only on later IPC updates.
+        pipeline.update_config(config);
+        pipeline
     }
 
     /// Store device reference for future operations
@@ -161,7 +190,11 @@ impl AudioPipeline {
 
     /// Sync latest config into the pipeline before applying filters
     pub fn update_config(&mut self, config: &AudioConfig) {
-        self.config = config.clone();
+        let mut config = config.clone();
+        // Single funnel for every config source, so a profile or an edited
+        // config.json cannot smuggle an out-of-range gain past the IPC clamp.
+        config.mic_gain = sanitize_mic_gain(config.mic_gain);
+        self.config = config;
     }
 
     /// Apply the full audio config (EQ, mic gain, sidetone, noise gate, voice).
@@ -1063,7 +1096,10 @@ async fn instance_node_present(role: &str, node: &str) -> bool {
 /// re-applied after WirePlumber restore-routes overwrites the element
 /// during node activation (see AudioPipeline::apply_full).
 async fn apply_mic_gain_oneshot(device: &DeviceInfo, gain: u32) -> Result<()> {
-    let card = device.alsa_card;
+    // Refuse an unknown card instead of writing to card 0, which is some other
+    // device's mixer. The hotplug poll retries once ALSA has enumerated.
+    let card = usable_alsa_card(device.alsa_card)?;
+    let gain = sanitize_mic_gain(gain);
 
     // The GSX 300 capture gain is the ALSA mixer element "Mic Capture
     // Volume" (numid=4, 0-35, 100% = 5 dB). Note: `amixer scontrols`
@@ -1404,5 +1440,54 @@ mod tests {
     fn unknown_role_expects_no_node() {
         assert_eq!(expected_node("nonsense"), None);
         assert_eq!(expected_node(""), None);
+    }
+
+    // ── ALSA card: "not found" must never become card 0 ────────────────────
+    //
+    // `find_alsa_card(...).unwrap_or(0)` used 0 as a sentinel for "ALSA has not
+    // enumerated this device yet". `apply_mic_gain_oneshot` then ran
+    // `amixer -c 0 …`, which is a real, different sound card — so an EPOS
+    // unplug/replug race could move somebody else's input gain. The card index
+    // has to stay unknown until it is actually known.
+
+    /// A missing ALSA card is an error, never a fallback to card 0.
+    #[test]
+    fn unknown_alsa_card_is_refused() {
+        assert!(usable_alsa_card(None).is_err());
+    }
+
+    /// Card 0 is a legitimate ALSA index, not a sentinel. This case exists to
+    /// stop anyone "fixing" the bug above by rejecting 0, which would break
+    /// every user whose headset really is on card 0.
+    #[test]
+    fn alsa_card_zero_is_a_real_card() {
+        assert_eq!(usable_alsa_card(Some(0)).unwrap(), 0);
+        assert_eq!(usable_alsa_card(Some(4)).unwrap(), 4);
+    }
+
+    // ── mic_gain is a percentage, bounded at the pipeline ──────────────────
+
+    /// `amixer` accepts values above 100% and silently saturates, so an
+    /// unclamped gain looks successful while the hardware sits pinned at max.
+    /// Every path that can set a gain — direct IPC, a profile, a hand-edited
+    /// config.json, Reload — funnels through here.
+    #[test]
+    fn mic_gain_is_bounded_to_a_percentage() {
+        assert_eq!(sanitize_mic_gain(0), 0);
+        assert_eq!(sanitize_mic_gain(1), 1);
+        assert_eq!(sanitize_mic_gain(100), 100);
+        assert_eq!(sanitize_mic_gain(101), 100);
+        assert_eq!(sanitize_mic_gain(5_000), 100);
+        assert_eq!(sanitize_mic_gain(u32::MAX), 100);
+    }
+
+    /// The bound is applied where config enters the pipeline, not only at the
+    /// IPC edge — a profile carrying 5000 must not reach `amixer` either.
+    #[test]
+    fn pipeline_clamps_an_oversized_gain_from_any_source() {
+        let mut cfg = AudioConfig::default();
+        cfg.mic_gain = 5_000;
+        let pipeline = AudioPipeline::new(&cfg);
+        assert_eq!(pipeline.config.mic_gain, 100);
     }
 }
