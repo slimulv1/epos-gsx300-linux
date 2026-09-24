@@ -46,19 +46,22 @@ pub fn request_is_mutation(req: &Request) -> bool {
     )
 }
 
-/// Whether a handled request should be followed by a config save.
+/// Whether this request should be followed by a config save.
 ///
-/// Only mutations are saved, so the GUI's 3s status poll never churns the file.
-/// Among mutations, success is not always spelled `Response::Ok`: `ToggleMode`
-/// answers `Response::Mode(new_mode)` so the GUI can update its toggle straight
-/// from the reply instead of waiting for the next poll, and gating on `Ok`
-/// alone meant the stereo/7.1 switch reached the LED and the status but never
-/// the disk. Every other mutating handler does answer `Ok`.
+/// Every mutating request is persisted — including one whose application
+/// failed. The handler has already changed `state.config` by then, and the
+/// alternative was a daemon whose RAM, its disk file and its own reply all
+/// disagreed: the GUI showed a setting that a restart reverted, and a later
+/// successful mutation silently resurrected a value the user had just been
+/// told had failed. Persisting the intent also means a restart retries it,
+/// which is the right outcome for a failure caused by a busy device rather
+/// than a rejected value — the values themselves are already clamped.
 ///
-/// `Response::Error` is never saved: the handler failed, and persisting it
-/// would record a change the daemon could not apply.
-pub fn response_should_persist(response: &Response, is_mutation: bool) -> bool {
-    is_mutation && matches!(response, Response::Ok | Response::Mode(_))
+/// `Reload` is the exception. It adopts the file as the source of truth, so
+/// writing anything back would overwrite the very file it was asked to read,
+/// including a file the user was in the middle of editing.
+pub fn should_persist(request: &Request) -> bool {
+    !matches!(request, Request::Reload) && request_is_mutation(request)
 }
 
 /// Compare two profile names the way the shared config contract defines them.
@@ -355,7 +358,7 @@ async fn handle_client(stream: UnixStream, state: Arc<RwLock<IpcState>>) -> Resu
             }
         };
 
-        let is_mutation = request_is_mutation(&request);
+        let should_save = should_persist(&request);
 
         let response = handle_request(request, state.clone()).await;
 
@@ -366,7 +369,7 @@ async fn handle_client(stream: UnixStream, state: Arc<RwLock<IpcState>>) -> Resu
         // failed save can still be reported to the client that asked.
         //
         // Read-only requests never write: the GUI polls GetStatus every 3s.
-        let response = if response_should_persist(&response, is_mutation) {
+        let response = if should_save {
             let st = state.read().await;
             after_persist(&response, crate::save_config(&st).map_err(|e| e.to_string()))
         } else {
@@ -489,7 +492,11 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
                         debug!("EQ conf changed — instance-only restart (main untouched)");
                     }
                 }
-                Err(e) => warn!("Failed to apply EQ: {}", e),
+                Err(e) => {
+                    return Response::Error {
+                        message: format!("Failed to apply EQ: {}", e),
+                    };
+                }
             }
             Response::Ok
         }
@@ -503,7 +510,9 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
             let audio_cfg = state.config.audio.clone();
             state.audio.update_config(&audio_cfg);
             if let Err(e) = state.audio.apply_sidetone().await {
-                warn!("Failed to apply sidetone: {}", e);
+                return Response::Error {
+                    message: format!("Failed to apply sidetone: {}", e),
+                };
             }
             Response::Ok
         }
@@ -526,7 +535,11 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
                     // Do NOT restart main pipewire → Discord sink/source links
                     // stay pinned.
                 }
-                Err(e) => warn!("Failed to apply noise gate: {}", e),
+                Err(e) => {
+                    return Response::Error {
+                        message: format!("Failed to apply noise gate: {}", e),
+                    };
+                }
             }
             Response::Ok
         }
@@ -686,7 +699,11 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
                     // RestartBus; `changed` only reports whether a conf actually differed.
                     Ok(true) => debug!("audio conf changed - instance restart enqueued"),
                     Ok(false) => debug!("audio conf unchanged - no instance restart"),
-                    Err(e) => warn!("Failed to apply profile: {}", e),
+                    Err(e) => {
+                        return Response::Error {
+                            message: format!("Failed to apply profile: {}", e),
+                        };
+                    }
                 }
                 Response::Ok
             } else {
@@ -771,7 +788,11 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
                         // RestartBus; `changed` only reports whether a conf actually differed.
                         Ok(true) => debug!("audio conf changed - instance restart enqueued"),
                         Ok(false) => debug!("audio conf unchanged - no instance restart"),
-                        Err(e) => warn!("Failed to apply fallback profile: {}", e),
+                        Err(e) => {
+                            return Response::Error {
+                                message: format!("Failed to apply fallback profile: {}", e),
+                            };
+                        }
                     }
                     info!(
                         "Deleted active profile '{}' -> fallback to '{}'",
@@ -823,7 +844,11 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
                         // RestartBus; `changed` only reports whether a conf actually differed.
                         Ok(true) => debug!("audio conf changed - instance restart enqueued"),
                         Ok(false) => debug!("audio conf unchanged - no instance restart"),
-                        Err(e) => warn!("Failed to apply reloaded config: {}", e),
+                        Err(e) => {
+                            return Response::Error {
+                                message: format!("Failed to apply reloaded config: {}", e),
+                            };
+                        }
                     }
                     Response::Ok
                 }
@@ -1175,13 +1200,13 @@ async fn process_http_body(
         }
     };
 
-    let is_mutation = request_is_mutation(&request);
+    let should_save = should_persist(&request);
 
     let response = handle_request(request, state.clone()).await;
 
     // Persist before answering, through the same rule and the same helper as the
     // Unix socket, so the two paths cannot drift apart on what a client is told.
-    let response = if response_should_persist(&response, is_mutation) {
+    let response = if should_save {
         let st = state.read().await;
         after_persist(&response, crate::save_config(&st).map_err(|e| e.to_string()))
     } else {
@@ -1722,7 +1747,7 @@ mod tests {
         );
     }
 
-    // ─── What counts as a successful, persistable change ──────
+    // ─── What gets written to disk ───────────────────────────
     //
     // The save gate tested `matches!(response, Response::Ok)`, which quietly
     // excluded `ToggleMode`: that handler answers `Response::Mode` so the GUI
@@ -1733,41 +1758,41 @@ mod tests {
     // the toggle left the file at `stereo` while the daemon reported
     // `surround71`.
 
-    /// The regression: the toggle's own success shape must reach disk.
+    fn mode_toggle() -> Request {
+        Request::ToggleMode
+    }
+
+    /// The regression: the toggle must reach disk, and the rule is now keyed on
+    /// the request rather than on the shape of its reply, so the two cannot
+    /// drift apart again.
     #[test]
     fn the_mode_toggle_is_persisted() {
-        assert!(
-            response_should_persist(&Response::Mode(AudioMode::Surround71), true),
-            "ToggleMode answers Response::Mode, and that change must be saved"
-        );
+        assert!(should_persist(&mode_toggle()));
     }
 
-    /// The ordinary shape keeps working.
+    /// A failure to apply no longer means the edit is dropped from disk. The
+    /// handler already changed `state.config`; persisting it keeps RAM, disk
+    /// and the reply from disagreeing, and lets a restart retry what a busy
+    /// device refused once.
     #[test]
-    fn a_plain_ok_is_persisted_when_it_mutates() {
-        assert!(response_should_persist(&Response::Ok, true));
+    fn a_mutation_is_persisted_even_when_its_reply_is_an_error() {
+        assert!(should_persist(&Request::SetMicGain { gain: 50 }));
     }
 
-    /// A failure is never persisted, however the request was classified.
-    #[test]
-    fn an_error_is_never_persisted() {
-        assert!(!response_should_persist(
-            &Response::Error {
-                message: "Failed to apply EQ".into()
-            },
-            true
-        ));
-    }
-
-    /// Read-only traffic must not churn the file, whatever it answers with.
-    /// `GetMode` also answers `Response::Mode`, so this is the case that keeps
-    /// widening the gate from being a mistake.
+    /// The GUI polls GetStatus three times a second; read-only traffic must
+    /// never churn the file.
     #[test]
     fn read_only_requests_never_persist() {
-        assert!(!response_should_persist(
-            &Response::Mode(AudioMode::Stereo),
-            false
-        ));
-        assert!(!response_should_persist(&Response::Ok, false));
+        assert!(!should_persist(&Request::GetStatus));
+        assert!(!should_persist(&Request::GetMode));
+        assert!(!should_persist(&Request::GetProfiles));
+    }
+
+    /// `Reload` reads the file as its source of truth. Writing anything back on
+    /// any of its paths would overwrite the file the user asked it to read —
+    /// including one they were in the middle of editing.
+    #[test]
+    fn reload_never_writes_back() {
+        assert!(!should_persist(&Request::Reload));
     }
 }
