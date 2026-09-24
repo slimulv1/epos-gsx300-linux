@@ -217,6 +217,11 @@ async fn main() -> Result<()> {
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let enabled = !st.config.audio.eq.enabled;
                             st.config.audio.eq.enabled = enabled;
+                            // The active profile is "the profile you are editing".
+                            // The IPC setters mirror live edits into it; the
+                            // button used not to, so switching profiles and back
+                            // silently undid whatever the button just toggled.
+                            crate::ipc::sync_active_profile(&mut st);
                             let audio_cfg = st.config.audio.clone();
                             st.audio.update_config(&audio_cfg);
                             if let Err(e) = st.audio.apply_eq().await {
@@ -303,6 +308,11 @@ async fn main() -> Result<()> {
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let enabled = !st.config.audio.sidetone.enabled;
                             st.config.audio.sidetone.enabled = enabled;
+                            // The active profile is "the profile you are editing".
+                            // The IPC setters mirror live edits into it; the
+                            // button used not to, so switching profiles and back
+                            // silently undid whatever the button just toggled.
+                            crate::ipc::sync_active_profile(&mut st);
                             let audio_cfg = st.config.audio.clone();
                             st.audio.update_config(&audio_cfg);
                             if let Err(e) = st.audio.apply_sidetone().await {
@@ -322,6 +332,11 @@ async fn main() -> Result<()> {
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let enabled = !st.config.audio.noise_gate.enabled;
                             st.config.audio.noise_gate.enabled = enabled;
+                            // The active profile is "the profile you are editing".
+                            // The IPC setters mirror live edits into it; the
+                            // button used not to, so switching profiles and back
+                            // silently undid whatever the button just toggled.
+                            crate::ipc::sync_active_profile(&mut st);
                             let audio_cfg = st.config.audio.clone();
                             st.audio.update_config(&audio_cfg);
                             if let Err(e) = st.audio.apply_noise_gate().await {

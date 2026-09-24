@@ -170,7 +170,10 @@ fn sync_profile_audio(profiles: &mut [epos_shared::Profile], active: &str, live:
     }
 }
 
-fn sync_active_profile(state: &mut IpcState) {
+/// `pub(crate)` because the smart-button path needs it too: its toggles edit the
+/// live audio and must land in the active profile exactly as the IPC setters
+/// do, or switching profiles and back reverts what the button just did.
+pub(crate) fn sync_active_profile(state: &mut IpcState) {
     let active = state.config.active_profile.clone();
     let live = state.config.audio.clone();
     sync_profile_audio(&mut state.config.profiles, &active, &live);
