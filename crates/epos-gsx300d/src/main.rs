@@ -36,6 +36,11 @@ async fn main() -> Result<()> {
 
     // Load config
     let config = config::load()?;
+    // Seed the daemon's belief about the file with what it actually contains,
+    // before anything can save. Without this the first save would find no
+    // belief to contradict and would overwrite an edit made between the load
+    // and that save.
+    let config_bytes_on_disk = std::fs::read(config::config_path()).ok();
     info!("Config loaded from {}", config::config_path().display());
 
     // Detect device
@@ -164,7 +169,7 @@ async fn main() -> Result<()> {
         pipewire_nodes: None,
         last_volume_sink: std::sync::Mutex::new(String::new()),
         mic_watch: std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
-        last_written: std::sync::Mutex::new(None),
+        last_written: std::sync::Mutex::new(config_bytes_on_disk),
         volume_save_notify: Arc::new(Notify::new()),
         smart_button_seq: std::sync::atomic::AtomicU64::new(0),
     }));
@@ -1003,7 +1008,59 @@ fn external_volume_to_apply(
 /// Persists the daemon's config to disk and records the exact bytes written so
 /// `config_watch_loop` can recognize the daemon's own atomic `save()` and skip
 /// it — instead of reloading and reverting newer in-memory state.
+/// Whether the config file may be written right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SaveDecision {
+    /// The file is what we believe it to be, so writing is safe.
+    Proceed,
+    /// Somebody else changed it. `reason` is what to tell the user.
+    Refuse { reason: String },
+}
+
+/// Decide whether a save may go ahead, from what the daemon believes is on disk
+/// and what is actually there.
+///
+/// The daemon owns the config in memory and rewrites the whole file, so an edit
+/// made outside it is only picked up once the 2s watcher notices. Until then any
+/// save overwrites it. That was observed on this machine: a volume save landed
+/// between two writes of a test and the second one was lost.
+///
+/// Re-checking immediately before the write and failing closed when ownership
+/// cannot be established is the guidance for daemon-authored files, and the
+/// belief is kept honest in both directions: `save_config` records what it
+/// wrote, and the watcher records what it adopted.
+fn save_decision(believed: Option<&[u8]>, on_disk: Option<&[u8]>) -> SaveDecision {
+    let (Some(believed), Some(on_disk)) = (believed, on_disk) else {
+        // Nothing of ours to protect: either we have never written, or there is
+        // no file there to overwrite.
+        return SaveDecision::Proceed;
+    };
+    if believed == on_disk {
+        return SaveDecision::Proceed;
+    }
+    SaveDecision::Refuse {
+        reason: format!(
+            "config.json changed outside the daemon \
+             ({} bytes on disk, {} bytes expected) - not overwriting it; \
+             the edit will be loaded shortly",
+            on_disk.len(),
+            believed.len()
+        ),
+    }
+}
+
 fn save_config(st: &IpcState) -> Result<(), anyhow::Error> {
+    // Check before writing, not after: after the fact the edit is already gone.
+    let on_disk = std::fs::read(config::config_path()).ok();
+    let believed = lock(&st.last_written).clone();
+    if let SaveDecision::Refuse { reason } = save_decision(believed.as_deref(), on_disk.as_deref())
+    {
+        // Surfaced to the client as a failure, and logged, so the edit is
+        // visible rather than silently losing a race.
+        warn!("{reason}");
+        return Err(anyhow::anyhow!("{reason}"));
+    }
+
     config::save(&st.config)?;
     if let Ok(bytes) = std::fs::read(config::config_path()) {
         *lock(&st.last_written) = Some(bytes);
@@ -1372,7 +1429,76 @@ fn emit_smart_notify(st: &IpcState) {
 mod tests {
     use super::*;
 
-    // ─── Volume arriving from an edited config file ──────────
+    // ─── Whether a save may go ahead ─────────────────────────
+    //
+    // The daemon keeps the authoritative config in memory and rewrites the whole
+    // file. If the user edits that file while the daemon is running, the edit is
+    // only picked up by the 2s watcher — and until it is, a save from an IPC
+    // request or the volume worker overwrites it. That was observed on this
+    // machine: a legitimate volume save landed between two writes of a test and
+    // the second one was lost.
+    //
+    // Research on daemon-authored files points the same way: re-check the
+    // current state immediately before the write, and if ownership cannot be
+    // established, fail closed rather than clobber. So the daemon remembers what
+    // it believes is on disk, and refuses to write over anything else.
+
+    /// Writing is fine when the file is what we think it is.
+    #[test]
+    fn a_save_proceeds_when_the_file_is_what_we_wrote() {
+        assert!(matches!(
+            save_decision(Some(b"ours"), Some(b"ours")),
+            SaveDecision::Proceed
+        ));
+    }
+
+    /// The case that lost the edit: the file no longer matches our belief, so
+    /// somebody changed it behind our back.
+    #[test]
+    fn a_save_is_refused_when_somebody_else_changed_the_file() {
+        let outcome = save_decision(Some(b"ours"), Some(b"theirs"));
+        let reason = match outcome {
+            SaveDecision::Refuse { reason } => reason,
+            SaveDecision::Proceed => panic!("a foreign edit must not be overwritten"),
+        };
+        assert!(
+            reason.contains("changed") || reason.contains("edit"),
+            "the reason must name the conflict: {reason}"
+        );
+    }
+
+    /// Never having written is not a conflict — there is nothing of ours to
+    /// protect. The startup path seeds the belief from the file it loaded, so
+    /// this is only the first-write case.
+    #[test]
+    fn a_first_save_is_not_a_conflict() {
+        assert!(matches!(
+            save_decision(None, Some(b"whatever")),
+            SaveDecision::Proceed
+        ));
+    }
+
+    /// A file that has gone missing has nothing to overwrite.
+    #[test]
+    fn a_missing_file_does_not_block_a_save() {
+        assert!(matches!(
+            save_decision(Some(b"ours"), None),
+            SaveDecision::Proceed
+        ));
+    }
+
+    /// The reason names the sizes, so a log reader can tell a one-field edit
+    /// from a wholesale replacement without opening both files.
+    #[test]
+    fn the_conflict_reason_says_how_different_the_file_is() {
+        let reason = match save_decision(Some(b"1234"), Some(b"12345678")) {
+            SaveDecision::Refuse { reason } => reason,
+            SaveDecision::Proceed => panic!("expected a refusal"),
+        };
+        assert!(reason.contains('4'), "expected the expected size in: {reason}");
+        assert!(reason.contains('8'), "expected the actual size in: {reason}");
+    }
+
     //
     // The watcher adopted a hand-edited `device.volume` into `st.config` and
     // left the daemon's own trackers alone. The value therefore went nowhere:
@@ -1380,6 +1506,14 @@ mod tests {
     // adopted the sink's value over it, and the next save wrote that back. The
     // edit was undone silently, and the log said only "non-audio settings
     // updated".
+
+    // ─── Volume arriving from an edited config file ──────────
+    //
+    // The watcher used to copy a hand-edited `device.volume` into `st.config`
+    // and nothing else. The value went nowhere: the 1s volume watcher read the
+    // real sink, adopted that level over the edit, and the next save wrote it
+    // back — so editing the volume in the file did nothing, and the log said
+    // only "non-audio settings updated".
 
     /// An edited volume is applied, and clamped rather than trusted.
     #[test]
