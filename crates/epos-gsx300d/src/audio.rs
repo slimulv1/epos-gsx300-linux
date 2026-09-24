@@ -91,11 +91,19 @@ pub enum OutputRoute {
 /// audio away from whatever device the user is actually using.
 ///
 /// Pure policy, deliberately free of I/O so it can be tested directly.
-pub fn desired_output_route(eq_enabled: bool, device_connected: bool) -> Option<OutputRoute> {
+pub fn desired_output_route(
+    eq_enabled: bool,
+    device_connected: bool,
+    chain_present: bool,
+) -> Option<OutputRoute> {
     if !device_connected {
         return None;
     }
-    Some(if eq_enabled {
+    // `Processed` points apps at `epos-eq-input`, a null-sink that only
+    // produces audio while the EQ filter-chain is draining its monitor. With
+    // the chain absent that is a sink into a void, so an enabled-but-broken EQ
+    // must resolve to the raw hardware sink instead of the anchor.
+    Some(if eq_enabled && chain_present {
         OutputRoute::Processed
     } else {
         OutputRoute::Raw
@@ -491,7 +499,15 @@ impl AudioPipeline {
             .device
             .as_ref()
             .is_some_and(|d| !d.pipewire_sink.is_empty());
-        let Some(route) = desired_output_route(eq_enabled, device_connected) else {
+        // Only route to the EQ anchor when its chain is genuinely published.
+        // Otherwise an enabled-but-broken EQ points every default-following app
+        // at a null-sink nobody drains, i.e. silence.
+        let chain_present = if self.config.eq.enabled {
+            Self::main_graph_has_node("epos-eq-capture").await
+        } else {
+            false
+        };
+        let Some(route) = desired_output_route(eq_enabled, device_connected, chain_present) else {
             // Device absent: leave the user's current default alone.
             return Ok(false);
         };
@@ -1140,6 +1156,21 @@ fn dump_has_node(dump: &str, node: &str) -> bool {
     walk(&root, node)
 }
 
+/// Which MAIN-graph node proves the EQ is actually working, given its
+/// generated conf.
+///
+/// The static anchor `epos-eq-input` exists whether or not the filter-chain
+/// does, so it proves nothing. When the graph really carries bands, the chain
+/// node `epos-eq-capture` is what must be published; with a passthrough graph
+/// there is no EQ to run and the anchor is all that is expected.
+fn eq_expected_node(conf: &str) -> &'static str {
+    if conf.contains("eq_band_") {
+        "epos-eq-capture"
+    } else {
+        EQ_SINK_NAME
+    }
+}
+
 /// The MAIN-graph node this role must publish for its DSP path to be usable,
 /// or `None` when the role is disabled and so legitimately publishes nothing.
 ///
@@ -1154,7 +1185,8 @@ fn dump_has_node(dump: &str, node: &str) -> bool {
 /// filter is engaged, so it is always expected.
 fn expected_node(role: &str) -> Option<String> {
     if role == "eq" {
-        return Some(EQ_SINK_NAME.to_string());
+        let conf = std::fs::read_to_string(AudioPipeline::instance_conf_path("eq")).ok()?;
+        return Some(eq_expected_node(&conf).to_string());
     }
     let marker = match role {
         "voice" => "epos-voice-output",
@@ -1417,7 +1449,7 @@ mod tests {
     #[test]
     fn eq_on_with_device_routes_to_processed_sink() {
         assert_eq!(
-            desired_output_route(true, true),
+            desired_output_route(true, true, true),
             Some(OutputRoute::Processed)
         );
     }
@@ -1425,7 +1457,8 @@ mod tests {
     /// With EQ OFF, playback must go straight to the EPOS hardware sink.
     #[test]
     fn eq_off_with_device_routes_to_raw_sink() {
-        assert_eq!(desired_output_route(false, true), Some(OutputRoute::Raw));
+        assert_eq!(desired_output_route(false, true, false),
+              Some(OutputRoute::Raw));
     }
 
     /// While the EPOS is unplugged the daemon must NOT claim the default sink.
@@ -1435,7 +1468,7 @@ mod tests {
     fn absent_device_never_touches_the_default_sink() {
         for eq_enabled in [true, false] {
             assert_eq!(
-                desired_output_route(eq_enabled, false),
+                desired_output_route(eq_enabled, false, true),
                 None,
                 "eq_enabled={eq_enabled} must not touch the default while absent"
             );
@@ -1725,5 +1758,79 @@ mod tests {
     #[test]
     fn no_input_route_is_desired_while_disconnected() {
         assert_eq!(desired_input_route(true, true, false, true), None);
+    }
+
+    // ── The EQ must never be advertised unless its chain actually exists ──
+    //
+    // `epos-eq-input` is a static null-sink installed in MAIN by
+    // 40-epos-eq-virtualsink.conf, so it exists whether or not the EQ
+    // filter-chain does. The chain cannot live in the per-role instance: a
+    // filter-chain capture cannot resolve a static null-sink in another
+    // daemon ("defined target not found", measured), so `epos-eq-capture`
+    // never appears in MAIN. Routing the default sink to the anchor anyway
+    // sends every app that honours the default into a sink nobody drains —
+    // silence. The route and the health verdict must both depend on the chain
+    // being present, not on the anchor.
+
+    /// EQ on but the chain absent -> the raw sink, never the dead anchor.
+    #[test]
+    fn eq_route_falls_back_to_raw_when_the_chain_is_missing() {
+        assert_eq!(
+            desired_output_route(true, true, false),
+            Some(OutputRoute::Raw),
+            "routing to epos-eq-input without epos-eq-capture would silence apps"
+        );
+    }
+
+    /// EQ on and the chain really present -> the processed route.
+    #[test]
+    fn eq_route_uses_the_anchor_when_the_chain_is_present() {
+        assert_eq!(
+            desired_output_route(true, true, true),
+            Some(OutputRoute::Processed)
+        );
+    }
+
+    /// EQ off is unaffected: raw sink whether or not a chain lingers.
+    #[test]
+    fn eq_off_always_means_raw_sink() {
+        assert_eq!(desired_output_route(false, true, false), Some(OutputRoute::Raw));
+        assert_eq!(desired_output_route(false, true, true), Some(OutputRoute::Raw));
+    }
+
+    /// Disconnected: leave the default alone, as before.
+    #[test]
+    fn no_output_route_is_desired_while_disconnected() {
+        assert_eq!(desired_output_route(true, false, true), None);
+        assert_eq!(desired_output_route(false, false, false), None);
+    }
+
+    /// The health check must judge the EQ by its chain node when the EQ is
+    /// actually engaged, not by the always-present static anchor.
+    #[test]
+    fn eq_health_follows_the_chain_not_the_static_anchor() {
+        let with_bands = generate_eq_instance_conf(
+            &[epos_shared::config::EqBand {
+                freq: 1000,
+                gain_db: 6.0,
+                q: 1.0,
+            }],
+            "sink",
+        );
+        assert!(
+            with_bands.contains("eq_band_"),
+            "sanity: a non-flat band must reach the graph"
+        );
+        assert_eq!(
+            eq_expected_node(&with_bands),
+            "epos-eq-capture",
+            "with bands in the graph, the chain node is what must be published"
+        );
+        let passthrough = generate_eq_instance_conf(&[], "sink");
+        assert_eq!(
+            eq_expected_node(&passthrough),
+            EQ_SINK_NAME,
+            "with a passthrough graph there is no EQ chain to publish"
+        );
     }
 }
