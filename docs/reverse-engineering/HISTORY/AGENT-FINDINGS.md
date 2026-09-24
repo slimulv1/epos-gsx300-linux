@@ -89,7 +89,7 @@
 | Feature | Mechanism | Config path |
 |-----------|--------|-------------|
 | **9-band EQ** | `filter-chain` with `bq_peaking` (Freq/Q/Gain — PipeWire computes coefficients itself) | `~/.config/pipewire/pipewire.conf.d/50-epos-eq.conf` |
-| **Voice Enhancer** (Warm/Clear) | Source filter-chain on the EPOS mic: Warm = boost 200/350/500Hz, Clear = 2-8kHz | `51-epos-voice-enhancer.conf` |
+| **Voice Enhancer** (Warm/Clear) | Source filter-chain on the EPOS mic: Warm = boost 200/350/500Hz, Clear = 2-8kHz | `~/.config/pipewire-epos/voice/pipewire.conf` (instance `pipewire-epos@voice`) |
 | **Noise Gate** | rnnoise neural suppression via LADSPA (`noise_suppressor_stereo`) | `93-epos-noisegate.conf` |
 
 **Noise gate requirements:**

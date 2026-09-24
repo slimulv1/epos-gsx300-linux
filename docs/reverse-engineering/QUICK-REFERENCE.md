@@ -194,7 +194,7 @@ ROM) — **do NOT probe with write intent** (brick risk).
 | Feature | File in `~/.config/pipewire/pipewire.conf.d/` |
 |---------|-----------------------------------------------|
 | 9-band EQ (`bq_peaking`) | `50-epos-eq.conf` |
-| Voice Enhancer (Warm/Clear) | `51-epos-voice-enhancer.conf` |
+| Voice Enhancer (Warm/Clear) | `~/.config/pipewire-epos/voice/pipewire.conf` (instance `pipewire-epos@voice`; the old main-instance `51-epos-voice-enhancer.conf` was removed to avoid double-processing) |
 | Noise Gate (rnnoise LADSPA) | `93-epos-noisegate.conf` |
 
 Noise gate needs `librnnoise_ladspa.so` → `~/.local/lib/ladspa/` +

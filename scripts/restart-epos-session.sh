@@ -53,7 +53,7 @@ fi
 if ! systemctl --user list-unit-files "pipewire-epos@.service" >/dev/null 2>&1; then
     die "chưa thấy template pipewire-epos@.service — chạy ./scripts/install.sh trước rồi restart main"
 fi
-for role in "${EPOS_INSTANCE_ROLES[@]}"; do
+for role in "${ROLES[@]}"; do
     if [[ ! -e "$XDG_CONFIG_HOME/systemd/user/graphical-session.target.wants/pipewire-epos@$role.service" ]] &&
        [[ ! -e "$HOME/.config/systemd/user/graphical-session.target.wants/pipewire-epos@$role.service" ]]; then
         die "chưa thấy enable symlink pipewire-epos@$role — chạy ./scripts/install.sh trước rồi restart main"

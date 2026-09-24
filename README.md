@@ -203,13 +203,18 @@ EQ / noise gate / voice enhancer from the GUI:
   restarted**, so Discord keeps its pinned sink (`epos-eq-input` when
   EQ is applied, the EPOS hardware sink otherwise) **and** its pinned mic
   link (`epos-voice-output`).
-- The main graph carries static **fail-closed anchors** the whole time:
-  the EQ anchor is the null-sink `epos-eq-input`
-  (`pipewire.conf.d/40-epos-eq-virtualsink.conf`), the mic anchor is the
-  null-source `epos-voice-output`
-  (`pipewire.conf.d/51-epos-voice-enhancer.conf`). If a DSP instance
-  drops, the anchors keep the links — the side goes silent (fail-closed)
-  instead of Discord re-routing to the default device.
+- The main graph carries a static **fail-closed anchor** for the playback
+  side: the EQ null-sink `epos-eq-input`
+  (`pipewire.conf.d/40-epos-eq-virtualsink.conf`). If the EQ instance drops,
+  the anchor keeps the link — the side goes silent (fail-closed) instead of
+  Discord re-routing to the default device.
+- The **mic** side has no main-graph anchor. `epos-voice-output` is published
+  by the `pipewire-epos@voice` instance itself, so it disappears while that
+  instance restarts. The earlier `51-epos-voice-enhancer.conf` main-instance
+  filter-chain that used to provide a permanent voice source has been removed
+  (it is listed in `OLD_MAIN_DSP_CONFS` in `scripts/install.sh`): keeping it
+  would double-process the mic and collide on the `epos-voice-output` node
+  name with the per-role instance.
 
 No PipeWire (main) restart is performed for any DSP change from the GUI —
 `pipewire.conf.d/*-epos-*.conf` files are seeded at install time only and

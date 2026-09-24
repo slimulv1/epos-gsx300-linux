@@ -34,7 +34,7 @@
 | # | Feature | Feasibility | Effort | Notes |
 |---|---------|-------------|--------|-------|
 | 8 | Mic Gain (0-100%) | ✅ | Low | ALSA mixer control: `numid=4` (Mic Capture Volume, -30 to +5 dB). Map 0-100% → dB range. |
-| 9 | Voice Enhancer (Warm/Clear/Off) | ✅ | High | **SOLVED (2026-09-10)**. Filter-chain source on mic capture (`51-epos-voice-enhancer.conf`): Warm = boost 200/350/500Hz, Clear = 2-8kHz. Verified: `epos-voice-capture/output` nodes linked to EPOS mic. |
+| 9 | Voice Enhancer (Warm/Clear/Off) | ✅ | High | **SOLVED (2026-09-10)**. Filter-chain source on mic capture. Warm = boost 200/350/500Hz, Clear = 2-8kHz. Verified: `epos-voice-capture/output` nodes linked to EPOS mic. The filter-chain now lives in the dedicated `pipewire-epos@voice` instance (`~/.config/pipewire-epos/voice/pipewire.conf`); the original main-instance `51-epos-voice-enhancer.conf` was removed to prevent double-processing and a node-name collision on `epos-voice-output`. |
 | 10 | Noise Gate | ✅ | Low | **SOLVED (2026-09-10)**. rnnoise neural suppression via LADSPA filter-chain (`93-epos-noisegate.conf`). Requires `librnnoise_ladspa.so` in `~/.local/lib/ladspa` + `LADSPA_PATH` drop-in. Verified: `epos-noisegate-*` nodes + `pw-record` PASS. |
 | 11 | Sidetone (Mic Monitoring) | ⚠️ | Medium | PipeWire: mix capture stream into playback loopback. `module-loopback` or custom `pw-loopback`. Latency may be higher than hardware sidetone. |
 | 12 | Mic Mute | ✅ | Low | Standard ALSA/PipeWire mute toggle. `wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle`. |
