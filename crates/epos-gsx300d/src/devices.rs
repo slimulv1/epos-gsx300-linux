@@ -1,5 +1,6 @@
 use anyhow::Result;
 use epos_shared::device::DeviceInfo;
+use std::time::Duration;
 use tracing::{debug, warn};
 
 /// Detect EPOS GSX 300 on USB bus — always a fresh scan including `pw-dump`.
@@ -277,13 +278,34 @@ fn epos_node_names_from_dump(dump: Option<&str>) -> (String, String) {
 
 /// Resolve the EPOS's PipeWire node names from the live graph.
 fn find_pipewire_nodes() -> (String, String) {
-    let dump = std::process::Command::new("pw-dump")
-        .output()
-        .ok()
-        .and_then(|o| {
-            (o.status.success()).then(|| String::from_utf8_lossy(&o.stdout).into_owned())
-        });
+    let dump = capped_dump("pw-dump", Duration::from_secs(5));
     epos_node_names_from_dump(dump.as_deref())
+}
+
+/// Run a blocking dump command with a wall-clock cap.
+///
+/// This runs inside `spawn_blocking` and is awaited by both daemon startup and
+/// the 5s hotplug loop, so a command that never answers would stop the daemon
+/// from finishing startup and stop every watchdog from ever being reached. The
+/// worker thread is abandoned rather than joined on timeout; the caller treats
+/// that exactly like a failed dump, which already falls back to the compiled-in
+/// node names and is re-resolved once the names look stale again.
+fn capped_dump(program: &str, budget: Duration) -> Option<String> {
+    // Owned for the worker thread, which requires 'static.
+    let program = program.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let captured = std::process::Command::new(&program)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+        // The receiver is gone when the budget expired; sending then fails,
+        // which is the intended outcome, so the error is deliberately dropped.
+        let _ = tx.send(captured);
+    });
+    rx.recv_timeout(budget).ok().flatten()
 }
 
 fn find_hidraw(vid: u16, pid: u16) -> Option<std::path::PathBuf> {
@@ -328,6 +350,55 @@ fn find_input_event(vid: u16, pid: u16) -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A program that never exits, written to disk so it can stand in for
+    /// `pw-dump`. On disk rather than on PATH because the tests in this binary
+    /// share the environment.
+    fn script_program(name: &str, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("epos-dev-{}-{name}", std::process::id()));
+        std::fs::write(&path, body).expect("write script");
+        let mut perms = std::fs::metadata(&path).expect("stat script").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod script");
+        path.to_str().expect("utf-8 temp path").to_string()
+    }
+
+    /// `detect()` is awaited during startup and on every hotplug tick, and the
+    /// watchdogs only run from that loop. A `pw-dump` that never answers would
+    /// therefore stop the daemon from finishing startup and stop every watchdog
+    /// from ever running — and a hung PipeWire client is not hypothetical here:
+    /// `pw-cli -r` wedged this machine before.
+    #[test]
+    fn a_hung_pipewire_dump_is_abandoned() {
+        let program = script_program("pwdump-hang", "#!/bin/sh\nsleep 30\n");
+        let started = std::time::Instant::now();
+
+        let out = capped_dump(&program, std::time::Duration::from_millis(150));
+
+        assert!(out.is_none(), "a hung pw-dump must not be waited on");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "must return near its budget, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A dump that answers is still read, and a dump that fails yields nothing
+    /// so the caller takes the same fallback it already takes today.
+    #[test]
+    fn a_working_pipewire_dump_is_still_read() {
+        let program = script_program("pwdump-ok", "#!/bin/sh\necho '[{\"info\":{}}]'\n");
+        let out = capped_dump(&program, std::time::Duration::from_secs(5))
+            .expect("a working dump must be read");
+        assert!(out.contains("info"), "stdout must survive: {out}");
+    }
+
+    #[test]
+    fn a_failing_pipewire_dump_yields_nothing() {
+        let program = script_program("pwdump-fail", "#!/bin/sh\nexit 1\n");
+        assert!(capped_dump(&program, std::time::Duration::from_secs(5)).is_none());
+    }
 
     /// Trimmed from a real `pw-dump` on this machine, the shape the selector has
     /// to read: JSON, one property per line.

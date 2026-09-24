@@ -1192,21 +1192,7 @@ impl AudioPipeline {
 
     /// Point the PipeWire default sink at `sink`. No-op on an empty name.
     async fn set_default_sink(sink: &str) -> Result<()> {
-        if sink.is_empty() {
-            return Ok(());
-        }
-        let out = tokio::process::Command::new("pactl")
-            .args(["set-default-sink", sink])
-            .output()
-            .await?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "pactl set-default-sink {} failed: {}",
-                sink,
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        Ok(())
+        set_default_sink_with(sink, "pactl", PROBE_BUDGET).await
     }
 
     /// Current PipeWire default sink name, or `None` if it cannot be read.
@@ -2198,6 +2184,10 @@ async fn run_probe(program: &str, args: &[&str], budget: Duration) -> Probe {
     }
 }
 
+/// The cap every external command runs under, exported for the volume writers
+/// in `main`, which were the last two calls still running unbounded.
+pub(crate) const COMMAND_BUDGET: Duration = PROBE_BUDGET;
+
 /// Run `program args...` capped, returning its stdout on success.
 ///
 /// Same guarantees as [`run_probe`] — stdin closed, hard cap, child killed on
@@ -2209,7 +2199,11 @@ async fn run_probe(program: &str, args: &[&str], budget: Duration) -> Probe {
 /// with no cap, made from code that holds the global state write lock. A
 /// hung `pactl` or `amixer` could therefore stall the whole daemon: IPC, the
 /// config watcher and the EQ watchdog all wait on that one lock.
-async fn run_status(program: &str, args: &[&str], budget: Duration) -> Result<String, String> {
+pub(crate) async fn run_status(
+    program: &str,
+    args: &[&str],
+    budget: Duration,
+) -> Result<String, String> {
     let child = tokio::process::Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -2230,6 +2224,85 @@ async fn run_status(program: &str, args: &[&str], budget: Duration) -> Result<St
             Err(format!("{program} timed out after {budget:?}"))
         }
     }
+}
+
+/// `set_default_sink` with the program and budget as parameters, so a test can
+/// stand in a `pactl` that never exits. The production call runs under the
+/// global write lock, so an unbounded wait here stops the whole daemon —
+/// IPC, the config watcher, the hotplug loop and the volume watcher all queue
+/// behind that one lock.
+async fn set_default_sink_with(sink: &str, program: &str, budget: Duration) -> Result<()> {
+    if sink.is_empty() {
+        return Ok(());
+    }
+    run_status(program, &["set-default-sink", sink], budget)
+        .await
+        .map(|_| ())
+        .map_err(|detail| anyhow::anyhow!("pactl set-default-sink {sink} failed: {detail}"))
+}
+
+/// The GSX 300 capture gain, with the mixer binary and budget as parameters so
+/// a test can stand in an `amixer` that never exits.
+///
+/// This is reached from `apply_mic_gain` and from `apply_full`, and both hold
+/// the global write lock, so an unbounded wait here stops the whole daemon
+/// rather than just the microphone gain. The control list, the card refusal and
+/// the error surfaced to the GUI are unchanged; only the wait is now bounded,
+/// and a timeout is reported as a timeout rather than as a mixer failure.
+async fn set_mic_gain_via(
+    device: &DeviceInfo,
+    gain: u32,
+    mixer: &str,
+    budget: Duration,
+) -> Result<()> {
+    // Refuse an unknown card instead of writing to card 0, which is some other
+    // device's mixer. The hotplug poll retries once ALSA has enumerated.
+    let card = usable_alsa_card(device.alsa_card)?;
+    let gain = sanitize_mic_gain(gain);
+
+    // The GSX 300 capture gain is the ALSA mixer element "Mic Capture
+    // Volume" (numid=4, 0-35, 100% = 5 dB). Note: `amixer scontrols`
+    // shows the SIMPLE name "Mic", but `amixer cset` matches the ELEMENT
+    // name — those are different namespaces. cset "Mic" fails, so the
+    // element name is the primary; "Mic" is kept as a fallback for
+    // firmwares/quirks that rename the element.
+    debug!("Setting mic gain to {}% on card {} via {}", gain, card, mixer);
+
+    let card_arg = card.to_string();
+    let mut last_detail = String::new();
+    for control in ["Mic Capture Volume", "Mic"] {
+        let control_arg = format!("name='{control}'");
+        let gain_arg = format!("{gain}%");
+        match run_status(
+            mixer,
+            &["-c", &card_arg, "cset", &control_arg, &gain_arg],
+            budget,
+        )
+        .await
+        {
+            Ok(_) => {
+                info!("Mic gain set to {}% (control '{}')", gain, control);
+                return Ok(());
+            }
+            Err(detail) => last_detail = detail,
+        }
+    }
+
+    // Previously this only logged a warning and returned Ok(()), so a
+    // failed amixer call was reported to the GUI as a successful gain
+    // change and the bad value was persisted. Surface it as an error.
+    let detail = if last_detail.is_empty() {
+        "amixer reported no usable capture control".to_string()
+    } else {
+        last_detail
+    };
+    warn!("amixer mic gain failed: {}", detail);
+    Err(anyhow::anyhow!(
+        "Failed to set mic gain to {}% on card {}: {}",
+        gain,
+        card,
+        detail
+    ))
 }
 
 /// Does a `pw-dump` of the MAIN graph publish `node`?
@@ -2650,66 +2723,7 @@ async fn instance_node_present(role: &str, node: &str) -> bool {
 /// re-applied after WirePlumber restore-routes overwrites the element
 /// during node activation (see AudioPipeline::apply_full).
 async fn apply_mic_gain_oneshot(device: &DeviceInfo, gain: u32) -> Result<()> {
-    // Refuse an unknown card instead of writing to card 0, which is some other
-    // device's mixer. The hotplug poll retries once ALSA has enumerated.
-    let card = usable_alsa_card(device.alsa_card)?;
-    let gain = sanitize_mic_gain(gain);
-
-    // The GSX 300 capture gain is the ALSA mixer element "Mic Capture
-    // Volume" (numid=4, 0-35, 100% = 5 dB). Note: `amixer scontrols`
-    // shows the SIMPLE name "Mic", but `amixer cset` matches the ELEMENT
-    // name — those are different namespaces. cset "Mic" fails, so the
-    // element name is the primary; "Mic" is kept as a fallback for
-    // firmwares/quirks that rename the element.
-    debug!("Setting mic gain to {}% on card {}", gain, card);
-
-    let mut last_stderr = String::new();
-    let mut success = false;
-    for control in ["Mic Capture Volume", "Mic"] {
-        let output = tokio::process::Command::new("amixer")
-            .args([
-                "-c",
-                &card.to_string(),
-                "cset",
-                &format!("name='{}'", control),
-                &format!("{}%", gain),
-            ])
-            .output()
-            .await;
-
-        match output {
-            Ok(o) if o.status.success() => {
-                info!("Mic gain set to {}% (control '{}')", gain, control);
-                success = true;
-                break;
-            }
-            Ok(o) => {
-                last_stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
-            }
-            Err(e) => {
-                last_stderr = e.to_string();
-            }
-        }
-    }
-
-    if !success {
-        // Previously this only logged a warning and returned Ok(()), so a
-        // failed amixer call was reported to the GUI as a successful gain
-        // change and the bad value was persisted. Surface it as an error.
-        let detail = if last_stderr.is_empty() {
-            "amixer reported no usable capture control".to_string()
-        } else {
-            last_stderr
-        };
-        warn!("amixer mic gain failed: {}", detail);
-        return Err(anyhow::anyhow!(
-            "Failed to set mic gain to {}% on card {}: {}",
-            gain,
-            card,
-            detail
-        ));
-    }
-    Ok(())
+    set_mic_gain_via(device, gain, "amixer", PROBE_BUDGET).await
 }
 
 impl Drop for AudioPipeline {
@@ -2956,6 +2970,175 @@ mod tests {
         )
         .await;
         assert!(matches!(outcome, Probe::SpawnFailed(_)), "got {outcome:?}");
+    }
+
+    // ── Bounding the writers ──────────────────────────────────
+    //
+    // The readers above were capped, but four writer calls were still bare
+    // `.output().await`. Two of them run while the global state write lock is
+    // held, so a `pactl` or `amixer` that never answers froze the entire
+    // daemon: IPC, the config watcher, the hotplug loop and the volume
+    // watcher all wait on that one lock.
+
+    /// A program that never exits, written to disk so it can stand in for
+    /// `amixer` or `pactl`. On disk rather than on PATH because the other
+    /// tests in this binary share the environment.
+    fn hanging_program(name: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("epos-hang-{}-{name}", std::process::id()));
+        std::fs::write(&path, "#!/bin/sh\nsleep 30\n").expect("write hang script");
+        let mut perms = std::fs::metadata(&path).expect("stat hang script").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod hang script");
+        path.to_str().expect("utf-8 temp path").to_string()
+    }
+
+    fn test_device() -> DeviceInfo {
+        DeviceInfo {
+            usb_bus: 1,
+            usb_addr: 2,
+            alsa_card: Some(0),
+            pipewire_sink: "alsa_output.usb-test.analog-stereo".into(),
+            pipewire_source: "alsa_input.usb-test.mono-fallback".into(),
+            hidraw: None,
+            input_event: None,
+            firmware_version: None,
+            chip_id: None,
+            hw_snapshot: None,
+        }
+    }
+
+    /// A `pactl` that never answers must not be able to hold the global write
+    /// lock: `route_output` calls this while the lock is held, so an unbounded
+    /// wait here freezes IPC, the config watcher, the hotplug loop and the
+    /// volume watcher all at once.
+    #[tokio::test]
+    async fn a_hung_default_sink_writer_is_abandoned() {
+        let program = hanging_program("sink");
+        let started = std::time::Instant::now();
+
+        let result =
+            set_default_sink_with("epos-eq-input", &program, Duration::from_millis(150)).await;
+
+        assert!(result.is_err(), "a hung pactl must be reported, not awaited");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "must return near its budget, took {:?}",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_file(&program);
+    }
+
+    /// The success path must still move the default sink — the cap must not turn
+    /// a working `pactl` into a routing failure. An empty sink name stays a
+    /// no-op, which is what keeps a missing target from reaching `pactl` at all.
+    #[tokio::test]
+    async fn a_working_default_sink_writer_still_succeeds() {
+        let program = std::env::temp_dir()
+            .join(format!("epos-sink-ok-{}", std::process::id()))
+            .to_str()
+            .expect("utf-8 temp path")
+            .to_string();
+        std::fs::write(&program, "#!/bin/sh\nexit 0\n").expect("write ok script");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&program).expect("stat").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&program, perms).expect("chmod");
+        }
+
+        assert!(set_default_sink_with("epos-eq-input", &program, Duration::from_secs(5))
+            .await
+            .is_ok());
+        assert!(
+            set_default_sink_with("", &program, Duration::from_secs(5)).await.is_ok(),
+            "an empty sink name stays a no-op"
+        );
+        let _ = std::fs::remove_file(&program);
+    }
+
+    /// The same wedge one level deeper: `apply_mic_gain_oneshot` is reached
+    /// from both `apply_mic_gain` and `apply_full`, each under the write lock.
+    #[tokio::test]
+    async fn a_hung_mixer_is_abandoned_and_reports_failure() {
+        let program = hanging_program("mixer");
+        let started = std::time::Instant::now();
+
+        let result =
+            set_mic_gain_via(&test_device(), 50, &program, Duration::from_millis(150)).await;
+
+        assert!(result.is_err(), "a hung amixer must be reported, not awaited");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "must return near its budget, took {:?}",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_file(&program);
+    }
+
+    /// The success path must still write, and still report which control
+    /// answered — the cap must not turn a working mixer into a failure.
+    #[tokio::test]
+    async fn a_working_mixer_still_succeeds() {
+        let program = std::env::temp_dir()
+            .join(format!("epos-ok-{}", std::process::id()))
+            .to_str()
+            .expect("utf-8 temp path")
+            .to_string();
+        std::fs::write(&program, "#!/bin/sh\necho 'Simple mixer control '\''Mic'\'',0\n'")
+            .expect("write ok script");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&program).expect("stat").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&program, perms).expect("chmod");
+        }
+
+        let result =
+            set_mic_gain_via(&test_device(), 50, &program, Duration::from_secs(5)).await;
+
+        assert!(result.is_ok(), "a working mixer must still succeed: {result:?}");
+        let _ = std::fs::remove_file(&program);
+    }
+
+    /// `run_status` is what the writers now rely on, so pin the three
+    /// properties they depend on: it gives up at the budget, it cannot block
+    /// on stdin, and it tells success from failure.
+    #[tokio::test]
+    async fn status_gives_up_on_a_command_that_never_exits() {
+        let started = std::time::Instant::now();
+        let outcome = run_status("sleep", &["30"], Duration::from_millis(150)).await;
+        assert!(outcome.is_err(), "a hung command must not look like success");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "must return near its budget, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn status_cannot_block_on_stdin() {
+        // `cat` with an inherited terminal would block forever.
+        assert_eq!(
+            run_status("cat", &[], Duration::from_secs(5)).await,
+            Ok(String::new())
+        );
+    }
+
+    #[tokio::test]
+    async fn status_reports_a_non_zero_exit_with_stderr() {
+        let outcome = run_status("sh", &["-c", "echo boom >&2; exit 3"], Duration::from_secs(5))
+            .await;
+        let message = outcome.expect_err("exit 3 must not be success");
+        assert!(message.contains("boom"), "stderr must survive: {message}");
+    }
+
+    #[tokio::test]
+    async fn status_returns_stdout_when_the_command_answers() {
+        assert_eq!(
+            run_status("echo", &["epos-voice-output"], Duration::from_secs(5)).await,
+            Ok("epos-voice-output\n".to_string())
+        );
     }
 
     /// The node-presence check reads real `pw-dump` output, which is JSON. An

@@ -7,6 +7,7 @@ mod ipc;
 mod led;
 
 use crate::audio::AudioPipeline;
+use crate::audio::{run_status, COMMAND_BUDGET};
 use crate::hid::{HidEvent, HidHandler};
 use crate::ipc::IpcState;
 use crate::led::LedController;
@@ -519,21 +520,13 @@ async fn apply_volume(state: &Arc<RwLock<IpcState>>, percent: i32) {
         return;
     }
     let pct = format!("{}%", percent.clamp(0, 100));
-    match tokio::process::Command::new("pactl")
-        .args(["set-sink-volume", &sink, &pct])
-        .output()
-        .await
+    // Capped like every other external command: a wedged `pactl` must not
+    // leave the knob handler waiting forever. The dial's tracked value is
+    // written after this returns either way, and the watcher corrects it
+    // from the real sink level if the write did not land.
+    if let Err(detail) = run_status("pactl", &["set-sink-volume", &sink, &pct], COMMAND_BUDGET).await
     {
-        Ok(out) if !out.status.success() => {
-            warn!(
-                "pactl set-sink-volume {} {}: {}",
-                sink,
-                pct,
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        Err(e) => warn!("pactl set-sink-volume {} failed: {}", sink, e),
-        _ => {}
+        warn!("pactl set-sink-volume {} {} failed: {}", sink, pct, detail);
     }
 }
 
@@ -543,15 +536,11 @@ async fn read_sink_volume(sink: &str) -> Option<i32> {
     if sink.is_empty() {
         return None;
     }
-    let out = tokio::process::Command::new("pactl")
-        .args(["get-sink-volume", sink])
-        .output()
+    // A hung `pactl` returns None here, so the watcher skips this tick and
+    // tries again, rather than the loop waiting on it forever.
+    let text = run_status("pactl", &["get-sink-volume", sink], COMMAND_BUDGET)
         .await
         .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
     // "Volume: front-left: 19660 / 30% / -31.37 dB,   front-right: ... / 30% / ..."
     // Take the first "/ N%" token — works for mono and stereo sinks.
     let pct = text
