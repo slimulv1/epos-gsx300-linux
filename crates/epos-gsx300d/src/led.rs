@@ -337,6 +337,31 @@ fn write_vendor_report(file: &mut File, byte: u8) -> Result<()> {
 /// request (bit6 clear) is ever allowed through this path. Report IDs 0x06 /
 /// 0x07 / 0x1A (firmware flash protocol) are hard-blocked by the daemon.
 fn write_primary_report(file: &mut File, payload: &[u8]) -> Result<()> {
+    let packet = primary_packet(payload)?;
+    file.write_all(&packet)
+        .context("Failed to write primary LED report")?;
+    file.flush().ok();
+    Ok(())
+}
+
+/// Build the Report 0x04 packet for `payload`, or refuse it.
+///
+/// Pure, so the refusal rules are testable without the headset. The payload
+/// is the user's own `primary_blue` / `primary_red` from `config.json`, which
+/// is a documented hand-editable probe surface — so "malformed" is a shape a
+/// real configuration can have, not a hypothetical.
+///
+/// An empty payload is refused rather than copied. The previous code computed
+/// `len = 0` and then evaluated `packet[1..=0]`, an inclusive range that starts
+/// after it ends, which panics. `Some([])` reached it: `.as_deref()` yields
+/// `Some(&[])` so the "not configured" error never fired, and `first()` is
+/// `None` so the bit6 guard never fired either. A panic there ran inside the
+/// LED heartbeat and the IPC handlers, silently killing whichever worker hit
+/// it.
+fn primary_packet(payload: &[u8]) -> Result<Vec<u8>> {
+    if payload.is_empty() {
+        anyhow::bail!("Refusing empty Report 0x04 payload: there is nothing to send");
+    }
     // Memory-bus read-request guard: the first payload byte is the flags byte.
     // bit6 (0x40) = EEPROM write (firmware flash) — refuse it unconditionally.
     if payload.first().is_some_and(|f| f & 0x40 != 0) {
@@ -347,12 +372,11 @@ fn write_primary_report(file: &mut File, payload: &[u8]) -> Result<()> {
     }
     let mut packet = vec![0u8; PRIMARY_CMD_PAYLOAD_SIZE + 1];
     packet[0] = REPORT_ID_PRIMARY_CMD;
+    // The report is a fixed size, so copy into the tail by its true length and
+    // zero-pad the rest rather than indexing with an inclusive range.
     let len = payload.len().min(PRIMARY_CMD_PAYLOAD_SIZE);
-    packet[1..=len].copy_from_slice(&payload[..len]);
-    file.write_all(&packet)
-        .context("Failed to write primary LED report")?;
-    file.flush().ok();
-    Ok(())
+    packet[1..1 + len].copy_from_slice(&payload[..len]);
+    Ok(packet)
 }
 
 impl Drop for LedController {
@@ -368,3 +392,70 @@ impl Drop for LedController {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The panic this exists to prevent. `primary_blue: []` in config.json is
+    /// reachable: `Some([])` satisfies `as_deref()` so the "not configured"
+    /// error never fires, and `first()` is `None` so the bit6 guard never
+    /// fires. The old code then evaluated `packet[1..=0]`, which panics.
+    #[test]
+    fn an_empty_payload_is_refused_rather_than_panicking() {
+        let outcome = std::panic::catch_unwind(|| primary_packet(&[]));
+        assert!(outcome.is_ok(), "building a packet must never panic");
+        let error = primary_packet(&[]).expect_err("an empty payload has nothing to send");
+        assert!(
+            error.to_string().contains("empty"),
+            "the reason must say what was wrong: {error}"
+        );
+    }
+
+    /// The brick guard is untouched by the empty check, and still fires on the
+    /// very first byte it always did.
+    #[test]
+    fn an_eeprom_write_payload_is_still_refused() {
+        let error = primary_packet(&[0x40, 0x00]).expect_err("bit6 must be refused");
+        assert!(
+            error.to_string().contains("brick risk"),
+            "the brick-risk reason must survive: {error}"
+        );
+    }
+
+    /// A real payload still produces a full-size report: report ID first, the
+    /// payload copied into the body, and the remainder zero-padded so the HID
+    /// report keeps its fixed length.
+    #[test]
+    fn a_real_payload_still_builds_a_full_report() {
+        let payload = [0x00u8, 0x04, 0xAB, 0xCD];
+        let packet = primary_packet(&payload).expect("a valid payload must build");
+
+        assert_eq!(packet.len(), PRIMARY_CMD_PAYLOAD_SIZE + 1);
+        assert_eq!(packet[0], REPORT_ID_PRIMARY_CMD);
+        assert_eq!(&packet[1..1 + payload.len()], &payload[..]);
+        assert!(
+            packet[1 + payload.len()..].iter().all(|b| *b == 0),
+            "the rest of the report must be zero-padded"
+        );
+    }
+
+    /// A payload longer than the report body is truncated, not a panic and not
+    /// an oversized write.
+    #[test]
+    fn an_oversized_payload_is_truncated_to_the_report() {
+        let payload = vec![0x00u8; PRIMARY_CMD_PAYLOAD_SIZE + 20];
+        let packet = primary_packet(&payload).expect("oversized is truncated, not refused");
+        assert_eq!(packet.len(), PRIMARY_CMD_PAYLOAD_SIZE + 1);
+    }
+
+    /// A single byte is the smallest legal payload; it must not take the
+    /// inclusive-range path that made the empty case panic.
+    #[test]
+    fn a_one_byte_payload_is_accepted() {
+        let packet = primary_packet(&[0x00]).expect("one byte is a legal payload");
+        assert_eq!(packet.len(), PRIMARY_CMD_PAYLOAD_SIZE + 1);
+        assert_eq!(packet[1], 0x00);
+    }
+}
+
