@@ -77,7 +77,7 @@ pub fn save_to(path: &Path, config: &Config) -> Result<()> {
             .with_context(|| format!("Failed to create config dir {}", dir.display()))?;
     }
 
-    let tmp_path = path.with_extension("json.tmp");
+    let tmp_path = temp_path(path);
 
     let data = serde_json::to_string_pretty(config)?;
     std::fs::write(&tmp_path, &data)
@@ -93,6 +93,23 @@ pub fn save_to(path: &Path, config: &Config) -> Result<()> {
 
     info!("Config saved to {}", path.display());
     Ok(())
+}
+
+/// A fresh sibling path for one save.
+///
+/// Every writer shares one config path, and a fixed temp name let concurrent
+/// saves consume each other's file: one rename would move the other's bytes
+/// into place and the second rename would fail with the temp file already
+/// gone. The name carries the pid and a per-process counter, so two saves can
+/// never be handed the same path.
+fn temp_path(path: &Path) -> PathBuf {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config.json".to_string());
+    path.with_file_name(format!("{name}.tmp.{}.{sequence}", std::process::id()))
 }
 
 #[cfg(test)]
@@ -219,6 +236,68 @@ mod tests {
             .filter(|name| name != "config.json")
             .collect();
         assert!(leftovers.is_empty(), "unexpected files left: {leftovers:?}");
+    }
+
+    /// Every writer in the daemon shares one config path: the IPC handlers, the
+    /// volume-save worker and the smart-button path all run as separate tasks.
+    /// A single fixed temp name let two of them consume each other's file, so
+    /// one rename moved the other's bytes into place and the second rename
+    /// failed outright.
+    #[test]
+    fn temp_paths_never_collide() {
+        let dir = scratch("tempnames");
+        let path = dir.join("config.json");
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            assert!(
+                seen.insert(temp_path(&path)),
+                "two saves were handed the same temp path"
+            );
+        }
+    }
+
+    /// The temp file has to be a sibling of the target, or the rename is a
+    /// cross-device copy and stops being atomic.
+    #[test]
+    fn temp_path_stays_beside_its_target() {
+        let path = Path::new("/home/someone/.config/epos-gsx300/config.json");
+        assert_eq!(temp_path(path).parent(), path.parent());
+    }
+
+    /// The consequence of a shared temp name: with enough writers in flight,
+    /// some saves fail outright and the file can be left holding another
+    /// writer's bytes. Every save must succeed and the result must parse.
+    #[test]
+    fn concurrent_saves_all_succeed_and_leave_a_readable_config() {
+        let dir = scratch("concurrent");
+        let path = dir.join("config.json");
+        save_to(&path, &Config::default()).expect("seed");
+
+        let mut handles = Vec::new();
+        for worker in 0..16 {
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                for round in 0..8 {
+                    let mut config = Config::default();
+                    config.device.volume = Some(worker * 8 + round);
+                    save_to(&path, &config)
+                        .unwrap_or_else(|e| panic!("save {worker}/{round} failed: {e}"));
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("writer thread must not panic");
+        }
+
+        load_from(&path).expect("the surviving config must parse");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read scratch dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "config.json")
+            .collect();
+        assert!(leftovers.is_empty(), "temp files were left behind: {leftovers:?}");
     }
 }
 

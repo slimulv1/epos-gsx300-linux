@@ -946,6 +946,10 @@ async fn volume_save_worker(state: Arc<RwLock<IpcState>>) {
 async fn config_watch_loop(state: Arc<RwLock<IpcState>>) {
     let path = config::config_path();
     let mut last_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    // The mtime whose read or parse last failed. Retrying is what lets an edit
+    // survive being caught mid-write, but warning on every 2s tick would bury
+    // the log for as long as a file stays broken, so the warning is per change.
+    let mut last_failed_mtime: Option<std::time::SystemTime> = None;
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -954,7 +958,12 @@ async fn config_watch_loop(state: Arc<RwLock<IpcState>>) {
         if mtime == last_mtime {
             continue;
         }
-        last_mtime = mtime;
+        // `last_mtime` is advanced only once this change is settled — the
+        // daemon's own write, or an external edit that parsed. It used to be
+        // assigned here, before the read and the parse, so a read that failed
+        // or a file caught mid-write marked the change as seen and it was
+        // never looked at again: the edit was silently dropped, and the only
+        // thing that could revive it was an unrelated later change.
 
         // Read the raw file bytes before parsing so we can recognize the
         // daemon's own atomic write. If they match what we last wrote, this
@@ -964,7 +973,12 @@ async fn config_watch_loop(state: Arc<RwLock<IpcState>>) {
         // 2s poll window, or a knob turn queued behind a save).
         let disk_bytes = match std::fs::read(&path) {
             Ok(b) => b,
-            Err(_) => continue,
+            // Unsettled: leave `last_mtime` alone so the next tick retries.
+            Err(e) => {
+                debug!("Config read failed, will retry: {}", e);
+                last_failed_mtime = mtime;
+                continue;
+            }
         };
         {
             let s = state.read().await;
@@ -972,6 +986,8 @@ async fn config_watch_loop(state: Arc<RwLock<IpcState>>) {
                 // This mtime change came from the daemon's own atomic `save()`;
                 // skip it so we don't revert in-memory state that has advanced
                 // past the on-disk snapshot.
+                last_mtime = mtime;
+                last_failed_mtime = None;
                 continue;
             }
         }
@@ -979,11 +995,20 @@ async fn config_watch_loop(state: Arc<RwLock<IpcState>>) {
         let mut new_config = match config::load_existing() {
             Ok(c) => c,
             Err(e) => {
-                // File may be mid-write or malformed; keep current config.
-                warn!("Config reload failed, keeping current config: {}", e);
+                // File may be mid-write or malformed; keep current config and
+                // keep watching, so the edit lands once the file is whole. Warn
+                // once for this change rather than on every retry.
+                if last_failed_mtime != mtime {
+                    warn!("Config reload failed, keeping current config: {}", e);
+                    last_failed_mtime = mtime;
+                }
                 continue;
             }
         };
+
+        // Settled: this external edit is now in memory.
+        last_mtime = mtime;
+        last_failed_mtime = None;
 
         let mut st = state.write().await;
 
