@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use epos_shared::config::{AudioConfig, VoiceMode};
 use epos_shared::device::DeviceInfo;
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -30,6 +30,9 @@ pub struct AudioPipeline {
     /// reapply task captures its epoch and aborts if a newer apply has since
     /// started, so a stale task can never overwrite a newer gain value.
     gain_epoch: Arc<AtomicU64>,
+    /// Consecutive 5 s polls that saw no `epos-eq-capture` while the EQ was
+    /// enabled. Drives the fall-back grace period and the restart cadence.
+    eq_chain_missing_polls: AtomicU32,
 }
 
 /// Debounced restart bus: audio handlers record which epos instance(s) changed
@@ -209,6 +212,7 @@ impl AudioPipeline {
             device: None,
             restarts: Arc::new(RestartBus::new()),
             gain_epoch: Arc::new(AtomicU64::new(0)),
+            eq_chain_missing_polls: AtomicU32::new(0),
         };
         // Same funnel as update_config, so a hand-edited config.json is bounded
         // at startup too and not only on later IPC updates.
@@ -228,6 +232,64 @@ impl AudioPipeline {
         // config.json cannot smuggle an out-of-range gain past the IPC clamp.
         config.mic_gain = sanitize_mic_gain(config.mic_gain);
         self.config = config;
+    }
+
+    /// Ask the restart bus to (re)start a DSP instance.
+    ///
+    /// Used by the startup convergence pass and the EQ watchdog. The bus
+    /// deduplicates and the worker debounces, so repeated requests for the same
+    /// role collapse into one restart.
+    pub fn request_instance_restart(&self, role: &str) {
+        debug!("Requesting epos instance restart: {role}");
+        self.restarts.request(role);
+    }
+
+    /// Keep the EQ honest on the 5 s poll: verify the chain, repair the route,
+    /// and ask for a restart if the chain is gone.
+    ///
+    /// This is the difference between the EQ working and the user getting
+    /// silence. With the EQ enabled the default sink is `epos-eq-input`, a
+    /// null-sink that keeps accepting streams whether or not anything drains
+    /// its monitor. Measured before this existed: killing `pipewire-epos@eq`
+    /// left the default sink on the anchor, the chain absent, apps still
+    /// opening streams into it, and the daemon logging nothing at all.
+    ///
+    /// Costs one `pw-cli ls Node` (about 4 ms) per poll, and only when the EQ
+    /// is enabled. Falls back to unprocessed audio rather than silence, and
+    /// retries the instance on a slow cadence instead of every poll.
+    pub async fn maintain_eq(&self) {
+        if !self.config.eq.enabled {
+            self.eq_chain_missing_polls.store(0, Ordering::Relaxed);
+            // EQ off: make sure the default sink is the raw device, not a
+            // leftover anchor from a previous session.
+            if let Err(e) = self.route_output_with_chain(Some(false)).await {
+                warn!("Failed to route output with EQ off: {}", e);
+            }
+            return;
+        }
+
+        let present = Self::main_graph_has_node(EQ_CAPTURE_NAME).await;
+        let missing = if present {
+            self.eq_chain_missing_polls.store(0, Ordering::Relaxed);
+            0
+        } else {
+            self.eq_chain_missing_polls.fetch_add(1, Ordering::Relaxed) + 1
+        };
+        let decision = eq_route_decision(present, missing);
+
+        if decision.repair_to_raw {
+            warn!(
+                "EQ chain absent for {missing} poll(s) - falling back to the raw \
+                 EPOS sink so audio is not swallowed by the EQ anchor"
+            );
+        }
+        if let Err(e) = self.route_output_with_chain(Some(present)).await {
+            warn!("Failed to maintain EQ output route: {}", e);
+        }
+        if decision.request_restart {
+            warn!("EQ chain missing - requesting pipewire-epos@eq restart");
+            self.restarts.request("eq");
+        }
     }
 
     /// Apply the full audio config (EQ, mic gain, sidetone, noise gate, voice).
@@ -411,10 +473,18 @@ impl AudioPipeline {
     /// Is a node currently published in the MAIN graph?
     ///
     /// Reuses the capped `pw-dump` probe, so this cannot wedge the caller.
+    /// Is `node` currently published in the MAIN graph?
+    ///
+    /// Uses `pw-cli -r pipewire-0 ls Node` rather than a full `pw-dump`:
+    /// measured 4 ms / 5.8 KB against 14 ms / 510 KB, and this now runs on
+    /// every 5 s poll. `ls Node` is a well-formed command, so it exits instead
+    /// of dropping into pw-cli's interactive fallback — that is what made
+    /// `info 0` hang and wedge the reload worker. `run_probe` still closes
+    /// stdin and caps the wait, so a regression here cannot hang the daemon.
     async fn main_graph_has_node(node: &str) -> bool {
         matches!(
-            run_probe("pw-dump", &["-r", "pipewire-0"], PROBE_BUDGET).await,
-            Probe::Ran(dump) if dump_has_node(&dump, node)
+            run_probe("pw-cli", &["-r", "pipewire-0", "ls", "Node"], PROBE_BUDGET).await,
+            Probe::Ran(list) if node_list_has_node(&list, node)
         )
     }
 
@@ -494,6 +564,15 @@ impl AudioPipeline {
     /// preserved until the next transition (EQ toggled, or device replugged)
     /// rather than being fought on every poll.
     pub async fn route_output(&self) -> Result<bool> {
+        self.route_output_with_chain(None).await
+    }
+
+    /// `chain_present` lets a caller that already probed the MAIN graph reuse
+    /// the answer, so a 5 s poll costs exactly one probe.
+    pub(crate) async fn route_output_with_chain(
+        &self,
+        chain_present: Option<bool>,
+    ) -> Result<bool> {
         let eq_enabled = self.config.eq.enabled;
         let device_connected = self
             .device
@@ -502,10 +581,10 @@ impl AudioPipeline {
         // Only route to the EQ anchor when its chain is genuinely published.
         // Otherwise an enabled-but-broken EQ points every default-following app
         // at a null-sink nobody drains, i.e. silence.
-        let chain_present = if self.config.eq.enabled {
-            Self::main_graph_has_node("epos-eq-capture").await
-        } else {
-            false
+        let chain_present = match chain_present {
+            Some(v) => v,
+            None if self.config.eq.enabled => Self::main_graph_has_node(EQ_CAPTURE_NAME).await,
+            None => false,
         };
         let Some(route) = desired_output_route(eq_enabled, device_connected, chain_present) else {
             // Device absent: leave the user's current default alone.
@@ -523,11 +602,15 @@ impl AudioPipeline {
             return Ok(false);
         }
         Self::set_default_sink(&target).await?;
-        info!(
-            "Output routed to {} (EQ {})",
-            target,
-            if eq_enabled { "on" } else { "off" }
-        );
+        match route {
+            OutputRoute::Processed => info!("Output routed to {target} (EQ on)"),
+            OutputRoute::Raw if eq_enabled => info!(
+                "Output routed to {target} (EQ configured but its chain is not \
+                 available — unprocessed audio, deliberately preferred over \
+                 silence)"
+            ),
+            OutputRoute::Raw => info!("Output routed to {target} (EQ off)"),
+        }
         Ok(true)
     }
 
@@ -1178,6 +1261,75 @@ fn eq_expected_node(conf: &str) -> &'static str {
     } else {
         EQ_SINK_NAME
     }
+}
+
+/// The MAIN-graph node the EQ filter-chain must publish for its path to work.
+/// Named in the capture side of the generated conf.
+const EQ_CAPTURE_NAME: &str = "epos-eq-capture";
+
+/// Consecutive polls with a missing chain tolerated before the route gives up
+/// on the EQ. One poll is 5 s, so this is a 10 s grace period: long enough that
+/// a single missed sample cannot bounce audio between sinks, short enough that
+/// a real failure does not leave the user in silence.
+const EQ_FAILCLOSED_AFTER_POLLS: u32 = 2;
+
+/// Once the route has fallen back, ask for an instance restart on this poll and
+/// then every `EQ_RESTART_RETRY_POLLS` polls. 6 polls = 30 s, so a chain that
+/// cannot start is retried without becoming a restart storm.
+const EQ_RESTART_RETRY_POLLS: u32 = 6;
+
+/// What the EQ route should do on this poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EqRouteDecision {
+    /// Route playback through `epos-eq-input` (EQ applied).
+    pub use_anchor: bool,
+    /// Actively move the default sink back to the raw hardware sink.
+    pub repair_to_raw: bool,
+    /// Ask the restart bus to restart the eq instance.
+    pub request_restart: bool,
+}
+
+/// Decide the EQ route from the chain's liveness and how long it has been gone.
+///
+/// A missing chain is the dangerous state, because `epos-eq-input` keeps
+/// accepting streams that go nowhere. Falling back to the raw hardware sink
+/// costs the user their EQ but keeps their audio, which is the right order.
+pub(crate) fn eq_route_decision(chain_present: bool, missing_polls: u32) -> EqRouteDecision {
+    if chain_present {
+        return EqRouteDecision {
+            use_anchor: true,
+            repair_to_raw: false,
+            request_restart: false,
+        };
+    }
+    if missing_polls < EQ_FAILCLOSED_AFTER_POLLS {
+        // Inside the grace period: hold whatever route is current.
+        return EqRouteDecision {
+            use_anchor: true,
+            repair_to_raw: false,
+            request_restart: false,
+        };
+    }
+    EqRouteDecision {
+        use_anchor: false,
+        repair_to_raw: true,
+        // First attempt the moment the grace period expires, then every
+        // `EQ_RESTART_RETRY_POLLS` after that (2, 8, 14, ...).
+        request_restart: (missing_polls - EQ_FAILCLOSED_AFTER_POLLS) % EQ_RESTART_RETRY_POLLS == 0,
+    }
+}
+
+/// Does `pw-cli ls Node` output list `node`?
+///
+/// Exact quoted-name match, so a prefix of a real node never counts. Used for
+/// the frequent liveness poll, where `pw-cli -r pipewire-0 ls Node` is far
+/// cheaper than a full `pw-dump` (measured 4 ms / 5.8 KB versus 14 ms / 510 KB).
+fn node_list_has_node(list: &str, node: &str) -> bool {
+    if node.is_empty() {
+        return false;
+    }
+    let wanted = format!("node.name = \"{node}\"");
+    list.lines().any(|line| line.trim() == wanted)
 }
 
 /// The MAIN-graph node this role must publish for its DSP path to be usable,
@@ -1911,5 +2063,83 @@ mod tests {
             EQ_SINK_NAME,
             "with a passthrough graph there is no EQ chain to publish"
         );
+    }
+
+    // ── EQ watchdog: audio must never be silently swallowed ───────────────
+    //
+    // With the EQ on, the default sink is `epos-eq-input`, a null-sink whose
+    // only source of audio is the eq filter-chain. If that chain dies the
+    // anchor still accepts streams, so applications keep "playing" into a
+    // void. Measured: killing pipewire-epos@eq left the default sink on the
+    // anchor, the chain absent, and streams still being accepted — total
+    // silence, with the daemon logging nothing.
+    //
+    // Two things must therefore happen, and both are rate-limited so a
+    // flapping chain cannot thrash the route or storm restarts.
+
+    /// A healthy chain is the only reason to sit on the anchor.
+    #[test]
+    fn eq_route_holds_the_anchor_while_the_chain_is_up() {
+        let d = eq_route_decision(true, 0);
+        assert!(d.use_anchor, "chain present: keep EQ'd audio on the anchor");
+        assert!(!d.repair_to_raw, "nothing to repair");
+        assert!(!d.request_restart, "a healthy chain must not be restarted");
+    }
+
+    /// One bad poll is not enough to move the route: a single missed sample
+    /// must not bounce audio between the anchor and the raw sink.
+    #[test]
+    fn eq_route_tolerates_one_bad_poll_before_falling_back() {
+        let d = eq_route_decision(false, 1);
+        assert!(
+            d.use_anchor,
+            "one missing poll must not flap the route away from the EQ"
+        );
+        assert!(!d.repair_to_raw, "repair only after the grace period");
+        assert!(!d.request_restart, "no restart storm on a single blip");
+    }
+
+    /// After the grace period the route must fall back to raw hardware, which
+    /// is unprocessed but audible. Silence is the worse failure.
+    #[test]
+    fn eq_route_falls_back_to_raw_after_the_grace_period() {
+        let d = eq_route_decision(false, 2);
+        assert!(!d.use_anchor, "a dead chain must not stay the default sink");
+        assert!(d.repair_to_raw, "move the default sink back to raw hardware");
+        assert!(d.request_restart, "ask for a restart once it has settled");
+    }
+
+    /// Restarts are rate limited: the first attempt, then a slow heartbeat,
+    /// so a chain that cannot start does not restart every few seconds.
+    #[test]
+    fn eq_restarts_are_rate_limited() {
+        assert!(
+            !eq_route_decision(false, 3).request_restart,
+            "no restart on every poll"
+        );
+        assert!(
+            !eq_route_decision(false, 7).request_restart,
+            "not on an odd poll either"
+        );
+        assert!(
+            eq_route_decision(false, 8).request_restart,
+            "a periodic retry is still wanted"
+        );
+        assert!(
+            eq_route_decision(false, 14).request_restart,
+            "and it keeps retrying slowly"
+        );
+    }
+
+    /// `pw-cli ls Node` text output, used by the frequent liveness poll.
+    #[test]
+    fn node_list_matches_only_an_exact_name() {
+        let list = r#"	id 42, type PipeWire:Interface:Node/3
+			node.name = "epos-eq-capture"
+			media.class = "Stream/Input/Audio""#;
+        assert!(node_list_has_node(list, "epos-eq-capture"));
+        assert!(!node_list_has_node(list, "epos-eq-output"));
+        assert!(!node_list_has_node(list, "epos-eq"));
+        assert!(!node_list_has_node(list, ""));
     }
 }

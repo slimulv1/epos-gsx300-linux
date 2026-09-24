@@ -71,6 +71,17 @@ async fn main() -> Result<()> {
         if let Err(e) = audio.apply_full().await {
             warn!("Failed to apply initial audio config: {}", e);
         }
+        // Force the DSP instances to converge on the confs we just wrote.
+        //
+        // `write_instance_conf` only requests a restart when the file bytes
+        // changed, which cannot detect an instance that is running an OLDER
+        // conf while the on-disk file already matches — the state is
+        // unreachable for the watchdog too, since the chain node exists either
+        // way. Restarting once at startup makes the running instances a
+        // function of the config, deterministically, instead of by luck.
+        for role in ["eq", "voice"] {
+            audio.request_instance_restart(role);
+        }
     }
 
     // HID event channel: reader thread → async handler task
@@ -701,6 +712,12 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
             if let Err(e) = st.audio.route_input().await {
                 warn!("Failed to route input: {}", e);
             }
+            // Watchdog for the EQ. route_output() only ran on connect and on
+            // boot, so a chain that died in between left the default sink on
+            // `epos-eq-input` — a null-sink that still accepts streams, i.e.
+            // silence with no diagnostic. maintain_eq() verifies the chain,
+            // falls back to raw hardware if it is gone, and asks for a restart.
+            st.audio.maintain_eq().await;
         }
 
         was_connected = is_connected;
