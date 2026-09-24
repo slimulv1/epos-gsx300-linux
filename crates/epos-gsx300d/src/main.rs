@@ -605,20 +605,57 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-        // Reuse cached PipeWire node names — Detect without spawning pw-dump.
-        // A fresh `pw-dump` runs exactly once per (re)connect: when the device
-        // is on the USB bus (cheap sysfs check) and we don't know node names
-        // yet. With a cache present, or device absent, zero subprocesses.
+        // Reuse cached PipeWire node names — detect without spawning pw-dump.
+        // A fresh `pw-dump` runs once per (re)connect, and now also whenever the
+        // cached names are no longer published in the main graph.
+        //
+        // That second case is not defensive extra. On 2026-09-24 the daemon
+        // started while the main graph was still coming up, cached a pair of
+        // names that were never node names, wrote them into the generated confs,
+        // and then never revisited them: this loop only re-applies on a
+        // connect/disconnect transition, and it passed the cache back with
+        // `needs_fresh = false`, so it never even re-read the graph. The result
+        // was an EQ and a voice chain that stayed dead through every restart the
+        // watchdog performed.
         let cached_nodes = state.read().await.pipewire_nodes.clone();
-        let device = if cached_nodes.is_none() && devices::usb_present() {
+        // Checked against the live graph only while the device is on the bus, so
+        // an unplugged headset costs a sysfs read and nothing else. A probe that
+        // could not run reports "not stale" — it is not evidence about any node,
+        // and treating it as evidence would spawn a `pw-dump` on every tick.
+        let names_stale = if cached_nodes.is_some() && devices::usb_present() {
+            let node_list = audio::AudioPipeline::main_node_list().await;
+            audio::cached_nodes_stale(cached_nodes.as_ref(), node_list.as_deref().unwrap_or(""))
+        } else {
+            false
+        };
+        let device = if (cached_nodes.is_none() || names_stale) && devices::usb_present() {
+            if names_stale {
+                info!("Cached EPOS node names are not published — resolving them again");
+            }
             devices::detect().await
         } else {
-            devices::detect_with_nodes(cached_nodes, false).await
+            devices::detect_with_nodes(cached_nodes.clone(), false).await
         };
         let is_connected = device.is_some();
 
-        if is_connected && !was_connected {
-            info!("EPOS GSX 300 connected — applying config");
+        // Names that moved are a re-enumeration as far as the generated confs are
+        // concerned: those still carry the old targets, so they have to be
+        // rewritten. Handled by the same path as a reconnect rather than a second
+        // one that could drift away from it.
+        let names_changed = match (&cached_nodes, &device) {
+            (Some(_), Some(d)) => audio::node_names_changed(
+                cached_nodes.as_ref(),
+                &(d.pipewire_sink.clone(), d.pipewire_source.clone()),
+            ),
+            _ => false,
+        };
+
+        if is_connected && (!was_connected || names_changed) {
+            if names_changed {
+                info!("EPOS node names changed — regenerating the instance confs");
+            } else {
+                info!("EPOS GSX 300 connected — applying config");
+            }
             // Re-probe hardware info BEFORE taking the write lock: hwinfo::probe
             // does a blocking HID read (~tens of ms) and the lock guards all IPC,
             // so doing it inside would stall GetStatus/GetDevice for the whole

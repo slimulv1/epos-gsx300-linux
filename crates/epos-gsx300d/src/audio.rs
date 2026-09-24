@@ -272,6 +272,35 @@ pub(crate) enum MicWatchAction {
     NoSignal,
 }
 
+/// Are the cached PipeWire node names still published in the main graph?
+///
+/// Answers "no cache" as *not stale*, so this can only ever add a re-check and
+/// never suppress one. A missing node list — the probe timed out — is likewise
+/// not stale, because a probe that could not run is not evidence about any node
+/// and must not be allowed to trigger a fresh lookup on every tick.
+pub(crate) fn cached_nodes_stale(cached: Option<&(String, String)>, node_list: &str) -> bool {
+    let Some((sink, source)) = cached else {
+        return false;
+    };
+    // A blank or wildcard name is by definition not a published node, so it must
+    // read as stale rather than being passed through to a generated conf.
+    !node_list_has_node(node_list, sink) || !node_list_has_node(node_list, source)
+}
+
+/// Did a fresh detection produce different node names than the ones in use?
+///
+/// True when there is no cache at all, so the first detection always qualifies as
+/// a change and goes through the reconnect path.
+pub(crate) fn node_names_changed(
+    cached: Option<&(String, String)>,
+    fresh: &(String, String),
+) -> bool {
+    match cached {
+        None => true,
+        Some((sink, source)) => sink != &fresh.0 || source != &fresh.1,
+    }
+}
+
 /// Decode little-endian signed 16-bit samples.
 ///
 /// A capture cut mid-sample leaves an odd trailing byte; it is dropped rather
@@ -1089,7 +1118,7 @@ impl AudioPipeline {
     /// `None` must never be read as "nothing is there". It means the tool timed
     /// out or could not start, which is not evidence about any node — the
     /// distinction the whole watchdog rests on.
-    async fn main_node_list() -> Option<String> {
+    pub(crate) async fn main_node_list() -> Option<String> {
         match run_probe(
             "pw-cli",
             &["-r", "pipewire-0", "ls", "Node"],
@@ -3895,6 +3924,131 @@ mod tests {
         assert_eq!(
             classify_mic_window(&decode_s16le(&noisy)),
             MicSignal::Present
+        );
+    }
+
+    // ── A cached node name that is not a node ───────────────────────────────
+    //
+    // The 2026-09-24 outage was a name problem wearing a costume. The daemon
+    // cached a pair of node names while the main graph was still coming up, wrote
+    // them into the generated confs, and then never looked again: the hotplug
+    // loop only re-applies on a connect/disconnect *transition*, and it hands the
+    // cache back with `needs_fresh = false`, so it never even re-reads the graph.
+    // Two independent reasons a wrong name could sit there forever.
+    //
+    // The cheap half of the fix: the main graph's node list is already fetched
+    // every poll for the liveness probes, so noticing that a cached name is *not
+    // published* costs nothing extra.
+
+    /// No cache means nothing to be stale about, and this must never suppress a
+    /// fresh lookup.
+    #[test]
+    fn no_cached_names_are_never_called_stale() {
+        assert!(!cached_nodes_stale(None, ""));
+        assert!(!cached_nodes_stale(None, "node.name = \"anything\""));
+    }
+
+    /// Both names still published: the cache is good, do not spend a `pw-dump`.
+    #[test]
+    fn cached_names_that_are_published_are_not_stale() {
+        let cache = (
+            "alsa_output.usb-Sennheiser_EPOS_GSX_300_A003200202602692-00.analog-stereo"
+                .to_string(),
+            "alsa_input.usb-Sennheiser_EPOS_GSX_300_A003200202602692-00.mono-fallback"
+                .to_string(),
+        );
+        let list = "  \t\t\tnode.name = \"alsa_output.usb-Sennheiser_EPOS_GSX_300_A003200202602692-00.analog-stereo\"\n  \t\t\tnode.name = \"alsa_input.usb-Sennheiser_EPOS_GSX_300_A003200202602692-00.mono-fallback\"";
+        assert!(!cached_nodes_stale(Some(&cache), list));
+    }
+
+    /// A sink that has gone is stale. This is the ordinary case the check exists
+    /// for: the headset was re-enumerated and came back under different names.
+    #[test]
+    fn a_cached_sink_that_is_no_longer_published_is_stale() {
+        let cache = (
+            "alsa_output.usb-EPOS-OLD_SERIAL-00.analog-stereo".to_string(),
+            "alsa_input.usb-EPOS-OLD_SERIAL-00.mono-fallback".to_string(),
+        );
+        let list = "  \t\t\tnode.name = \"alsa_output.usb-Sennheiser_EPOS_GSX_300_NEW-00.analog-stereo\"\n  \t\t\tnode.name = \"alsa_input.usb-Sennheiser_EPOS_GSX_300_NEW-00.mono-fallback\"";
+        assert!(cached_nodes_stale(Some(&cache), list));
+    }
+
+    /// The source alone going missing is equally a reason to re-resolve: it is
+    /// what makes the voice chain point at nothing.
+    #[test]
+    fn a_cached_source_that_is_no_longer_published_is_stale() {
+        let cache = (
+            "alsa_output.usb-EPOS-00.analog-stereo".to_string(),
+            "alsa_input.usb-EPOS-00.mono-fallback".to_string(),
+        );
+        let list = "  \t\t\tnode.name = \"alsa_output.usb-EPOS-00.analog-stereo\"\n  \t\t\tnode.name = \"alsa_input.usb-something-else.mono-fallback\"";
+        assert!(
+            cached_nodes_stale(Some(&cache), list),
+            "a surviving sink must not make a dead source look fine"
+        );
+    }
+
+    /// The state the outage actually left behind: a wildcard pair cached as if it
+    /// were a node name. No node is ever published under a wildcard, so this must
+    /// read as stale or the loop would keep trusting it forever.
+    #[test]
+    fn a_cached_wildcard_is_stale() {
+        let cache = (
+            "alsa_output.usb-*:*.analog-stereo".to_string(),
+            "alsa_input.usb-*:*.mono-fallback".to_string(),
+        );
+        assert!(cached_nodes_stale(Some(&cache), ""));
+    }
+
+    /// A blank cached name is by definition not a published node.
+    #[test]
+    fn a_blank_cached_name_is_stale() {
+        let cache = (String::new(), "alsa_input.usb-EPOS-00.mono-fallback".to_string());
+        assert!(cached_nodes_stale(Some(&cache), ""));
+        let cache = ("alsa_output.usb-EPOS-00.analog-stereo".to_string(), String::new());
+        assert!(cached_nodes_stale(Some(&cache), ""));
+    }
+
+    /// A prefix of a real name is not that name. Matching loosely here is how a
+    /// renamed node would be accepted as the old one.
+    #[test]
+    fn a_partial_name_match_does_not_count_as_published() {
+        let cache = (
+            "alsa_output.usb-Sennheiser_EPOS_GSX_300_00.analog".to_string(),
+            "alsa_input.usb-Sennheiser_EPOS_GSX_300_00.mono".to_string(),
+        );
+        let list = "  \t\t\tnode.name = \"alsa_output.usb-Sennheiser_EPOS_GSX_300_00.analog-stereo\"\n  \t\t\tnode.name = \"alsa_input.usb-Sennheiser_EPOS_GSX_300_00.mono-fallback\"";
+        assert!(cached_nodes_stale(Some(&cache), list));
+    }
+
+    /// Re-resolving is only half of it: if the names that come back differ from
+    /// the ones the confs were generated from, the confs have to be rewritten.
+    /// Treating that as a reconnect lets the existing, already-tested path do the
+    /// work, instead of a second path that can drift away from it.
+    #[test]
+    fn changed_names_are_treated_as_a_reconnect() {
+        let old = (
+            "alsa_output.usb-EPOS-OLD-00.analog-stereo".to_string(),
+            "alsa_input.usb-EPOS-OLD-00.mono-fallback".to_string(),
+        );
+        let new = (
+            "alsa_output.usb-EPOS-NEW-00.analog-stereo".to_string(),
+            "alsa_input.usb-EPOS-NEW-00.mono-fallback".to_string(),
+        );
+        assert!(node_names_changed(Some(&old), &new), "both moved");
+        assert!(node_names_changed(None, &new), "no cache means it is new");
+        assert!(
+            !node_names_changed(Some(&new), &new),
+            "the same names must not cause a re-apply on every poll"
+        );
+
+        let half_moved = (
+            new.0.clone(),
+            "alsa_input.usb-EPOS-OLD-00.mono-fallback".to_string(),
+        );
+        assert!(
+            node_names_changed(Some(&new), &half_moved),
+            "one half changing is still a change"
         );
     }
 }
