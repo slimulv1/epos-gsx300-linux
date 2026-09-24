@@ -25,6 +25,30 @@ export interface EqBand {
   q: number;
 }
 
+/**
+ * Wire names for `epos_shared::config::VoiceMode` (`#[serde(rename_all =
+ * "lowercase")]`). Keeping this a union instead of `string` means a typo in a
+ * mode name is a compile error rather than a request the daemon silently
+ * rejects at runtime.
+ */
+export type VoiceModeName = "off" | "warm" | "clear" | "custom";
+
+export const VOICE_MODE_NAMES: readonly VoiceModeName[] = [
+  "off",
+  "warm",
+  "clear",
+  "custom",
+];
+
+/**
+ * Canonical neutral-profile name, mirroring
+ * `epos_shared::config::FLAT_PROFILE_NAME`. The daemon writes "FLAT" while
+ * older configs and user-created profiles used "Flat", so this is the single
+ * spelling the GUI should generate. Comparisons against existing profile
+ * names stay case-insensitive.
+ */
+export const FLAT_PROFILE_NAME = "FLAT";
+
 export interface AudioConfig {
   eq: {
     enabled: boolean;
@@ -32,17 +56,19 @@ export interface AudioConfig {
   };
   sidetone: { enabled: boolean; level: number };
   noise_gate: { enabled: boolean; threshold_db: number };
-  voice_enhancer: { mode: string; custom_bands: EqBand[] | null };
+  voice_enhancer: { mode: VoiceModeName; custom_bands: EqBand[] | null };
   mic_gain: number;
 }
 
+export type AudioMode = "stereo" | "surround71";
+
 export interface Profile {
   name: string;
+  /** Serialised by Rust (`Profile::mode`), previously missing here. */
+  mode: AudioMode;
   audio: AudioConfig;
   created_at: string;
 }
-
-export type AudioMode = "stereo" | "surround71";
 
 export interface DeviceInfo {
   usb_bus: number;
@@ -70,10 +96,23 @@ export interface DeviceStatus {
 }
 
 // ─── Response shape from daemon ─────────────────────────────
-interface DaemonResponse {
-  type: string;
-  payload: any;
-}
+/**
+ * Discriminated union mirroring `epos_shared::ipc::Response`
+ * (`#[serde(tag = "type", content = "payload")]`).
+ *
+ * This used to be `{ type: string; payload: any }`, which meant the compiler
+ * could not catch a Rust/TypeScript field drift (e.g. the `Profile` shape
+ * losing `mode`) and silently accepted any response body. Callers narrow on
+ * `res.type` and the payload type follows.
+ */
+type DaemonResponse =
+  | { type: "Ok" }
+  | { type: "Error"; payload: { message: string } }
+  | { type: "Status"; payload: DeviceStatus }
+  | { type: "Device"; payload: DeviceInfo | null }
+  | { type: "Eq"; payload: AudioConfig }
+  | { type: "Mode"; payload: AudioMode }
+  | { type: "Profiles"; payload: Profile[] };
 
 // Default 9-band EQ (matches daemon epos-shared defaults)
 export function defaultBands(): EqBand[] {
@@ -149,10 +188,23 @@ export const useDaemonStore = defineStore("daemon", () => {
     daemon_version: "0.1.0",
     device_connected: true,
     eq_active: false,
-    active_profile: "Flat",
+    active_profile: FLAT_PROFILE_NAME,
     mode: mockMode as AudioMode,
     smart_button_action: "toggle_mode",
+    sidetone_enabled: false,
+    noise_gate_enabled: false,
+    voice_enhancer_enabled: false,
   };
+
+  function mockAudioConfig(): AudioConfig {
+    return {
+      eq: { enabled: false, bands: defaultBands() },
+      sidetone: { enabled: false, level: 0 },
+      noise_gate: { enabled: false, threshold_db: -30 },
+      voice_enhancer: { mode: "off", custom_bands: null },
+      mic_gain: 80,
+    };
+  }
 
   function mockResponse(request: Record<string, unknown>): DaemonResponse {
     switch (request.type) {
@@ -167,32 +219,23 @@ export const useDaemonStore = defineStore("daemon", () => {
       case "SetMode": {
         const m = (request as { payload?: { mode?: AudioMode } }).payload?.mode;
         if (m) mockMode = m;
-        return { type: "Ok", payload: null };
+        return { type: "Ok" };
       }
       case "SetSmartButton": {
         const a = (request as { payload?: { action?: string } }).payload?.action;
         if (a) mockStatus.smart_button_action = a;
-        return { type: "Ok", payload: null };
+        return { type: "Ok" };
       }
       case "GetEq":
-        return {
-          type: "Eq",
-          payload: {
-            eq: { enabled: false, bands: defaultBands() },
-            sidetone: { enabled: false, level: 0 },
-            noise_gate: { enabled: false, threshold_db: -30 },
-            voice_enhancer: { mode: "off", custom_bands: null },
-            mic_gain: 80,
-          },
-        };
+        return { type: "Eq", payload: mockAudioConfig() };
       case "GetProfiles":
         return {
           type: "Profiles",
           payload: [
-            { name: "Flat", audio: {}, created_at: "2026-09-09" },
-            { name: "Music", audio: {}, created_at: "2026-09-09" },
-            { name: "Movie", audio: {}, created_at: "2026-09-09" },
-            { name: "eSport", audio: {}, created_at: "2026-09-09" },
+            { name: FLAT_PROFILE_NAME, mode: "stereo", audio: mockAudioConfig(), created_at: "2026-09-09" },
+            { name: "Music", mode: "surround71", audio: mockAudioConfig(), created_at: "2026-09-09" },
+            { name: "Movie", mode: "surround71", audio: mockAudioConfig(), created_at: "2026-09-09" },
+            { name: "eSport", mode: "stereo", audio: mockAudioConfig(), created_at: "2026-09-09" },
           ],
         };
       case "GetDevice":
@@ -210,7 +253,7 @@ export const useDaemonStore = defineStore("daemon", () => {
           },
         };
       default:
-        return { type: "Ok", payload: null };
+        return { type: "Ok" };
     }
   }
 
@@ -291,13 +334,33 @@ export const useDaemonStore = defineStore("daemon", () => {
     await sendRequest({ type: "SetNoiseGate", payload: { enabled, threshold_db: thresholdDb } });
   }
 
-  async function setVoiceEnhancer(modeName: string, customBands?: EqBand[]) {
-    if (!audio.value) return;
-    audio.value.voice_enhancer = { mode: modeName, custom_bands: customBands || null };
-    await sendRequest({
+  /**
+   * Select a voice-enhancer mode.
+   *
+   * Returns true only when the daemon actually accepted the change. The
+   * previous implementation updated the UI first and then discarded the
+   * response, so a rejected or dropped request left the button highlighted
+   * for a mode that was never applied. Now the optimistic value is rolled
+   * back on any failure (transport error or Response::Error).
+   */
+  async function setVoiceEnhancer(modeName: VoiceModeName, customBands?: EqBand[]) {
+    if (!audio.value) return false;
+    const previous = audio.value.voice_enhancer;
+    const bands = customBands || null;
+    audio.value.voice_enhancer = { mode: modeName, custom_bands: bands };
+    const res = await sendRequest({
       type: "SetVoiceEnhancer",
-      payload: { mode: modeName, custom_bands: customBands || null },
+      payload: { mode: modeName, custom_bands: bands },
     });
+    if (res?.type === "Error") {
+      audio.value.voice_enhancer = previous;
+      return false;
+    }
+    if (!res) {
+      audio.value.voice_enhancer = previous;
+      return false;
+    }
+    return true;
   }
 
   async function setMicGain(gain: number) {

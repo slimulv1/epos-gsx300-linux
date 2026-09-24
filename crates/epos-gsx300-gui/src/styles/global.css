@@ -1,3 +1,6 @@
+/* Inter font - self-hosted via @fontsource if available, else system stack */
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap");
+
 /* ─────────────────────────────────────────────
    EPOS GSX 300 — Global design tokens & base
    Palette from EPOS Gaming Suite (pcper.com review)
@@ -48,9 +51,6 @@
   --time-fast: 150ms;
   --time-med: 250ms;
 }
-
-/* Inter font — self-hosted via @fontsource if available, else system stack */
-@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap");
 
 * {
   margin: 0;

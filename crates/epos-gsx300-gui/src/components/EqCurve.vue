@@ -111,7 +111,10 @@ onMounted(() => {
 });
 onUnmounted(() => {
   ro?.disconnect();
-  if (emitTimer) clearTimeout(emitTimer);
+  // Flush, do not just clear the timer: a pending debounced edit that had not
+  // fired yet (fast tab switch, or a keyboard step followed immediately by
+  // leaving) used to be dropped, leaving the store on the stale bands.
+  flushEmit();
 });
 
 function freqToX(freq: number, w: number): number {
@@ -165,7 +168,7 @@ function draw() {
   ctx.strokeStyle = "rgba(210, 220, 228, 0.07)";
   ctx.lineWidth = 1;
   ctx.setLineDash([4, 4]);
-  props.bands.forEach((b) => {
+  display.value.forEach((b) => {
     const x = freqToX(b.freq, w);
     ctx.beginPath();
     ctx.moveTo(x, PADDING.top);
@@ -201,7 +204,7 @@ function draw() {
   ctx.fillStyle = "rgba(138, 155, 160, 0.7)";
   ctx.font = "10px var(--font-ui)";
   ctx.textAlign = "center";
-  props.bands.forEach((b) => {
+  display.value.forEach((b) => {
     const x = freqToX(b.freq, w);
     const label = b.freq >= 1000 ? `${b.freq / 1000}k` : `${b.freq}`;
     ctx.fillText(label, x, h - 4);
@@ -210,7 +213,7 @@ function draw() {
   // EQ curve with glow — uniform brightness from 64Hz to 16kHz, plus faint
   // "running-light" tails that extend beyond the outermost bands and taper
   // down to nothing (matches the device's light sweep)
-  const points: { x: number; y: number }[] = props.bands.map((b) => ({
+  const points: { x: number; y: number }[] = display.value.map((b) => ({
     x: freqToX(b.freq, w),
     y: dbToY(b.gain_db, h),
   }));
@@ -296,7 +299,7 @@ function draw() {
   // Band position dots: bright markers on the curve (device-accurate) —
   // one glowing dot at each 64..16k notch to show where each band sits
   ctx.save();
-  for (const band of props.bands) {
+  for (const band of display.value) {
     const x = freqToX(band.freq, w);
     const y = dbToY(band.gain_db, h);
     ctx.shadowColor = "rgba(78, 205, 196, 0.95)";
@@ -309,7 +312,7 @@ function draw() {
   ctx.restore();
 
   // Hover/drag gets a soft highlight ring around the band dot
-  props.bands.forEach((band, i) => {
+  display.value.forEach((band, i) => {
     if (hovered.value === i || dragging.value === i) {
       const x = freqToX(band.freq, w);
       const y = dbToY(band.gain_db, h);
@@ -329,7 +332,7 @@ function findNearestBand(clientX: number): number | null {
   const w = c.clientWidth;
   let closest = 0;
   let minDist = Infinity;
-  props.bands.forEach((band, i) => {
+  display.value.forEach((band, i) => {
     const dist = Math.abs(x - freqToX(band.freq, w));
     if (dist < minDist) {
       minDist = dist;
@@ -396,14 +399,17 @@ const selectedBand = ref<number | null>(null);
 function onKeyDown(e: KeyboardEvent) {
   if (selectedBand.value === null) return;
   const step = e.shiftKey ? 3 : 1;
+  // Read from `display`, not `props`: props only refreshes after the debounced
+  // emit, so repeated arrow presses each recomputed from the same stale value
+  // and the band never moved past the first step.
   if (e.key === "ArrowUp") {
     e.preventDefault();
-    const band = props.bands[selectedBand.value];
+    const band = display.value[selectedBand.value];
     const newDb = Math.min(MAX_DB, band.gain_db + step);
     onBandChange(selectedBand.value, newDb);
   } else if (e.key === "ArrowDown") {
     e.preventDefault();
-    const band = props.bands[selectedBand.value];
+    const band = display.value[selectedBand.value];
     const newDb = Math.max(MIN_DB, band.gain_db - step);
     onBandChange(selectedBand.value, newDb);
   } else if (e.key === "ArrowLeft") {
@@ -411,7 +417,7 @@ function onKeyDown(e: KeyboardEvent) {
     selectedBand.value = Math.max(0, selectedBand.value - 1);
   } else if (e.key === "ArrowRight") {
     e.preventDefault();
-    selectedBand.value = Math.min(props.bands.length - 1, selectedBand.value + 1);
+    selectedBand.value = Math.min(display.value.length - 1, selectedBand.value + 1);
   }
 }
 
