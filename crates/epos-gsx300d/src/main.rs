@@ -5,12 +5,14 @@ mod hid;
 mod hwinfo;
 mod ipc;
 mod led;
+mod sync;
 
 use crate::audio::AudioPipeline;
 use crate::audio::{run_status, COMMAND_BUDGET};
 use crate::hid::{HidEvent, HidHandler};
 use crate::ipc::IpcState;
 use crate::led::LedController;
+use crate::sync::lock;
 use anyhow::Result;
 use epos_shared::config::AudioMode;
 use epos_shared::config::SmartButtonAction;
@@ -588,7 +590,7 @@ async fn volume_watch_loop(state: Arc<RwLock<IpcState>>) {
         // entirely, so this is not somebody adjusting the volume: it is playback
         // moving. Say which, and adopt the new sink's real level.
         let target_changed = {
-            let mut last = st.last_volume_sink.lock().unwrap();
+            let mut last = lock(&st.last_volume_sink);
             let changed = !last.is_empty() && last.as_str() != sink.as_str();
             *last = sink.clone();
             changed
@@ -855,7 +857,7 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
 fn save_config(st: &IpcState) -> Result<(), anyhow::Error> {
     config::save(&st.config)?;
     if let Ok(bytes) = std::fs::read(config::config_path()) {
-        *st.last_written.lock().unwrap() = Some(bytes);
+        *lock(&st.last_written) = Some(bytes);
     }
     Ok(())
 }
@@ -982,7 +984,7 @@ async fn config_watch_loop(state: Arc<RwLock<IpcState>>) {
         };
         {
             let s = state.read().await;
-            if *s.last_written.lock().unwrap() == Some(disk_bytes.clone()) {
+            if *lock(&s.last_written) == Some(disk_bytes.clone()) {
                 // This mtime change came from the daemon's own atomic `save()`;
                 // skip it so we don't revert in-memory state that has advanced
                 // past the on-disk snapshot.
@@ -1082,7 +1084,7 @@ async fn config_watch_loop(state: Arc<RwLock<IpcState>>) {
         if !audio_changed && !mode_changed {
             info!("Config hot-reload: non-audio settings updated");
         }
-        *st.last_written.lock().unwrap() = Some(disk_bytes);
+        *lock(&st.last_written) = Some(disk_bytes);
     }
 }
 
@@ -1146,7 +1148,7 @@ fn emit_smart_notify(st: &IpcState) {
     static LAST: std::sync::Mutex<Option<std::time::Instant>> =
         std::sync::Mutex::new(None);
     {
-        let mut last = LAST.lock().unwrap();
+        let mut last = lock(&LAST);
         let now = std::time::Instant::now();
         if last
             .map(|t| now.duration_since(t) < std::time::Duration::from_millis(800))

@@ -162,6 +162,11 @@ mod tests {
         let loaded = load_or_create(&path).expect("bootstrap must create a config");
 
         assert!(path.exists(), "bootstrap must leave a config file behind");
+        assert_eq!(
+            loaded.active_profile,
+            epos_shared::config::FLAT_PROFILE_NAME,
+            "bootstrap must hand back the default profile"
+        );
         // `Config` has no `PartialEq`, so compare what actually landed on disk.
         let on_disk = load_from(&path).expect("reload what bootstrap wrote");
         assert_eq!(

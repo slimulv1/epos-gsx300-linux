@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use epos_shared::config::{AudioConfig, EqConfig, VoiceMode};
 use epos_shared::ipc::MicInputState;
 use epos_shared::device::DeviceInfo;
+use crate::sync::lock;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -92,13 +93,13 @@ impl RestartBus {
     /// Request a restart of one epos instance ("eq" | "voice" | "sidetone").
     pub fn request(&self, name: &str) {
         assert!(matches!(name, "eq" | "voice" | "sidetone"));
-        self.pending.lock().unwrap().insert(name.to_string());
+        lock(&self.pending).insert(name.to_string());
         self.notify.notify_one();
     }
 
     /// Drain a deduplicated snapshot; requests arriving later remain pending.
     pub fn drain(&self) -> BTreeSet<String> {
-        std::mem::take(&mut *self.pending.lock().unwrap())
+        std::mem::take(&mut *lock(&self.pending))
     }
 }
 
@@ -748,7 +749,7 @@ impl AudioPipeline {
     /// checked" and "checked and fine" are different claims and only one of them
     /// is true before the first capture.
     pub fn mic_input_state(&self) -> MicInputState {
-        self.mic_watch.lock().unwrap().reported
+        lock(&self.mic_watch).reported
     }
 
     /// Open a short capture on the microphone and feed the watchdog one probe.
@@ -773,7 +774,7 @@ impl AudioPipeline {
             return;
         }
         {
-            let mut watch = self.mic_watch.lock().unwrap();
+            let mut watch = lock(&self.mic_watch);
             let due = watch
                 .last_probe
                 .is_none_or(|t| t.elapsed() >= MIC_PROBE_INTERVAL);
@@ -787,7 +788,7 @@ impl AudioPipeline {
 
         let signal = self.probe_mic_signal().await;
         let (next_state, action) = {
-            let watch = self.mic_watch.lock().unwrap();
+            let watch = lock(&self.mic_watch);
             mic_watch_action(signal, watch.state)
         };
 
@@ -799,7 +800,7 @@ impl AudioPipeline {
             MicWatchAction::Undecided | MicWatchAction::Suspect => MicInputState::Unknown,
         };
 
-        let mut watch = self.mic_watch.lock().unwrap();
+        let mut watch = lock(&self.mic_watch);
         let changed = watch.reported != report;
         watch.state = next_state;
         watch.reported = report;
@@ -920,19 +921,14 @@ impl AudioPipeline {
     /// The current watchdog state for `role`, defaulting for a role seen first
     /// time.
     fn role_health(&self, role: &str) -> RoleHealth {
-        self.role_health
-            .lock()
-            .unwrap()
+        lock(&self.role_health)
             .get(role)
             .copied()
             .unwrap_or_default()
     }
 
     fn set_role_health(&self, role: &str, state: RoleHealth) {
-        self.role_health
-            .lock()
-            .unwrap()
-            .insert(role.to_string(), state);
+        lock(&self.role_health).insert(role.to_string(), state);
     }
 
     /// Move every stream currently attached to the EQ anchor onto the raw EPOS    /// sink.
@@ -1429,7 +1425,7 @@ impl AudioPipeline {
                 // with the EQ on, playback elsewhere means the EQ is not in the
                 // path, and that is now reported through `eq_in_path` rather than
                 // quietly pretended otherwise.
-                if previous.as_deref() != self.last_user_sink.lock().unwrap().as_deref() {
+                if previous.as_deref() != lock(&self.last_user_sink).as_deref() {
                     if let Ok(mut remembered) = self.last_user_sink.lock() {
                         *remembered = previous.clone();
                     }
