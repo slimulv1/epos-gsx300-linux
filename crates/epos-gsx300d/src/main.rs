@@ -16,7 +16,7 @@ use epos_shared::config::SmartButtonAction;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify, RwLock};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -93,6 +93,19 @@ async fn main() -> Result<()> {
     if let Some(ref mut led_ctrl) = led {
         if let Err(e) = led_ctrl.set_mode(config.mode) {
             warn!("Failed to set initial LED mode: {}", e);
+        }
+        // Say plainly whether the ring is actually being driven, so the state
+        // is never assumed to match the requested mode. EPROTO here means the
+        // USB endpoint is wedged, not that the unit lacks LED support — the
+        // same report succeeds on the same unit after a physical replug.
+        if led_ctrl.write_failing() {
+            warn!(
+                "LED ring is NOT being driven: HID output writes fail (errno 71 \
+                 EPROTO) while the device stays enumerated. Audio is unaffected. \
+                 Unplug the GSX 300 for ~10s and plug it back in — the daemon \
+                 re-syncs the ring on reconnect. See \
+                 docs/reverse-engineering/LED-HID-WEDGED-ENDPOINT.md"
+            );
         }
     }
 
@@ -851,8 +864,19 @@ async fn led_heartbeat_loop(state: Arc<RwLock<IpcState>>) {
         let mut st = state.write().await;
         let desired = st.config.mode;
         if let Some(ref mut led) = st.led {
-            if let Err(e) = led.set_mode(desired) {
-                warn!("LED heartbeat: failed to re-assert {:?}: {}", desired, e);
+            // LedController already rate-limits its own warning to the
+            // failure TRANSITION, so repeating it here produced a second
+            // warning every 2s (~1400/hour) on top of the one it emitted
+            // itself. Keep this at debug so a wedged LED path costs a single
+            // visible line instead of flooding the journal.
+            if led.set_mode(desired).is_err() {
+                debug!("LED heartbeat: could not re-assert {:?}", desired);
+                // The hotplug loop only calls reopen() when the device drops
+                // off the bus entirely. This is the other case: still
+                // enumerated, still refusing writes. Reopen the hidraw fd a
+                // bounded number of times — a plain close/open, never USB
+                // power/reset, which is what wedged the endpoint originally.
+                led.recover_if_needed();
             }
         }
     }

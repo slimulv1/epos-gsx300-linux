@@ -41,12 +41,39 @@ use tracing::{debug, info, warn};
 use epos_shared::config::AudioMode;
 use epos_shared::led::{LedProbeConfig, LedReportPath};
 
-/// HID Output report buffer size (must match device max)
-const HID_OUTPUT_SIZE: usize = 64;
+/// HID Output payload size for Report ID 0x02 (the LED ring).
+///
+/// Derived from the 120-byte report descriptor shipped by this device:
+/// `75 01` (Report Size = 1 bit) + `95 02` (Report Count = 2) for the two LED
+/// usage bits, followed by `95 06` (Report Count = 6) padding, i.e. an 8-bit
+/// OUTPUT field = 1 byte. A descriptor-exact hidraw write is therefore the
+/// report id plus one payload byte.
+///
+/// The long-standing 64-byte buffer also happens to be accepted, because the
+/// kernel pads/truncates an oversized report instead of rejecting it (verified:
+/// both sizes succeed on the same unit). The exact size is used because it is
+/// what the descriptor specifies, not because the old one was failing.
+const VENDOR_LED_PAYLOAD_SIZE: usize = 1;
 
-/// Report IDs for EPOS GSX 300
+/// Report ID for the LED ring (vendor page 0xFF13).
 const REPORT_ID_VENDOR_LED: u8 = 0x02;
+
+/// HID Output payload size for Report ID 0x04 (memory-bus / primary command).
+/// Descriptor: `75 08` + `95 26` (38) = 304 bits = 38 bytes.
+const PRIMARY_CMD_PAYLOAD_SIZE: usize = 38;
+
+/// Report ID for the memory-bus / primary command interface.
 const REPORT_ID_PRIMARY_CMD: u8 = 0x04;
+
+/// How many times the daemon reopens the hidraw node on its own after a write
+/// failure, before it stops retrying and leaves the diagnosis to the log.
+///
+/// Reopening is a plain close/open of the hidraw node. It deliberately does
+/// **not** touch USB power, `authorized` or port reset: those escalated a
+/// still-enumerated device into a fully unenumerable one on 2026-09-24, and
+/// only a physical replug recovered it. See
+/// docs/reverse-engineering/LED-HID-WEDGED-ENDPOINT.md.
+const MAX_LED_REOPEN_ATTEMPTS: u8 = 3;
 
 /// LED controller for EPOS GSX 300
 pub struct LedController {
@@ -54,6 +81,12 @@ pub struct LedController {
     file: Option<File>,
     probe_config: LedProbeConfig,
     current_mode: Option<AudioMode>,
+    /// Set once the first write fails, so the failure is reported exactly once
+    /// instead of on every 2s heartbeat. Reset on a successful write or reopen.
+    last_write_failed: bool,
+    /// Automatic close/open retries spent on the current failure. Reset only by
+    /// [`LedController::reopen`], i.e. by a real USB re-enumeration.
+    reopen_attempts: u8,
 }
 
 impl LedController {
@@ -90,12 +123,49 @@ impl LedController {
             file,
             probe_config,
             current_mode: None,
+            last_write_failed: false,
+            reopen_attempts: 0,
         })
     }
 
-    /// Reopen the device (e.g. after USB reconnect)
-    #[allow(dead_code)]
+    /// Reopen the device after a real USB re-enumeration.
+    ///
+    /// A genuine replug is a fresh start, so it refills the automatic-recovery
+    /// budget (unlike [`LedController::recover_if_needed`]).
     pub fn reopen(&mut self) -> Result<()> {
+        self.reopen_attempts = 0;
+        self.open_device()
+    }
+
+    /// Reopen the hidraw node after a failed write, on a bounded budget.
+    ///
+    /// A device that is still enumerated but refuses every output write has
+    /// either a stale file descriptor or a wedged interrupt-OUT endpoint. The
+    /// fd case is fixable in-process; the wedged-endpoint case is not, and is
+    /// why this is capped and silent at `debug` — the actionable warning comes
+    /// from the single failure-transition message in [`LedController::set_mode`].
+    pub fn recover_if_needed(&mut self) {
+        if !self.last_write_failed || self.reopen_attempts >= MAX_LED_REOPEN_ATTEMPTS {
+            return;
+        }
+        match self.open_device() {
+            Ok(()) => {
+                self.reopen_attempts += 1;
+                debug!(
+                    "LED: reopened hidraw after write failure (attempt {}/{})",
+                    self.reopen_attempts, MAX_LED_REOPEN_ATTEMPTS
+                );
+            }
+            Err(e) => debug!(
+                "LED: reopen attempt {} failed: {}",
+                self.reopen_attempts + 1,
+                e
+            ),
+        }
+    }
+
+    /// Close and reopen the hidraw node. Leaves the recovery budget untouched.
+    fn open_device(&mut self) -> Result<()> {
         self.file = None;
         self._hidraw_path = Self::find_hidraw()?;
         let file = OpenOptions::new()
@@ -105,6 +175,7 @@ impl LedController {
             .context("Failed to reopen hidraw device")?;
         self.file = Some(file);
         self.current_mode = None;
+        self.last_write_failed = false;
         Ok(())
     }
 
@@ -119,19 +190,20 @@ impl LedController {
         let probe_config = self.probe_config.clone();
         let file = self.file.as_mut().context("LED device not open")?;
 
-        match probe_config.use_report {
+        let result = match probe_config.use_report {
             LedReportPath::Vendor => {
                 let byte = match mode {
                     AudioMode::Stereo => probe_config.vendor_blue,
                     AudioMode::Surround71 => probe_config.vendor_red,
                 };
-                write_vendor_report(file, byte)?;
-                debug!(
-                    "LED: Report ID 0x{:02X} → 0x{:02X} ({})",
-                    REPORT_ID_VENDOR_LED,
-                    byte,
-                    mode.display_name()
-                );
+                write_vendor_report(file, byte).map(|()| {
+                    debug!(
+                        "LED: Report ID 0x{:02X} → 0x{:02X} ({})",
+                        REPORT_ID_VENDOR_LED,
+                        byte & 0x03,
+                        mode.display_name()
+                    );
+                })
             }
             LedReportPath::Primary => {
                 let payload = match mode {
@@ -144,15 +216,47 @@ impl LedController {
                         .as_deref()
                         .context("No primary_red payload configured")?,
                 };
-                write_primary_report(file, payload)?;
-                debug!(
-                    "LED: Report ID 0x{:02X} → {} bytes ({})",
-                    REPORT_ID_PRIMARY_CMD,
-                    payload.len(),
-                    mode.display_name()
-                );
+                write_primary_report(file, payload).map(|()| {
+                    debug!(
+                        "LED: Report ID 0x{:02X} → {} bytes ({})",
+                        REPORT_ID_PRIMARY_CMD,
+                        payload.len(),
+                        mode.display_name()
+                    );
+                })
             }
+        };
+
+        // The 2s heartbeat calls this unconditionally, so an unsupported
+        // output path used to emit a fresh warning every two seconds
+        // (~1400 lines/hour) and drown out real diagnostics. Report the
+        // transition into failure once, then stay quiet until it recovers.
+        //
+        // EPROTO here is a *transport* symptom, not evidence that the device
+        // lacks an output path: the same report succeeds on the same unit after
+        // a physical replug. The device stays enumerated but its interrupt-OUT
+        // endpoint goes dead, and only a replug clears it.
+        if result.is_err() && !self.last_write_failed {
+            let e = result
+                .as_ref()
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            warn!(
+                "LED write failed: {e}. The report is descriptor-correct and the \
+                 same write succeeds after a replug, so this is a wedged USB \
+                 endpoint rather than an unsupported device. Audio is unaffected. \
+                 Unplug the GSX 300 for ~10s and plug it back in; the daemon \
+                 re-syncs the ring on reconnect. See \
+                 docs/reverse-engineering/LED-HID-WEDGED-ENDPOINT.md"
+            );
         }
+        if result.is_ok() && self.last_write_failed {
+            info!("LED writes recovered");
+        }
+        self.last_write_failed = result.is_err();
+
+        result?;
 
         self.current_mode = Some(mode);
         // Heartbeat re-asserts this every 2s — keep at debug level to avoid
@@ -194,20 +298,26 @@ impl LedController {
         self.file.is_some()
     }
 
+    /// True when the last write failed, i.e. LED control is not working.
+    /// Callers can surface this instead of pretending the ring is in sync.
+    pub fn write_failing(&self) -> bool {
+        self.last_write_failed
+    }
+
     #[allow(dead_code)]
     pub fn current_mode(&self) -> Option<AudioMode> {
         self.current_mode
     }
 }
 
-/// Write vendor Report ID 0x02 (1-byte output)
+/// Write vendor Report ID 0x02 (1-byte LED output).
 fn write_vendor_report(file: &mut File, byte: u8) -> Result<()> {
     // The descriptor's output field is only 2 bits (wire values 0x00..=0x03:
     // off / blue / red / pink — see module doc). The firmware silently ignores
     // any higher bits → clamp to 0x00..=0x03 so a bad config value can never
     // produce a no-op write.
     let byte = byte & 0x03;
-    let mut packet = vec![0u8; HID_OUTPUT_SIZE];
+    let mut packet = vec![0u8; VENDOR_LED_PAYLOAD_SIZE + 1];
     packet[0] = REPORT_ID_VENDOR_LED;
     packet[1] = byte;
     file.write_all(&packet)
@@ -232,9 +342,9 @@ fn write_primary_report(file: &mut File, payload: &[u8]) -> Result<()> {
              (firmware flash = brick risk); dropping write"
         );
     }
-    let mut packet = vec![0u8; HID_OUTPUT_SIZE];
+    let mut packet = vec![0u8; PRIMARY_CMD_PAYLOAD_SIZE + 1];
     packet[0] = REPORT_ID_PRIMARY_CMD;
-    let len = payload.len().min(HID_OUTPUT_SIZE - 1);
+    let len = payload.len().min(PRIMARY_CMD_PAYLOAD_SIZE);
     packet[1..=len].copy_from_slice(&payload[..len]);
     file.write_all(&packet)
         .context("Failed to write primary LED report")?;
@@ -246,8 +356,8 @@ impl Drop for LedController {
     fn drop(&mut self) {
         // Try to reset LED to default (blue/stereo) on shutdown
         if let Some(ref mut file) = self.file {
-            let byte = self.probe_config.vendor_blue;
-            let mut packet = vec![0u8; HID_OUTPUT_SIZE];
+            let byte = self.probe_config.vendor_blue & 0x03;
+            let mut packet = vec![0u8; VENDOR_LED_PAYLOAD_SIZE + 1];
             packet[0] = REPORT_ID_VENDOR_LED;
             packet[1] = byte;
             let _ = file.write_all(&packet);
