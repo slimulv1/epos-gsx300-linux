@@ -225,6 +225,15 @@ pub struct IpcState {
     /// a target change be reported as exactly that, instead of being mistaken for
     /// somebody adjusting the volume externally.
     pub last_volume_sink: std::sync::Mutex<String>,
+    /// The microphone signal watchdog's own state.
+    ///
+    /// It lives here rather than inside `AudioPipeline` so the hotplug loop can
+    /// take a handle to it, drop the state lock, and run the capture with no
+    /// lock held at all. The capture takes about 2.7 seconds; measured, holding
+    /// the global lock for it froze the whole control surface that long, every
+    /// 63 seconds, because tokio's lock is first-in-first-out and write-preferring
+    /// and the volume watcher queues a writer every second.
+    pub mic_watch: std::sync::Arc<std::sync::Mutex<crate::audio::MicWatch>>,
     /// Raw bytes of the config file as last written by the daemon itself.
     /// `config_watch_loop` compares the on-disk bytes against this so it can
     /// tell the daemon's own atomic `save()` apart from a genuine external
@@ -443,7 +452,7 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
                 device_connected: device.is_some(),
                 eq_active: state.config.audio.eq.enabled,
                 eq_active_bands: crate::audio::effective_eq_band_count(&state.config.audio.eq),
-                mic_input: state.audio.mic_input_state(),
+                mic_input: state.audio.mic_input_state(&state.mic_watch),
                 eq_in_path: state.audio.eq_in_path_now().await,
                 active_profile: state.config.active_profile.clone(),
                 mode: state.config.mode,

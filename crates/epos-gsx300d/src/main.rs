@@ -162,6 +162,7 @@ async fn main() -> Result<()> {
         device: None,
         pipewire_nodes: None,
         last_volume_sink: std::sync::Mutex::new(String::new()),
+        mic_watch: std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
         last_written: std::sync::Mutex::new(None),
         volume_save_notify: Arc::new(Notify::new()),
         smart_button_seq: std::sync::atomic::AtomicU64::new(0),
@@ -892,10 +893,7 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
             // write lock held. GetStatus, the config watcher, the volume watcher
             // and every IPC request all queue behind that one lock.
             //
-            // A read lock lets the 3s status poll run alongside. The scopes must
-            // not nest: tokio's lock is fair and write-preferring, and holding a
-            // read lock while asking for a write one in the same task is the
-            // documented deadlock.
+            // A read lock lets the 3s status poll run alongside.
             drop(st);
             {
                 let st = state.read().await;
@@ -927,8 +925,33 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
             // not to the DSP instances, so the honest thing to do is stop
             // claiming that a microphone which is not delivering audio is a
             // healthy one.
-            st.audio.maintain_mic_signal().await;
             }
+            // The microphone probe captures audio for about 2.7 seconds, and it
+            // runs here with no state lock held at all.
+            //
+            // What it needs is a handle to its own state plus two values, so the
+            // snapshot is taken in its own short scope above and the capture
+            // happens after every guard has gone. Holding any lock for the
+            // capture froze the whole control surface for its duration, and
+            // tokio's write-preferring FIFO made it worse: the volume watcher
+            // queues a writer every second, so that writer — and every reader
+            // behind it — waited out the full capture.
+            //
+            // The two scopes above and here must not nest, and an earlier
+            // version of this did nest a read inside the long read. That is the
+            // deadlock tokio documents: a queued writer cannot be granted while
+            // this task still holds a read, and the second read cannot be
+            // granted while the writer is queued. The daemon answered no request
+            // at all until it was restarted.
+            let (voice_engaged, source, watch) = {
+                let st = state.read().await;
+                (
+                    st.audio.voice_path_engaged(),
+                    st.device.as_ref().map(|d| d.pipewire_source.clone()),
+                    std::sync::Arc::clone(&st.mic_watch),
+                )
+            };
+            audio::AudioPipeline::maintain_mic_signal(voice_engaged, source, &watch).await;
         }
 
         was_connected = is_connected;

@@ -44,7 +44,6 @@ pub struct AudioPipeline {
     role_health: Mutex<BTreeMap<String, RoleHealth>>,
     /// Microphone signal watchdog: the probe state, what is currently being
     /// reported, and when the last probe ran.
-    mic_watch: Mutex<MicWatch>,
     /// The output sink the user is currently using, when it is not one of ours.
     ///
     /// Only so the "the EQ is bypassed while you are on this device" line is
@@ -53,7 +52,7 @@ pub struct AudioPipeline {
 }
 
 /// Microphone signal watchdog bookkeeping.
-struct MicWatch {
+pub(crate) struct MicWatch {
     state: MicWatchState,
     /// What the daemon currently reports. Derived from the verdict, and tracked
     /// separately so a log line is emitted on transitions only.
@@ -598,7 +597,6 @@ impl AudioPipeline {
             eq_chain_missing_polls: AtomicU32::new(0),
             eq_chain_recovered_polls: AtomicU32::new(0),
             role_health: Mutex::new(BTreeMap::new()),
-            mic_watch: Mutex::new(MicWatch::default()),
             last_user_sink: Mutex::new(None),
         };
         // Same funnel as update_config, so a hand-edited config.json is bounded
@@ -759,8 +757,8 @@ impl AudioPipeline {
     /// Starts as `Unknown` and stays there until a probe has run, because "not
     /// checked" and "checked and fine" are different claims and only one of them
     /// is true before the first capture.
-    pub fn mic_input_state(&self) -> MicInputState {
-        lock(&self.mic_watch).reported
+    pub fn mic_input_state(&self, watch: &Mutex<MicWatch>) -> MicInputState {
+        lock(watch).reported
     }
 
     /// Open a short capture on the microphone and feed the watchdog one probe.
@@ -780,27 +778,31 @@ impl AudioPipeline {
     /// Only runs while a voice feature is actually engaged. With the enhancer
     /// and the gate both off, a silent microphone is a mute the user chose, and
     /// there is no reason to keep waking the capture device to observe it.
-    pub async fn maintain_mic_signal(&self) {
-        if !self.voice_path_engaged() {
-            return;
+    pub async fn maintain_mic_signal(
+        voice_engaged: bool,
+        source: Option<String>,
+        watch: &Arc<Mutex<MicWatch>>,
+    ) -> MicInputState {
+        if !voice_engaged {
+            return lock(watch).reported;
         }
         {
-            let mut watch = lock(&self.mic_watch);
-            let due = watch
+            let mut guard = lock(watch);
+            let due = guard
                 .last_probe
                 .is_none_or(|t| t.elapsed() >= MIC_PROBE_INTERVAL);
             if !due {
-                return;
+                return guard.reported;
             }
             // Stamp before the probe, not after: a probe that hangs must not turn
             // into a probe every tick.
-            watch.last_probe = Some(std::time::Instant::now());
+            guard.last_probe = Some(std::time::Instant::now());
         }
 
-        let signal = self.probe_mic_signal().await;
+        let signal = Self::probe_mic_signal(source.as_deref()).await;
         let (next_state, action) = {
-            let watch = lock(&self.mic_watch);
-            mic_watch_action(signal, watch.state)
+            let guard = lock(watch);
+            mic_watch_action(signal, guard.state)
         };
 
         // A single silent probe is deliberately reported as Unknown, not as a
@@ -811,10 +813,10 @@ impl AudioPipeline {
             MicWatchAction::Undecided | MicWatchAction::Suspect => MicInputState::Unknown,
         };
 
-        let mut watch = lock(&self.mic_watch);
-        let changed = watch.reported != report;
-        watch.state = next_state;
-        watch.reported = report;
+        let mut guard = lock(watch);
+        let changed = guard.reported != report;
+        guard.state = next_state;
+        guard.reported = report;
         if changed {
             match report {
                 MicInputState::Silent => warn!(
@@ -832,10 +834,11 @@ impl AudioPipeline {
                 ),
             }
         }
+        report
     }
 
     /// Is any voice feature actually processing the microphone?
-    fn voice_path_engaged(&self) -> bool {
+    pub fn voice_path_engaged(&self) -> bool {
         self.config.noise_gate.enabled || self.config.voice_enhancer.mode != VoiceMode::Off
     }
 
@@ -847,13 +850,8 @@ impl AudioPipeline {
     /// which on this machine measured 34 % exact-zero samples on quiet room
     /// tone. Judging that node against a 50 % threshold would report a perfectly
     /// healthy microphone as intermittently dead.
-    async fn probe_mic_signal(&self) -> MicSignal {
-        let Some(source) = self
-            .device
-            .as_ref()
-            .map(|d| d.pipewire_source.as_str())
-            .filter(|s| !s.is_empty())
-        else {
+    async fn probe_mic_signal(source: Option<&str>) -> MicSignal {
+        let Some(source) = source.filter(|s| !s.is_empty()) else {
             return MicSignal::Unknown;
         };
         let bytes = match run_capture(
