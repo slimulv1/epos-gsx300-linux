@@ -61,6 +61,59 @@ pub fn response_should_persist(response: &Response, is_mutation: bool) -> bool {
     is_mutation && matches!(response, Response::Ok | Response::Mode(_))
 }
 
+/// Compare two profile names the way the shared config contract defines them.
+///
+/// `Config::default()` and `Profile::flat()` produce "FLAT", the checked-in
+/// `config/default.json` says "Flat", and a user can type anything. Callers that
+/// compared exactly would miss the profile they meant — `SetActiveProfile` would
+/// refuse a case-only spelling, and `DeleteProfile` would remove the entry while
+/// leaving `active_profile` pointing at the name it just deleted.
+pub(crate) fn profile_name_matches(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+/// What deleting a profile should do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteOutcome {
+    /// No profile carries that name.
+    NotFound,
+    /// Removed a profile that was not active; the active one is untouched.
+    KeptActive,
+    /// Removed the active one; a fallback must be applied, including its mode.
+    SwitchedActive,
+    /// This was the only profile, so the delete is refused. See the note on
+    /// `DeleteOutcome` below.
+    RefuseLast,
+}
+
+/// Decide the effect of `DeleteProfile { name }` without touching any state.
+///
+/// Refusing the last profile is the deliberate choice. The alternative — removing
+/// it and pointing `active_profile` at "FLAT" — left a name that matched no
+/// entry: the list came back empty, the status still reported "FLAT", and the
+/// mismatch survived a restart. An empty list also has no valid active name, and
+/// an empty active name makes `sync_profile_audio` return early, so later live
+/// edits were never written to any profile. The default config always ships one
+/// profile and the GUI has no empty-state row, so "at least one" is the contract
+/// that keeps every other invariant true.
+fn delete_plan(profiles: &[epos_shared::Profile], active: &str, name: &str) -> DeleteOutcome {
+    if !profiles.iter().any(|p| profile_name_matches(&p.name, name)) {
+        return DeleteOutcome::NotFound;
+    }
+    let remaining = profiles
+        .iter()
+        .filter(|p| !profile_name_matches(&p.name, name))
+        .count();
+    if remaining == 0 {
+        return DeleteOutcome::RefuseLast;
+    }
+    if profile_name_matches(active, name) {
+        DeleteOutcome::SwitchedActive
+    } else {
+        DeleteOutcome::KeptActive
+    }
+}
+
 /// Mirror the live audio config back into the currently-active profile.
 ///
 /// Previously the live setters (SetEq / SetVoiceEnhancer / SetNoiseGate /
@@ -632,11 +685,29 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
         }
         Request::DeleteProfile { name } => {
             let mut state = state.write().await;
-            let before = state.config.profiles.len();
-            state.config.profiles.retain(|p| p.name != name);
-            if state.config.profiles.len() < before {
-                // If we deleted the active profile, fall back to Flat (or first remaining).
-                if state.config.active_profile == name {
+            match delete_plan(
+                &state.config.profiles,
+                &state.config.active_profile,
+                &name,
+            ) {
+                DeleteOutcome::NotFound => Response::Error {
+                    message: format!("Profile '{}' not found", name),
+                },
+                // Refused rather than leaving `active_profile` naming a profile
+                // that no longer exists. See `DeleteOutcome`.
+                DeleteOutcome::RefuseLast => Response::Error {
+                    message: format!(
+                        "'{}' is the only profile; create another before deleting it",
+                        name
+                    ),
+                },
+                DeleteOutcome::KeptActive => {
+                    state.config.profiles.retain(|p| !profile_name_matches(&p.name, &name));
+                    info!("Deleted profile '{}'", name);
+                    Response::Ok
+                }
+                DeleteOutcome::SwitchedActive => {
+                    state.config.profiles.retain(|p| !profile_name_matches(&p.name, &name));
                     // Match the flat profile case-insensitively: Config::default()
                     // and Profile::flat() use "FLAT", the checked-in
                     // config/default.json uses "Flat", and a user-created profile
@@ -649,45 +720,40 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
                         .find(|p| p.name.eq_ignore_ascii_case(FLAT_PROFILE_NAME))
                         .or_else(|| state.config.profiles.first())
                         .cloned();
-                    if let Some(profile) = fallback {
-                        state.config.audio = profile.audio.clone();
-                        state.config.active_profile = profile.name.clone();
-                        let audio_cfg = state.config.audio.clone();
-                        state.audio.update_config(&audio_cfg);
-                        match state.audio.apply_full().await {
-                            // apply_full() already enqueues any required instance restart on the
-                            // RestartBus; `changed` only reports whether a conf actually differed.
-                            Ok(true) => debug!("audio conf changed - instance restart enqueued"),
-                            Ok(false) => debug!("audio conf unchanged - no instance restart"),
-                            Err(e) => warn!("Failed to apply fallback profile: {}", e),
+                    // Unreachable while the last profile is refused, but a missing
+                    // fallback must be reported rather than stored.
+                    let Some(profile) = fallback else {
+                        return Response::Error {
+                            message: format!("Deleted '{}' but found no fallback profile", name),
+                        };
+                    };
+                    state.config.audio = profile.audio.clone();
+                    // A profile carries a mode as well as audio. Only the audio was
+                    // applied before, so deleting an active 7.1 profile left `mode`
+                    // at Surround71 and the ring red while the daemon reported the
+                    // stereo fallback -- and then saved that mismatch. The normal
+                    // switch path has always done both.
+                    state.config.mode = profile.mode;
+                    state.config.active_profile = profile.name.clone();
+                    let audio_cfg = state.config.audio.clone();
+                    state.audio.update_config(&audio_cfg);
+                    if let Some(ref mut led) = state.led {
+                        if let Err(e) = led.set_mode(profile.mode) {
+                            warn!("Failed to set LED on profile delete: {}", e);
                         }
-                        info!(
-                            "Deleted active profile '{}' → fallback to '{}'",
-                            name, profile.name
-                        );
-                    } else {
-                        // No profiles left: reset to defaults.
-                        state.config.audio = AudioConfig::default();
-                        state.config.active_profile =
-                            epos_shared::config::FLAT_PROFILE_NAME.to_string();
-                        let audio_cfg = state.config.audio.clone();
-                        state.audio.update_config(&audio_cfg);
-                        match state.audio.apply_full().await {
-                            // apply_full() already enqueues any required instance restart on the
-                            // RestartBus; `changed` only reports whether a conf actually differed.
-                            Ok(true) => debug!("audio conf changed - instance restart enqueued"),
-                            Ok(false) => debug!("audio conf unchanged - no instance restart"),
-                            Err(e) => warn!("Failed to apply default audio: {}", e),
-                        }
-                        info!("Deleted last profile '{}' → reset to defaults", name);
                     }
-                } else {
-                    info!("Deleted profile '{}'", name);
-                }
-                Response::Ok
-            } else {
-                Response::Error {
-                    message: format!("Profile '{}' not found", name),
+                    match state.audio.apply_full().await {
+                        // apply_full() already enqueues any required instance restart on the
+                        // RestartBus; `changed` only reports whether a conf actually differed.
+                        Ok(true) => debug!("audio conf changed - instance restart enqueued"),
+                        Ok(false) => debug!("audio conf unchanged - no instance restart"),
+                        Err(e) => warn!("Failed to apply fallback profile: {}", e),
+                    }
+                    info!(
+                        "Deleted active profile '{}' -> fallback to '{}'",
+                        name, profile.name
+                    );
+                    Response::Ok
                 }
             }
         }
@@ -1466,6 +1532,91 @@ mod tests {
         assert!(parse_request_head(b"").is_none());
         assert!(parse_request_head(b"not-a-request-line\r\n\r\n").is_none());
         assert!(parse_request_head(b"GET\r\n\r\n").is_none());
+    }
+
+    // ─── Deleting a profile ──────────────────────────────────
+    //
+    // The old handler removed the entry, then, if it had been the active one,
+    // picked a fallback and applied only its audio. Two things went missing.
+    //
+    // It never applied the fallback's *mode* or the LED. A profile carries a
+    // mode — MOVIE and MUSIC are 7.1, FLAT and ESPORT are stereo — so deleting
+    // an active 7.1 profile left the daemon reporting the stereo profile while
+    // `mode` stayed `Surround71` and the ring stayed red, and that mismatch was
+    // then saved.
+    //
+    // And with the last profile gone it set `active_profile` to "FLAT" without
+    // creating a FLAT profile, so the name pointed at nothing. The list came
+    // back empty, the status still said "FLAT", and it survived a restart
+    // because start-up does not recreate the missing profile. An empty active
+    // name also makes `sync_profile_audio` return early, so later live edits
+    // were never stored in any profile.
+
+    /// The dangling case is now refused instead of produced: the default config
+    /// always has a profile, and the GUI has no empty-state row, so a profile
+    /// list of zero has no valid active name to point at.
+    #[test]
+    fn deleting_the_only_profile_is_refused() {
+        let profiles = vec![profile("FLAT", 80)];
+        assert_eq!(
+            delete_plan(&profiles, "FLAT", "FLAT"),
+            DeleteOutcome::RefuseLast
+        );
+    }
+
+    #[test]
+    fn deleting_an_unknown_profile_is_not_found() {
+        let profiles = vec![profile("FLAT", 80), profile("MUSIC", 50)];
+        assert_eq!(
+            delete_plan(&profiles, "FLAT", "NOPE"),
+            DeleteOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn deleting_a_background_profile_keeps_the_active_one() {
+        let profiles = vec![profile("FLAT", 80), profile("MUSIC", 50)];
+        assert_eq!(
+            delete_plan(&profiles, "FLAT", "MUSIC"),
+            DeleteOutcome::KeptActive
+        );
+    }
+
+    #[test]
+    fn deleting_the_active_profile_switches_to_a_fallback() {
+        let profiles = vec![profile("MUSIC", 50), profile("FLAT", 80)];
+        assert_eq!(
+            delete_plan(&profiles, "MUSIC", "MUSIC"),
+            DeleteOutcome::SwitchedActive
+        );
+    }
+
+    /// The shared profile contract says names are case-insensitive, and the
+    /// shipped config uses "FLAT" while others in the wild use "Flat". An exact
+    /// compare meant `DeleteProfile { name: "flat" }` found nothing at all, and
+    /// deleting "FLAT" while `active_profile` said "Flat" removed the profile
+    /// without switching away from it.
+    #[test]
+    fn profile_matching_ignores_case() {
+        let profiles = vec![profile("FLAT", 80), profile("MUSIC", 50)];
+        // A case-only spelling must still find the profile, and must recognise
+        // that it is the active one — the old exact compares did neither.
+        assert_eq!(
+            delete_plan(&profiles, "flat", "FLAT"),
+            DeleteOutcome::SwitchedActive
+        );
+        assert_eq!(
+            delete_plan(&profiles, "MUSIC", "flat"),
+            DeleteOutcome::KeptActive,
+            "deleting a case-only spelling of a background profile leaves the active one"
+        );
+        // And the last profile is still recognised through a case difference,
+        // rather than slipping past as "not found".
+        let only = vec![profile("FLAT", 80)];
+        assert_eq!(
+            delete_plan(&only, "flat", "FLAT"),
+            DeleteOutcome::RefuseLast
+        );
     }
 
     // ─── Taking over the IPC socket path ─────────────────────
