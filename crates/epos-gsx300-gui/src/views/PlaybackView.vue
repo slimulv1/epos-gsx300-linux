@@ -56,6 +56,23 @@ async function toggleSoundTest() {
 
 const disconnected = computed(() => !store.status?.device_connected);
 
+/* The EQ toggle and the EQ doing something are separate facts. Bands flatter
+   than 0.1 dB are dropped when the PipeWire conf is generated, so an EQ that
+   is switched on with a flat curve puts no filter in the graph at all. The
+   audio is right - a flat curve is transparent - but the old status reported
+   only the toggle, so the interface said the EQ was on while nothing was
+   filtering and the user edited a curve that did nothing.
+
+   The band count is optional on purpose: without it (an older daemon, or no
+   status yet) we say nothing rather than guessing. */
+const eqActiveBandCount = computed(() => store.status?.eq_active_bands ?? null);
+const eqLooksTransparent = computed(
+  () =>
+    (store.audio?.eq?.enabled ?? false) &&
+    eqActiveBandCount.value !== null &&
+    eqActiveBandCount.value === 0,
+);
+
 /* ─── Save preset modal ─── */
 const saveOpen = ref(false);
 const saveName = ref("");
@@ -124,6 +141,14 @@ async function confirmSave() {
     <!-- EQ graph -->
     <div class="eq-section">
       <h3 class="section-title">EQUALIZER</h3>
+      <p v-if="eqLooksTransparent" class="eq-note">
+        ON, BUT NOT FILTERING - every band is flat, so the graph has no filter
+        in it. Move a band off 0 dB and the change will be audible.
+      </p>
+      <p v-else-if="(eqActiveBandCount ?? 0) > 0" class="eq-note ok">
+        {{ eqActiveBandCount }} band{{ eqActiveBandCount === 1 ? "" : "s" }}
+        active.
+      </p>
       <EqCurve
         :bands="store.audio?.eq?.bands ?? []"
         @update="onEqUpdate"
@@ -334,6 +359,17 @@ async function confirmSave() {
   letter-spacing: 0.5px;
   text-transform: uppercase;
   margin-bottom: var(--space-2);
+}
+
+.eq-note {
+  font-size: var(--fs-xs);
+  color: var(--warn);
+  margin: 0 0 var(--space-2);
+  line-height: 1.4;
+}
+
+.eq-note.ok {
+  color: var(--muted);
 }
 
 /* Controls row */

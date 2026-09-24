@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use epos_shared::config::{AudioConfig, VoiceMode};
+use epos_shared::config::{AudioConfig, EqConfig, VoiceMode};
 use epos_shared::device::DeviceInfo;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -120,6 +120,17 @@ pub fn desired_output_route(
     })
 }
 
+/// Is `sink` one this daemon sets itself?
+///
+/// Only ever used to decide whether a log line should report that the route was
+/// taken back from a sink the daemon did not choose. With the EQ on, the default
+/// sink is re-asserted every poll, so a manual change of output device is
+/// reversed within 5 s — correct, because the EQ only reaches applications that
+/// follow the default, but surprising if nothing says so.
+pub fn sink_is_managed(sink: &str, raw_sink: &str) -> bool {
+    !sink.is_empty() && (sink == EQ_SINK_NAME || sink == raw_sink)
+}
+
 /// Hard limits for every EQ / voice band interpolated into a generated
 /// PipeWire config. They are deliberately conservative: the values are written
 /// verbatim into a config file that PipeWire parses, so a malformed, stale, or
@@ -134,6 +145,24 @@ pub const BAND_GAIN_LIMIT_DB: f32 = 24.0;
 /// Bands flatter than this are no-ops and are dropped entirely.
 pub const BAND_GAIN_EPSILON_DB: f32 = 0.1;
 pub const MAX_EQ_BANDS: usize = 32;
+
+/// How many bands are actually shaping the output.
+///
+/// Reported alongside the EQ toggle because the two are independent questions.
+/// `sanitize_bands` drops every band flatter than `BAND_GAIN_EPSILON_DB`, so an
+/// EQ that is switched on with a flat curve generates a conf containing no
+/// filter at all: the audio is right — a flat curve is transparent — but a
+/// single `eq_active: true` says the EQ is on while nothing is filtering, and
+/// the user edits a curve that does nothing.
+///
+/// Counts what reaches the graph, not what was typed: bands the sanitiser drops
+/// are not in the filter chain, so counting them would be a second way to lie.
+pub fn effective_eq_band_count(eq: &EqConfig) -> usize {
+    if !eq.enabled {
+        return 0;
+    }
+    sanitize_bands(eq.bands.as_slice()).len()
+}
 
 /// Normalise a band list into the `(freq, gain_db, q)` tuples that are safe to
 /// interpolate into a generated PipeWire config.
@@ -875,16 +904,32 @@ impl AudioPipeline {
         let (raw_sink, _) = self.node_names();
         let target = match route {
             OutputRoute::Processed => EQ_SINK_NAME.to_string(),
-            OutputRoute::Raw => raw_sink,
+            OutputRoute::Raw => raw_sink.clone(),
         };
         if target.is_empty() {
             return Ok(false);
         }
-        if Self::read_default_sink().await.as_deref() == Some(target.as_str()) {
+        let previous = Self::read_default_sink().await;
+        if previous.as_deref() == Some(target.as_str()) {
             return Ok(false);
         }
         Self::set_default_sink(&target).await?;
+        // Only reached when the default really is changing, so `previous` is an
+        // observed value rather than a guess. A sink this daemon never set was
+        // put there by the user or another tool, and the route is about to be
+        // taken back from it — say so, because the watchdog will keep doing this
+        // every 5 s while the EQ is on.
+        let displaced = previous
+            .as_deref()
+            .filter(|p| !sink_is_managed(p, &raw_sink));
         match route {
+            OutputRoute::Processed if displaced.is_some() => info!(
+                "Output routed to {target} (EQ on) — taking it back from {}, \
+                 which this daemon did not choose. The EQ needs playback on \
+                 this sink, so a manual change of output device will keep being \
+                 reverted while the EQ is on.",
+                displaced.unwrap_or_default()
+            ),
             OutputRoute::Processed => info!("Output routed to {target} (EQ on)"),
             OutputRoute::Raw if eq_enabled => info!(
                 "Output routed to {target} (EQ configured but its chain is not \
@@ -1589,11 +1634,17 @@ fn dump_has_node(dump: &str, node: &str) -> bool {
 /// does, so it proves nothing. When the graph really carries bands, the chain
 /// node `epos-eq-capture` is what must be published; with a passthrough graph
 /// there is no EQ to run and the anchor is all that is expected.
-fn eq_expected_node(conf: &str) -> &'static str {
+/// The node the EQ instance must publish for its graph to be in the audio path,
+/// or `None` when the graph is a passthrough and the instance therefore has
+/// nothing to publish.
+///
+/// A passthrough conf is a real, correct state — a flat curve changes nothing,
+/// so writing no filter is right — but it is not a node any instance publishes.
+fn eq_expected_node(conf: &str) -> Option<&'static str> {
     if conf.contains("eq_band_") {
-        "epos-eq-capture"
+        Some(EQ_CAPTURE_NAME)
     } else {
-        EQ_SINK_NAME
+        None
     }
 }
 
@@ -1881,13 +1932,18 @@ fn node_list_has_node(list: &str, node: &str) -> bool {
 /// `epos-sidetone` that was hardcoded before — that name matches nothing, so
 /// the check could never succeed.
 ///
-/// `eq` is the exception: `epos-eq-input` is the static null-sink installed in
-/// MAIN by `40-epos-eq-virtualsink.conf` and exists whether or not the EQ
-/// filter is engaged, so it is always expected.
+/// `eq` is the exception, and it is why this can answer "nothing". Its conf is
+/// a passthrough graph whenever the curve is flat or the EQ is off, and then the
+/// instance publishes no EQ node at all. It used to answer with `EQ_SINK_NAME` —
+/// `epos-eq-input`, the static null-sink installed in MAIN by
+/// `40-epos-eq-virtualsink.conf` — so the health check for a disabled EQ was
+/// verifying that MAIN's anchor exists, which is true no matter what the
+/// instance is doing. That is a check which cannot fail, and so says nothing. It
+/// now demands nothing, which is both true and makes the check mean something.
 fn expected_node(role: &str) -> Option<String> {
     if role == "eq" {
         let conf = std::fs::read_to_string(AudioPipeline::instance_conf_path("eq")).ok()?;
-        return Some(eq_expected_node(&conf).to_string());
+        return eq_expected_node(&conf).map(|node| node.to_string());
     }
     let marker = match role {
         "voice" => "epos-voice-output",
@@ -2282,16 +2338,26 @@ mod tests {
         assert!(!dump_has_node("[{\"info\":{\"props\":{}}}]", "epos-voice-output"));
     }
 
-    /// With the EQ disabled the conf carries a passthrough graph, so the only
-    /// thing the role can be expected to publish is the static anchor.
+    /// With the EQ disabled the conf carries a passthrough graph, so the
+    /// instance publishes no EQ node and there is nothing to demand.
+    ///
+    /// This previously expected `EQ_SINK_NAME`, which is the MAIN graph's static
+    /// null-sink rather than anything the instance publishes. The check then
+    /// passed or failed according to MAIN's state, so for a disabled EQ it could
+    /// never fail and verified nothing.
     #[test]
-    fn eq_role_with_passthrough_graph_expects_only_the_anchor() {
+    fn eq_role_with_passthrough_graph_expects_no_node() {
         let conf = generate_eq_instance_conf(&[], "sink");
         assert!(
             !conf.contains("eq_band_"),
             "sanity: an empty band list must produce a passthrough graph"
         );
-        assert_eq!(eq_expected_node(&conf), EQ_SINK_NAME);
+        assert_eq!(
+            eq_expected_node(&conf),
+            None,
+            "a passthrough instance publishes no EQ node; demanding MAIN's \
+             anchor here verified the wrong thing"
+        );
     }
 
     /// With bands in the graph the chain node is what must be published, so a
@@ -2307,7 +2373,7 @@ mod tests {
             "sink",
         );
         assert!(conf.contains("eq_band_"), "sanity: the band must reach the graph");
-        assert_eq!(eq_expected_node(&conf), "epos-eq-capture");
+        assert_eq!(eq_expected_node(&conf), Some(EQ_CAPTURE_NAME));
     }
 
     /// An unknown role expects nothing rather than panicking. The restart bus
@@ -2594,14 +2660,15 @@ mod tests {
         );
         assert_eq!(
             eq_expected_node(&with_bands),
-            "epos-eq-capture",
+            Some(EQ_CAPTURE_NAME),
             "with bands in the graph, the chain node is what must be published"
         );
         let passthrough = generate_eq_instance_conf(&[], "sink");
         assert_eq!(
             eq_expected_node(&passthrough),
-            EQ_SINK_NAME,
-            "with a passthrough graph there is no EQ chain to publish"
+            None,
+            "with a passthrough graph there is no EQ chain to publish, so the \
+             health check has nothing to demand"
         );
     }
 
@@ -2969,5 +3036,129 @@ mod tests {
     #[test]
     fn two_identical_empty_files_are_a_match() {
         assert!(!conf_needs_restart(Some(""), Some("")));
+    }
+
+    // ── An enabled EQ is not the same as a filtering EQ ─────────────────────
+    //
+    // `sanitize_bands` drops any band flatter than `BAND_GAIN_EPSILON_DB`, so an
+    // EQ that is switched on with every band at 0 dB generates a conf with no
+    // filter in it at all. That is the correct audio — a flat curve is
+    // transparent — but the status reported `eq_active: true`, so the interface
+    // said the EQ was on while nothing was shaping the output. The user is left
+    // editing a curve that does nothing, with no indication of why.
+    //
+    // Nothing about the audio path changes here; this only reports what the
+    // graph is actually doing.
+
+    /// Off means nothing is in the graph, whatever the bands say.
+    #[test]
+    fn a_disabled_eq_shapes_nothing() {
+        let eq = EqConfig {
+            enabled: false,
+            bands: vec![band(1000, 6.0, 1.0), band(2000, -3.0, 1.0)],
+        };
+        assert_eq!(effective_eq_band_count(&eq), 0);
+    }
+
+    /// Every band within the limits really is in the graph, so the count matches
+    /// what the user configured.
+    #[test]
+    fn a_real_curve_reports_every_band_it_applies() {
+        let eq = EqConfig {
+            enabled: true,
+            bands: vec![band(125, 6.0, 1.0), band(1000, -4.5, 0.8), band(8000, 3.0, 1.2)],
+        };
+        assert_eq!(effective_eq_band_count(&eq), 3);
+    }
+
+    /// The case that made the status lie: on, with a curve drawn, but flat. The
+    /// generated conf has no filter in it, so the honest answer is zero.
+    #[test]
+    fn an_enabled_but_flat_eq_reports_no_active_bands() {
+        let flat = EqConfig {
+            enabled: true,
+            bands: vec![
+                band(64, 0.0, 1.0),
+                band(250, 0.0, 1.0),
+                band(1000, 0.05, 1.0),
+                band(4000, -0.05, 1.0),
+            ],
+        };
+        assert_eq!(effective_eq_band_count(&flat), 0);
+    }
+
+    /// The count must be what the graph gets, not what the user typed: bands
+    /// the sanitiser drops are not in the filter chain and must not be counted.
+    #[test]
+    fn dropped_bands_are_not_counted_as_active() {
+        let eq = EqConfig {
+            enabled: true,
+            bands: vec![
+                band(1000, 6.0, 1.0),  // kept
+                band(0, 6.0, 1.0),     // dropped: freq 0
+                band(500, 0.0, 1.0),   // dropped: flat
+                band(50000, 3.0, 1.0), // dropped: ultrasonic
+                band(250, 2.0, 1.0),   // kept
+            ],
+        };
+        assert_eq!(effective_eq_band_count(&eq), 2);
+    }
+
+    /// The two numbers are separate questions and must not be conflated. "The EQ
+    /// is switched on" and "the EQ is changing the sound" are both true-or-false
+    /// independently, which is exactly why one boolean was not enough.
+    #[test]
+    fn the_toggle_and_the_active_band_count_are_independent() {
+        let on_flat = EqConfig {
+            enabled: true,
+            bands: vec![band(1000, 0.0, 1.0)],
+        };
+        assert!(
+            on_flat.enabled && effective_eq_band_count(&on_flat) == 0,
+            "on but transparent"
+        );
+        let off_shaped = EqConfig {
+            enabled: false,
+            bands: vec![band(1000, 9.0, 1.0)],
+        };
+        assert!(
+            !off_shaped.enabled && effective_eq_band_count(&off_shaped) == 0,
+            "a curve that exists but is switched off changes nothing"
+        );
+    }
+
+    // ── Say when the route is being taken back, not just that it moved ──────
+    //
+    // With the EQ on, the daemon re-asserts the default sink on every poll. That
+    // is necessary — the EQ only reaches applications that follow the default,
+    // so without it the feature silently stops working — but it means a manual
+    // change of output device is undone within 5 s. The log said only "Output
+    // routed to <sink> (EQ on)", which does not tell the user that their choice
+    // was overridden, nor that it will keep being overridden.
+
+    /// Only the two sinks this daemon actually sets count as managed. Anything
+    /// else was chosen by the user or by another tool, and displacing it
+    /// deserves to be reported as such rather than quietly passed over.
+    #[test]
+    fn only_the_daemons_own_sinks_count_as_managed() {
+        let raw = "alsa_output.usb-EPOS-00.analog-stereo";
+        assert!(sink_is_managed(EQ_SINK_NAME, raw), "the EQ anchor is ours");
+        assert!(sink_is_managed(raw, raw), "the raw device is ours");
+        assert!(
+            !sink_is_managed("bluez_sink.00_00_00_00_00_00.a2dp_sink", raw),
+            "a bluetooth sink was not set by this daemon"
+        );
+        assert!(
+            !sink_is_managed("alsa_output.pci-0000_00_1f.3.analog-stereo", raw),
+            "another onboard output is not ours either"
+        );
+    }
+
+    /// An unreadable default must not be reported as someone else's choice:
+    /// there is nothing observed to attribute.
+    #[test]
+    fn an_unknown_default_sink_is_not_called_managed() {
+        let raw = "alsa_output.usb-EPOS-00.analog-stereo";
+        assert!(!sink_is_managed("", raw));
     }
 }

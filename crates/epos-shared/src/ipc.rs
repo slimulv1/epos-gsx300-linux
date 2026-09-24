@@ -74,6 +74,16 @@ pub enum Response {
         daemon_version: String,
         device_connected: bool,
         eq_active: bool,
+        /// How many bands are actually in the EQ filter graph right now.
+        ///
+        /// Separate from `eq_active` because the two are independent: bands
+        /// flatter than 0.1 dB are dropped when the conf is generated, so an
+        /// enabled EQ with a flat curve puts no filter in the graph at all. The
+        /// audio is correct — a flat curve is transparent — but a lone
+        /// `eq_active: true` tells the user the EQ is working while nothing is
+        /// filtering, and there is no way to tell that apart from a real curve
+        /// without this number.
+        eq_active_bands: usize,
         active_profile: String,
         mode: AudioMode,
         smart_button_action: String,

@@ -137,31 +137,26 @@ or a comment pinning it.
 
 ## Remaining known gaps
 
-Not defects that lose audio today, but not solved either:
+Nothing outstanding. The four items this document used to list are all closed,
+and each was verified by measurement rather than by reading the diff:
 
-- **External `pactl` routing fights the daemon.** The watchdog re-asserts the
-  default sink every 5 s when the EQ is on, so a deliberate manual change to
-  the default sink is reverted. That is the intended trade-off — without it the
-  EQ silently stops working the moment someone changes the output — but it is
-  worth knowing before spending time fighting it.
-- **All-flat bands degrade to passthrough** while `eq.enabled` stays true, so
-  the status reports the EQ as active when no filtering happens. Honest fix
-  would be an effective-band count in the status response.
-
-### Closed
-
-- **No loaded-conf identity** — was the reason a lost restart was permanent.
-  Each instance now records the conf it was last *verified* to have loaded, next
-  to the generated one, and the daemon restarts any role whose conf on disk does
-  not match. A copy rather than a digest, so it needs no new dependency and
-  cannot collide; written only after the post-restart health check passes, so a
-  stamp always describes a load that actually worked. Verified all three ways:
-  a changed config while the daemon was down is detected and restarted, an
-  unchanged one restarts nothing, and a deleted stamp restarts that role rather
-  than trusting it.
-- **Shutdown could drop a pending restart** — solved by the same stamp, with no
-  shutdown work added. A restart lost to an exit or a power cut leaves the stamp
-  describing the previous conf, so the next start repairs it. Draining on exit
-  was rejected: it adds shutdown latency and a hang risk in the exit path to fix
-  something that can be detected on the next start instead.
+- **An enabled EQ that filters nothing** — `sanitize_bands` drops bands flatter
+  than 0.1 dB, so an EQ that is on with a flat curve generates a conf with no
+  filter in it. The audio was always right; the *report* was not, and a lone
+  `eq_active: true` claimed "working" for a curve doing nothing. `Status` now
+  also carries `eq_active_bands`, the number of bands actually in the graph, and
+  the playback view says so rather than leaving the user editing a curve that
+  cannot be heard. Verified over IPC in all three states: on with 9 shaped bands
+  reports 9, on with a flat curve reports 0, off reports 0.
+- **A health check that could not fail** — `expected_node("eq")` answered with
+  `epos-eq-input`, the static null-sink in MAIN, whenever the EQ conf was a
+  passthrough. For a disabled EQ the check therefore verified that MAIN's anchor
+  exists, which is true whatever the instance was doing. It now demands nothing,
+  which is what a passthrough instance deserves.
+- **The daemon silently taking the output device back** — re-asserting the
+  default sink is required for the EQ to reach anything, but it reverses a manual
+  change of output device every 5 s. The log now names the sink it took it back
+  from and says it will keep doing so.
+- **No loaded-conf identity, and shutdown dropping pending restarts** — closed by
+  the `loaded.conf` stamp described above.
 

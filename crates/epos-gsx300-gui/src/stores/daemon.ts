@@ -86,6 +86,13 @@ export interface DeviceStatus {
   daemon_version: string;
   device_connected: boolean;
   eq_active: boolean;
+  /**
+   * How many bands are actually in the EQ filter graph right now. Optional
+   * because it was added after the first Status shape: a GUI talking to an
+   * older daemon does not have it, and must not conclude the EQ is
+   * transparent when it is only missing the number.
+   */
+  eq_active_bands?: number;
   active_profile: string;
   mode: AudioMode;
   smart_button_action?: string;
@@ -189,6 +196,7 @@ export const useDaemonStore = defineStore("daemon", () => {
     daemon_version: "0.1.0",
     device_connected: true,
     eq_active: false,
+    eq_active_bands: 0,
     active_profile: FLAT_PROFILE_NAME,
     mode: mockMode as AudioMode,
     smart_button_action: "toggle_mode",
