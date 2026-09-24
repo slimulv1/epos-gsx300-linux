@@ -93,6 +93,16 @@ export interface DeviceStatus {
    * transparent when it is only missing the number.
    */
   eq_active_bands?: number;
+  /**
+   * The daemon's own verdict on whether the microphone is delivering audio.
+   * Distinct from `device_connected`, which only means the USB device is
+   * present. Optional because it was added after the first Status shape.
+   *
+   * Note: the Tauri microphone view already shows a real-time fail-closed
+   * signal readout from the backend's own meter, and deliberately does not
+   * duplicate it. This field exists for IPC consumers that have no meter.
+   */
+  mic_input?: "Signal" | "Silent" | "Unknown";
   active_profile: string;
   mode: AudioMode;
   smart_button_action?: string;

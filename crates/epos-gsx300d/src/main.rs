@@ -753,6 +753,14 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
             // healthy forever afterwards: nodes gone, units still `active`,
             // nothing logged. One shared node listing covers both.
             st.audio.maintain_instances().await;
+            // Microphone signal watchdog. Self-rate-limited to one short capture
+            // a minute, and only while a voice feature is engaged, because it
+            // opens the capture device. It reports rather than repairs: a muted
+            // capture element or a stale ALSA source belongs to the capture path,
+            // not to the DSP instances, so the honest thing to do is stop
+            // claiming that a microphone which is not delivering audio is a
+            // healthy one.
+            st.audio.maintain_mic_signal().await;
         }
 
         was_connected = is_connected;

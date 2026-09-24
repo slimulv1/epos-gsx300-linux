@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use epos_shared::config::{AudioConfig, EqConfig, VoiceMode};
+use epos_shared::ipc::MicInputState;
 use epos_shared::device::DeviceInfo;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -40,6 +41,29 @@ pub struct AudioPipeline {
     /// (`voice`, `sidetone`), keyed by role name. The EQ keeps its own counters
     /// because it also has route actions layered on top.
     role_health: Mutex<BTreeMap<String, RoleHealth>>,
+    /// Microphone signal watchdog: the probe state, what is currently being
+    /// reported, and when the last probe ran.
+    mic_watch: Mutex<MicWatch>,
+}
+
+/// Microphone signal watchdog bookkeeping.
+struct MicWatch {
+    state: MicWatchState,
+    /// What the daemon currently reports. Derived from the verdict, and tracked
+    /// separately so a log line is emitted on transitions only.
+    reported: MicInputState,
+    last_probe: Option<std::time::Instant>,
+}
+
+impl Default for MicWatch {
+    fn default() -> Self {
+        Self {
+            state: MicWatchState::default(),
+            // Honest default: not checked yet is not the same as healthy.
+            reported: MicInputState::Unknown,
+            last_probe: None,
+        }
+    }
 }
 
 /// Debounced restart bus: audio handlers record which epos instance(s) changed
@@ -146,6 +170,175 @@ pub const BAND_GAIN_LIMIT_DB: f32 = 24.0;
 pub const BAND_GAIN_EPSILON_DB: f32 = 0.1;
 pub const MAX_EQ_BANDS: usize = 32;
 
+// ── Microphone signal liveness ──────────────────────────────────────────
+//
+// Node-presence checks cannot tell a working microphone from a connected but
+// dead one: a muted capture element, a source that went stale after ALSA
+// re-enumerated, an ADC that stopped converting. `device_connected` stays true
+// through all of it.
+//
+// A level threshold is not an alternative, it is the same bug with extra steps.
+// A quiet room is not a broken microphone. Measured on this machine over 122
+// windows of 150 ms, a healthy mic in a silent room produced:
+//
+//   exact-zero fraction   min 0.03 %   median 0.15 %   max 0.31 %
+//   window peak           min 562      median 787      max 1086
+//
+// so the only safe discriminator is DIGITAL SILENCE — exact zeros from a stream
+// that is otherwise running. The threshold below sits ~160x above the worst
+// healthy window observed, which is the margin that makes an automatic verdict
+// safe to act on rather than merely plausible.
+
+/// Shortest window that can be judged: 30 ms at 48 kHz, the chunk size
+/// `mic_meter.rs` settled on from its own measurement.
+pub(crate) const MIC_MIN_WINDOW_SAMPLES: usize = 1440;
+
+/// Fraction of exact-zero samples that counts as digital silence.
+pub(crate) const MIC_SILENT_ZERO_FRACTION: f64 = 0.5;
+
+/// What a captured window of microphone audio says about the capture path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MicSignal {
+    /// The capture is delivering audio — at minimum the preamp noise floor, which
+    /// is present whether or not anyone is speaking.
+    Present,
+    /// The stream is running but carrying only exact zeros: connected, and
+    /// converting nothing.
+    Silent,
+    /// Not enough evidence either way. A capture stream hands over zeros while
+    /// the ADC is still waking up, so an early verdict would call every start
+    /// dead.
+    Unknown,
+}
+
+/// Judge one captured window of microphone samples.
+///
+/// The arithmetic lives here rather than at the call site so the threshold is
+/// testable against recorded real-world data instead of only reachable through
+/// a live device.
+pub(crate) fn classify_mic_window(samples: &[i16]) -> MicSignal {
+    if samples.len() < MIC_MIN_WINDOW_SAMPLES {
+        return MicSignal::Unknown;
+    }
+    let zeros = samples.iter().filter(|s| **s == 0).count();
+    if zeros as f64 / samples.len() as f64 >= MIC_SILENT_ZERO_FRACTION {
+        MicSignal::Silent
+    } else {
+        MicSignal::Present
+    }
+}
+
+/// Consecutive silent probes required before the microphone is called dead.
+///
+/// Three, at one probe a minute, means a dead capture is reported within about
+/// three minutes while a single glitch — a threshold edge, a stream starting
+/// late, a USB re-enumeration — can never produce the verdict on its own.
+pub(crate) const MIC_SILENT_PROBES: u32 = 3;
+
+/// Consecutive good probes required before a dead microphone is believed alive
+/// again.
+pub(crate) const MIC_RECOVERY_PROBES: u32 = 2;
+
+/// Per-probe state of the microphone signal watchdog.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct MicWatchState {
+    /// Consecutive probes that read digital silence. Reset by *any* good
+    /// reading, so two separate hiccups cannot accumulate into a verdict.
+    pub silent_probes: u32,
+    /// Consecutive probes that read audio, never reaching
+    /// `MIC_RECOVERY_PROBES` (it clears the state instead of overshooting).
+    pub present_probes: u32,
+    /// Sticky verdict. Set once silence has been sustained, and cleared only
+    /// after `MIC_RECOVERY_PROBES` consecutive good readings — so the reported
+    /// state never calls a dead microphone healthy on the strength of one lucky
+    /// window, which is the mirror image of the mistake this check exists to
+    /// avoid.
+    pub no_signal: bool,
+}
+
+/// The microphone signal watchdog's verdict after one probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MicWatchAction {
+    /// No evidence either way. Reported as "unknown" rather than as health,
+    /// because a probe that could not run must not be laundered into a verdict.
+    Undecided,
+    /// The capture is delivering audio.
+    Alive,
+    /// Digital silence, not yet sustained. Explicitly *not* a dead microphone:
+    /// this is the state that must never be reported as one.
+    Suspect,
+    /// Sustained digital silence — the capture path is connected and converting
+    /// nothing.
+    NoSignal,
+}
+
+/// Decode little-endian signed 16-bit samples.
+///
+/// A capture cut mid-sample leaves an odd trailing byte; it is dropped rather
+/// than read past the end of the buffer.
+fn decode_s16le(bytes: &[u8]) -> Vec<i16> {
+    bytes
+        .chunks_exact(2)
+        .map(|p| i16::from_le_bytes([p[0], p[1]]))
+        .collect()
+}
+
+/// Advance the microphone signal watchdog by one probe.
+///
+/// Pure, like [`role_health_action`], because the rule that matters is a
+/// threshold on top of a threshold: the classifier can be right about a window
+/// and the verdict can still be wrong if one reading is allowed to conclude
+/// something. Keeping that arithmetic out of the I/O path is what makes it
+/// testable at all.
+pub(crate) fn mic_watch_action(
+    signal: MicSignal,
+    state: MicWatchState,
+) -> (MicWatchState, MicWatchAction) {
+    match signal {
+        // A probe that could not run is not evidence in either direction.
+        MicSignal::Unknown => (state, MicWatchAction::Undecided),
+        MicSignal::Present => {
+            let present = state.present_probes + 1;
+            let (no_signal, present_probes) = if present >= MIC_RECOVERY_PROBES {
+                (false, 0)
+            } else {
+                (state.no_signal, present)
+            };
+            (
+                MicWatchState {
+                    // Any good reading clears the *accumulator*, so a later
+                    // silence starts counting from one again. It does not clear
+                    // the verdict — that is what `no_signal` is for.
+                    silent_probes: 0,
+                    present_probes,
+                    no_signal,
+                },
+                if no_signal {
+                    MicWatchAction::NoSignal
+                } else {
+                    MicWatchAction::Alive
+                },
+            )
+        }
+        MicSignal::Silent => {
+            let silent = state.silent_probes + 1;
+            let no_signal = state.no_signal || silent >= MIC_SILENT_PROBES;
+            (
+                MicWatchState {
+                    silent_probes: silent,
+                    present_probes: 0,
+                    no_signal,
+                },
+                if no_signal {
+                    MicWatchAction::NoSignal
+                } else {
+                    MicWatchAction::Suspect
+                },
+            )
+        }
+    }
+}
+
 /// How many bands are actually shaping the output.
 ///
 /// Reported alongside the EQ toggle because the two are independent questions.
@@ -251,6 +444,7 @@ impl AudioPipeline {
             eq_chain_missing_polls: AtomicU32::new(0),
             eq_chain_recovered_polls: AtomicU32::new(0),
             role_health: Mutex::new(BTreeMap::new()),
+            mic_watch: Mutex::new(MicWatch::default()),
         };
         // Same funnel as update_config, so a hand-edited config.json is bounded
         // at startup too and not only on later IPC updates.
@@ -394,6 +588,138 @@ impl AudioPipeline {
     /// [`Self::maintain_eq`], which additionally repairs the output route and
     /// rescues in-flight streams, and watching it here too would give it two
     /// independent opinions about the same instance.
+    /// What the daemon currently reports about the microphone's signal.
+    ///
+    /// Starts as `Unknown` and stays there until a probe has run, because "not
+    /// checked" and "checked and fine" are different claims and only one of them
+    /// is true before the first capture.
+    pub fn mic_input_state(&self) -> MicInputState {
+        self.mic_watch.lock().unwrap().reported
+    }
+
+    /// Open a short capture on the microphone and feed the watchdog one probe.
+    ///
+    /// Deliberately **not** on the 5 s hotplug tick's critical path and
+    /// deliberately not a restart. Two reasons:
+    ///
+    /// * It opens the capture device, so probing frequently would light the
+    ///   microphone's recording indicator and hold the device awake. It runs at
+    ///   most once a minute, for about a second.
+    /// * A restart cannot fix this. A muted capture element, a stale ALSA source
+    ///   and a dead ADC are all outside the DSP instances, and this daemon does
+    ///   not own the capture path. What it can do — and what it does — is stop
+    ///   reporting a microphone that is not there as a healthy one. Inventing a
+    ///   repair here would produce log noise and false confidence.
+    ///
+    /// Only runs while a voice feature is actually engaged. With the enhancer
+    /// and the gate both off, a silent microphone is a mute the user chose, and
+    /// there is no reason to keep waking the capture device to observe it.
+    pub async fn maintain_mic_signal(&self) {
+        if !self.voice_path_engaged() {
+            return;
+        }
+        {
+            let mut watch = self.mic_watch.lock().unwrap();
+            let due = watch
+                .last_probe
+                .is_none_or(|t| t.elapsed() >= MIC_PROBE_INTERVAL);
+            if !due {
+                return;
+            }
+            // Stamp before the probe, not after: a probe that hangs must not turn
+            // into a probe every tick.
+            watch.last_probe = Some(std::time::Instant::now());
+        }
+
+        let signal = self.probe_mic_signal().await;
+        let (next_state, action) = {
+            let watch = self.mic_watch.lock().unwrap();
+            mic_watch_action(signal, watch.state)
+        };
+
+        // A single silent probe is deliberately reported as Unknown, not as a
+        // dead microphone: the verdict has not been reached yet.
+        let report = match action {
+            MicWatchAction::Alive => MicInputState::Signal,
+            MicWatchAction::NoSignal => MicInputState::Silent,
+            MicWatchAction::Undecided | MicWatchAction::Suspect => MicInputState::Unknown,
+        };
+
+        let mut watch = self.mic_watch.lock().unwrap();
+        let changed = watch.reported != report;
+        watch.state = next_state;
+        watch.reported = report;
+        if changed {
+            match report {
+                MicInputState::Silent => warn!(
+                    "microphone capture is running but digitally silent after \
+                     {} consecutive probes - the device is present and the node \
+                     exists, but no audio is being converted. Check the capture \
+                     switch and the input source; applications will record \
+                     silence.",
+                    MIC_SILENT_PROBES
+                ),
+                MicInputState::Signal => info!("microphone input confirmed carrying audio"),
+                MicInputState::Unknown => info!(
+                    "microphone input not yet confirmed (a probe was inconclusive \
+                     or only a suspicion so far)"
+                ),
+            }
+        }
+    }
+
+    /// Is any voice feature actually processing the microphone?
+    fn voice_path_engaged(&self) -> bool {
+        self.config.noise_gate.enabled || self.config.voice_enhancer.mode != VoiceMode::Off
+    }
+
+    /// Capture a short window from the raw microphone and classify it.
+    ///
+    /// The **raw** source, never `epos-voice-output`. The question here is
+    /// whether the microphone is converting anything, and the processed node
+    /// cannot answer it: rnnoise legitimately outputs zeros while it suppresses,
+    /// which on this machine measured 34 % exact-zero samples on quiet room
+    /// tone. Judging that node against a 50 % threshold would report a perfectly
+    /// healthy microphone as intermittently dead.
+    async fn probe_mic_signal(&self) -> MicSignal {
+        let Some(source) = self
+            .device
+            .as_ref()
+            .map(|d| d.pipewire_source.as_str())
+            .filter(|s| !s.is_empty())
+        else {
+            return MicSignal::Unknown;
+        };
+        let bytes = match run_capture(
+            "parec",
+            &[
+                "--device",
+                source,
+                "--format=s16le",
+                "--rate=48000",
+                "--channels=1",
+            ],
+            MIC_CAPTURE_SAMPLES * 2,
+            MIC_CAPTURE_BUDGET,
+        )
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                debug!("microphone probe could not read samples: {e}");
+                return MicSignal::Unknown;
+            }
+        };
+        let samples = decode_s16le(&bytes);
+        // Discard the start of the stream. A capture hands over zeros while the
+        // ADC is still waking up, and judging those would call every probe dead.
+        let settle = (MIC_SETTLE.as_secs_f64() * 48_000.0) as usize;
+        if samples.len() <= settle {
+            return MicSignal::Unknown;
+        }
+        classify_mic_window(&samples[settle..])
+    }
+
     pub async fn maintain_instances(&self) {
         let Some(list) = Self::main_node_list().await else {
             // Unusable probe: no evidence, so nothing is counted or restarted.
@@ -445,8 +771,7 @@ impl AudioPipeline {
             .insert(role.to_string(), state);
     }
 
-    /// Move every stream currently attached to the EQ anchor onto the raw EPOS
-    /// sink.
+    /// Move every stream currently attached to the EQ anchor onto the raw EPOS    /// sink.
     ///
     /// `pactl set-default-sink` only steers streams created afterwards, so
     /// without this a long-running stream stays pinned to the dead anchor and
@@ -1511,6 +1836,90 @@ const PROBE_BUDGET: Duration = Duration::from_secs(5);
 /// every retry attempt. A role that cannot be verified in this window is
 /// reported unhealthy and the worker moves on to the next role.
 const RESTART_VERIFY_BUDGET: Duration = Duration::from_secs(12);
+
+/// Read up to `want` bytes from a command's stdout, bounded by a clock.
+///
+/// [`run_probe`] waits for the process to exit, which is the wrong shape for a
+/// capture tool: `parec` runs until it is killed, so waiting for exit would wait
+/// forever. This is bounded by both the byte target and the budget, and the
+/// child is killed before returning on every path — including the error ones —
+/// so a capture process can never outlive its probe and leave the microphone's
+/// indicator lit.
+///
+/// No shell is involved: the arguments are passed as a vector, so a device name
+/// is never interpreted.
+async fn run_capture(
+    program: &str,
+    args: &[&str],
+    want: usize,
+    budget: Duration,
+) -> Result<Vec<u8>, String> {
+    use tokio::io::AsyncReadExt;
+
+    let mut child = tokio::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("{program} could not start: {e}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("{program} gave no stdout pipe"))?;
+
+    let mut collected: Vec<u8> = Vec::with_capacity(want);
+    let mut chunk = vec![0u8; 8192];
+    let deadline = tokio::time::Instant::now() + budget;
+    while collected.len() < want {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, stdout.read(&mut chunk)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => collected.extend_from_slice(&chunk[..n]),
+            Ok(Err(e)) => {
+                let _ = child.kill().await;
+                return Err(format!("{program} read failed: {e}"));
+            }
+            Err(_) => break,
+        }
+    }
+    // Always stop it, whatever happened above. SIGKILL cannot be ignored, so this
+    // cannot hang the way a cooperative shutdown could.
+    let _ = child.kill().await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait())
+        .await
+        .ok();
+
+    if collected.is_empty() {
+        Err(format!("{program} produced no samples"))
+    } else {
+        Ok(collected)
+    }
+}
+
+/// How long to discard after opening the capture stream.
+///
+/// `mic_meter.rs` measured a burst of ADC-settling clicks in the first ~20
+/// samples on this hardware and skipped ~240 ms for that reason. Those clicks
+/// are non-zero so they cannot make a live microphone look silent; what matters
+/// is the other end of the problem — a capture hands over zeros while the
+/// converter is still waking up, and judging those would call every probe dead.
+const MIC_SETTLE: Duration = Duration::from_millis(240);
+
+/// Samples requested per probe: one second at 48 kHz. Only ~1/4 of that is
+/// actually judged, after the settle is dropped.
+const MIC_CAPTURE_SAMPLES: usize = 48_000;
+
+/// Wall-clock cap for one capture, comfortably above the byte target at 48 kHz.
+const MIC_CAPTURE_BUDGET: Duration = Duration::from_secs(5);
+
+/// Minimum gap between probes. Opening the capture device engages its recording
+/// indicator, so this is deliberately slow; with `MIC_SILENT_PROBES` a dead
+/// microphone is still reported within a few minutes.
+const MIC_PROBE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Result of a capped, non-interactive subprocess probe.
 #[derive(Debug, PartialEq, Eq)]
@@ -3160,5 +3569,330 @@ mod tests {
     fn an_unknown_default_sink_is_not_called_managed() {
         let raw = "alsa_output.usb-EPOS-00.analog-stereo";
         assert!(!sink_is_managed("", raw));
+    }
+
+    // ── Is the microphone actually delivering audio? ────────────────────────
+    //
+    // Every other liveness check in this daemon asks whether a node EXISTS. A
+    // node can exist and be connected and still carry nothing: a muted capture
+    // element, a source that went stale after a re-enumeration, an ADC that has
+    // stopped converting. `device_connected` stays true through all of it, so the
+    // status claims a working microphone that is not there.
+    //
+    // The obvious implementation — "is the level low?" — is unusable. A quiet
+    // room is not a broken microphone, and a level gate strong enough to catch
+    // digital silence would either ignore a genuinely dead mic or kill a working
+    // one during silence. Measured over 122 windows of 150 ms on this machine in
+    // a quiet room, a healthy microphone produced at most 0.31 % exact-zero
+    // samples (median 0.15 %) and never a window peak below 562. So the
+    // discriminator is DIGITAL SILENCE, not level: exact zeros from a stream
+    // that is otherwise running. That leaves roughly a 160x margin against the
+    // worst healthy window observed, which is the only kind of margin that makes
+    // an automatic verdict safe to act on.
+
+    /// The ordinary case: a quiet room still carries the preamp noise floor, so
+    /// the capture path is alive even though nobody is speaking.
+    #[test]
+    fn a_quiet_room_with_a_working_mic_is_present() {
+        // 1440 samples (30 ms at 48 kHz), the same chunk size mic_meter.rs
+        // settled on from measurement. Mostly small non-zero values, a few
+        // zeros, no large excursions.
+        let mut window: Vec<i16> = (0..MIC_MIN_WINDOW_SAMPLES)
+            .map(|i| if i % 7 == 0 { 0 } else { ((i * 37) % 400) as i16 - 200 })
+            .collect();
+        window[0] = -120;
+        assert_eq!(classify_mic_window(&window), MicSignal::Present);
+    }
+
+    /// The case that matters: the stream runs and delivers exact zeros, so
+    /// something is connected but nothing is being converted.
+    #[test]
+    fn digital_silence_is_reported_as_silent() {
+        let window = vec![0i16; MIC_MIN_WINDOW_SAMPLES * 2];
+        assert_eq!(classify_mic_window(&window), MicSignal::Silent);
+    }
+
+    /// The worst healthy window actually measured — 0.31 % zeros — must still
+    /// read as a working microphone. This is the false-positive guard, built
+    /// from the measurement rather than from the threshold, so widening the
+    /// safety margin later cannot quietly turn this into a failure.
+    #[test]
+    fn the_worst_measured_healthy_window_is_still_present() {
+        // 1440 samples, 4 of them zero = 0.28 %, inside the measured 0.31 %.
+        let mut window = vec![7i16; MIC_MIN_WINDOW_SAMPLES];
+        for i in 0..4 {
+            window[i] = 0;
+        }
+        assert_eq!(classify_mic_window(&window), MicSignal::Present);
+    }
+
+    /// A stream that has not delivered enough to judge must not be called
+    /// silent. A capture stream hands over zeros while the ADC is still waking
+    /// up, so an early verdict here would report a dead microphone on every
+    /// start.
+    #[test]
+    fn too_few_samples_is_unknown_not_silent() {
+        assert_eq!(classify_mic_window(&[]), MicSignal::Unknown);
+        let short = vec![0i16; MIC_MIN_WINDOW_SAMPLES - 1];
+        assert_eq!(
+            classify_mic_window(&short),
+            MicSignal::Unknown,
+            "one sample short of the minimum must not be judged"
+        );
+    }
+
+    /// The threshold itself, from both sides, so a change to the constant cannot
+    /// quietly become a level gate.
+    #[test]
+    fn the_silence_threshold_is_a_majority_not_a_level() {
+        // 100 samples is below the minimum, so build the boundary case at the
+        // minimum size: 50 % zeros is silent, just under is present.
+        let half_silent = MIC_MIN_WINDOW_SAMPLES / 2;
+        let mut over = vec![11i16; MIC_MIN_WINDOW_SAMPLES];
+        over[..half_silent].iter_mut().for_each(|s| *s = 0);
+        assert_eq!(classify_mic_window(&over), MicSignal::Silent);
+
+        let mut under = vec![11i16; MIC_MIN_WINDOW_SAMPLES];
+        under[..half_silent - 1].iter_mut().for_each(|s| *s = 0);
+        assert_eq!(classify_mic_window(&under), MicSignal::Present);
+    }
+
+    /// A single real sample in an otherwise silent window is not silence, but it
+    /// is also not much of a verdict. Pinned so the classifier is honest about
+    /// being a threshold rather than pretending to measure quality.
+    #[test]
+    fn a_lone_stray_sample_does_not_manufacture_a_verdict() {
+        let mut window = vec![0i16; MIC_MIN_WINDOW_SAMPLES * 4];
+        window[MIC_MIN_WINDOW_SAMPLES * 2] = 900;
+        assert_eq!(
+            classify_mic_window(&window),
+            MicSignal::Silent,
+            "one stray sample in a 120 ms window is still digital silence"
+        );
+    }
+
+    // ── From one silent reading to a verdict ───────────────────────────────
+    //
+    // A single silent probe must never be allowed to declare a dead microphone.
+    // The classifier is a threshold, thresholds have edges, and the cost of
+    // guessing wrong here is severe: the daemon would report a working headset
+    // as broken. So the verdict needs sustained evidence, an inconclusive probe
+    // is allowed to conclude nothing at all, and recovery needs consecutive good
+    // readings so a flapping capture cannot advertise a healthy mic that is
+    // mostly silent.
+
+    /// One silent reading is a suspicion, not a verdict. This is the single most
+    /// important rule here.
+    #[test]
+    fn one_silent_probe_never_declares_a_dead_microphone() {
+        let (state, action) = mic_watch_action(MicSignal::Silent, MicWatchState::default());
+        assert_eq!(action, MicWatchAction::Suspect);
+        assert_eq!(state.silent_probes, 1);
+        assert_ne!(action, MicWatchAction::NoSignal);
+    }
+
+    /// Sustained silence is eventually acted on, otherwise the check is useless.
+    #[test]
+    fn sustained_silence_is_finally_reported() {
+        let mut state = MicWatchState::default();
+        let mut verdict = MicWatchAction::Undecided;
+        for probe in 1..=MIC_SILENT_PROBES {
+            let (next, action) = mic_watch_action(MicSignal::Silent, state);
+            state = next;
+            verdict = action;
+            let expected = if probe >= MIC_SILENT_PROBES {
+                MicWatchAction::NoSignal
+            } else {
+                MicWatchAction::Suspect
+            };
+            assert_eq!(action, expected, "probe {probe}");
+        }
+        assert_eq!(verdict, MicWatchAction::NoSignal);
+    }
+
+    /// A verdict stays a verdict while the silence continues, so the caller can
+    /// report a stable state instead of flickering.
+    #[test]
+    fn the_verdict_is_stable_while_silence_continues() {
+        let mut state = MicWatchState::default();
+        for _ in 0..MIC_SILENT_PROBES {
+            state = mic_watch_action(MicSignal::Silent, state).0;
+        }
+        for extra in 0..5 {
+            let (next, action) = mic_watch_action(MicSignal::Silent, state);
+            state = next;
+            assert_eq!(
+                action,
+                MicWatchAction::NoSignal,
+                "probe {} after the threshold must not change the verdict",
+                extra + 1
+            );
+        }
+    }
+
+    /// One good reading in the middle clears the suspicion, so two separate
+    /// hiccups cannot add up to a dead microphone.
+    #[test]
+    fn a_single_good_reading_between_two_silent_ones_resets_the_count() {
+        let first = mic_watch_action(MicSignal::Silent, MicWatchState::default()).0;
+        let (after_present, present_action) = mic_watch_action(MicSignal::Present, first);
+        assert_eq!(present_action, MicWatchAction::Alive);
+        assert_eq!(
+            after_present.silent_probes, 0,
+            "a good reading must clear the silence count"
+        );
+        let (_, action) = mic_watch_action(MicSignal::Silent, after_present);
+        assert_eq!(action, MicWatchAction::Suspect, "the count starts again");
+    }
+
+    /// A probe that could not run says nothing, and must not push the count in
+    /// either direction — otherwise a failing capture tool slowly convicts a
+    /// working microphone.
+    #[test]
+    fn an_inconclusive_probe_moves_neither_counter() {
+        let before = MicWatchState {
+            silent_probes: 2,
+            present_probes: 1,
+            no_signal: false,
+        };
+        let (state, action) = mic_watch_action(MicSignal::Unknown, before);
+        assert_eq!(action, MicWatchAction::Undecided);
+        assert_eq!(state, before);
+    }
+
+    /// Recovery needs consecutive good readings. While the failure is still
+    /// being cleared, the verdict stays `NoSignal`: one lucky window must not be
+    /// able to announce a microphone that is still mostly silent, which would be
+    /// the same class of mistake as the one this whole check exists to prevent.
+    #[test]
+    fn recovery_needs_consecutive_good_readings() {
+        let mut state = MicWatchState::default();
+        for _ in 0..MIC_SILENT_PROBES {
+            state = mic_watch_action(MicSignal::Silent, state).0;
+        }
+        let (one, action) = mic_watch_action(MicSignal::Present, state);
+        assert_eq!(
+            action,
+            MicWatchAction::NoSignal,
+            "one good reading must not clear the verdict yet"
+        );
+        assert!(
+            one.no_signal,
+            "the sticky verdict survives a single good reading"
+        );
+        let (two, action) = mic_watch_action(MicSignal::Present, one);
+        assert_eq!(
+            action,
+            MicWatchAction::Alive,
+            "{} consecutive good readings clear the failure",
+            MIC_RECOVERY_PROBES
+        );
+        assert_eq!(two, MicWatchState::default());
+    }
+
+    /// The good-probe streak must not run away, or a capture that fails once an
+    /// hour would take an hour of healthy audio to be believed again.
+    #[test]
+    fn the_good_probe_streak_is_capped() {
+        let mut state = MicWatchState::default();
+        for _ in 0..(MIC_RECOVERY_PROBES * 10) {
+            let (next, action) = mic_watch_action(MicSignal::Present, state);
+            assert_eq!(action, MicWatchAction::Alive);
+            state = next;
+            assert!(
+                state.present_probes < MIC_RECOVERY_PROBES,
+                "the streak must reset at the threshold, not grow forever"
+            );
+        }
+    }
+
+    /// The thresholds have to mean something: a single-probe threshold would let
+    /// a single glitch declare a dead microphone, and a huge one would mean the
+    /// check never fires.
+    #[test]
+    fn the_verdict_needs_more_than_one_probe_and_fewer_than_many() {
+        assert!(MIC_SILENT_PROBES > 1, "one probe is not evidence");
+        assert!(
+            MIC_SILENT_PROBES <= 6,
+            "at one probe a minute this must still be noticed within minutes, \
+             not hours"
+        );
+        assert!(MIC_RECOVERY_PROBES > 1, "one good probe is not recovery");
+    }
+
+    /// The sticky verdict has to survive silence on BOTH sides of a single good
+    /// reading. This is the flapping case that a non-sticky implementation gets
+    /// wrong in the most misleading direction: the accumulator restarts at one,
+    /// so a naive threshold drops back to "suspect" and the report flips between
+    /// "no signal" and "unknown" while the microphone is still not delivering
+    /// anything. Recovering is supposed to take consecutive good readings, and
+    /// this is the only place that rule is actually exercised.
+    #[test]
+    fn a_flapping_capture_does_not_retract_the_verdict() {
+        let mut state = MicWatchState::default();
+        for _ in 0..MIC_SILENT_PROBES {
+            state = mic_watch_action(MicSignal::Silent, state).0;
+        }
+        assert!(state.no_signal);
+
+        // One good reading: the accumulator clears, the verdict does not.
+        let (after_good, action) = mic_watch_action(MicSignal::Present, state);
+        assert_eq!(action, MicWatchAction::NoSignal);
+        assert_eq!(
+            after_good.silent_probes, 0,
+            "the accumulator restarts so a later silence counts from one"
+        );
+
+        // And silence again must not demote the verdict back to a suspicion.
+        let (after_silence, action) = mic_watch_action(MicSignal::Silent, after_good);
+        assert_eq!(
+            action,
+            MicWatchAction::NoSignal,
+            "one good reading is not recovery; the report must stay stable \
+             instead of flickering between no-signal and unknown"
+        );
+        assert_eq!(after_silence.silent_probes, 1);
+
+        // Two consecutive good readings are what finally clears it.
+        let (one, _) = mic_watch_action(MicSignal::Present, after_silence);
+        let (two, action) = mic_watch_action(MicSignal::Present, one);
+        assert_eq!(action, MicWatchAction::Alive);
+        assert_eq!(two, MicWatchState::default());
+    }
+
+    /// Decoding sits between the wire and the classifier, so it gets tested too:
+    /// a decoder that silently dropped the wrong bytes would make every verdict
+    /// meaningless while still looking like it worked.
+    #[test]
+    fn s16le_bytes_decode_little_endian() {
+        // 0x0100 = 256, 0xFFFF = -1, 0x8000 = -32768.
+        let bytes = [0x00, 0x01, 0xFF, 0xFF, 0x00, 0x80];
+        assert_eq!(decode_s16le(&bytes), vec![256, -1, -32768]);
+    }
+
+    /// A capture cut mid-sample leaves an odd byte. Dropping it is correct;
+    /// reading past the end is not.
+    #[test]
+    fn a_truncated_capture_does_not_read_past_its_end() {
+        assert_eq!(decode_s16le(&[0x01, 0x00, 0x02]), vec![1]);
+        assert!(decode_s16le(&[]).is_empty());
+        assert!(decode_s16le(&[0x05]).is_empty());
+    }
+
+    /// The real end-to-end shape: a decoded window of true digital silence has
+    /// to reach the classifier as silence, and a decoded window of live audio as
+    /// present. This is the path the probe actually takes, minus the device.
+    #[test]
+    fn decoded_silence_and_decoded_audio_classify_apart() {
+        let silent: Vec<u8> = vec![0u8; MIC_MIN_WINDOW_SAMPLES * 2];
+        assert_eq!(classify_mic_window(&decode_s16le(&silent)), MicSignal::Silent);
+
+        let noisy: Vec<u8> = (0..MIC_MIN_WINDOW_SAMPLES)
+            .flat_map(|i| (((i * 37) % 400) as i16 - 200).to_le_bytes())
+            .collect();
+        assert_eq!(
+            classify_mic_window(&decode_s16le(&noisy)),
+            MicSignal::Present
+        );
     }
 }

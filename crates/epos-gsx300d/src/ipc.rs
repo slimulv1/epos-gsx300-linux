@@ -242,6 +242,7 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
                 device_connected: device.is_some(),
                 eq_active: state.config.audio.eq.enabled,
                 eq_active_bands: crate::audio::effective_eq_band_count(&state.config.audio.eq),
+                mic_input: state.audio.mic_input_state(),
                 active_profile: state.config.active_profile.clone(),
                 mode: state.config.mode,
                 smart_button_action: serde_json::to_string(&state.config.smart_button.action)

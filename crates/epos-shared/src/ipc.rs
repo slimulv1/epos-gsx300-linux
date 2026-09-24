@@ -3,6 +3,24 @@ use serde::{Deserialize, Serialize};
 use crate::config::{AudioConfig, AudioMode};
 use crate::device::DeviceInfo;
 
+/// What the daemon knows about the microphone's actual output.
+///
+/// `Unknown` is a real state, not a placeholder: it covers both "no probe has
+/// run yet" and "the last probe was inconclusive, or was only a suspicion", and
+/// collapsing it into `Signal` would be exactly the false confidence this type
+/// exists to remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MicInputState {
+    /// The capture is carrying audio — at minimum the preamp noise floor, which
+    /// is present whether or not anyone is speaking.
+    Signal,
+    /// The capture is running but digitally silent: connected, and converting
+    /// nothing.
+    Silent,
+    /// Not established.
+    Unknown,
+}
+
 /// IPC request from GUI → Daemon
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
@@ -84,6 +102,19 @@ pub enum Response {
         /// filtering, and there is no way to tell that apart from a real curve
         /// without this number.
         eq_active_bands: usize,
+        /// Whether the microphone is actually delivering audio.
+        ///
+        /// Separate from `device_connected`, which only means the USB device is
+        /// present. A muted capture element, a stale source after ALSA
+        /// re-enumerated, or a converter that has stopped working all leave the
+        /// device "connected" and every node published while applications record
+        /// silence — so without this the status cannot tell a working microphone
+        /// from a dead one.
+        ///
+        /// Starts as `Unknown` and only becomes `Signal` or `Silent` once a
+        /// capture has actually been judged, because "not checked" is not the
+        /// same claim as "checked and fine".
+        mic_input: MicInputState,
         active_profile: String,
         mode: AudioMode,
         smart_button_action: String,
