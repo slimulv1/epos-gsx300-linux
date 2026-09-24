@@ -222,6 +222,25 @@ pub struct IpcState {
     pub smart_button_seq: std::sync::atomic::AtomicU64,
 }
 
+/// Decide what to answer a client once persistence has been attempted.
+///
+/// Pure, so the two rules that matter can be pinned without a writable config
+/// directory: a change that made it to disk is answered with whatever the
+/// handler produced, and a change that did not is reported as an error rather
+/// than accepted. Before this, a save failure was only logged — the GUI showed
+/// the setting as applied and it silently vanished on the next restart.
+pub(crate) fn after_persist(response: &Response, saved: Result<(), String>) -> Response {
+    match saved {
+        Ok(()) => response.clone(),
+        Err(detail) => Response::Error {
+            message: format!(
+                "Applied in memory but could not be saved, so it will be lost \
+                 on restart: {detail}"
+            ),
+        },
+    }
+}
+
 /// What a pre-existing socket at the IPC path actually means.
 ///
 /// The path alone cannot tell these apart: a live daemon and a daemon that was
@@ -340,16 +359,21 @@ async fn handle_client(stream: UnixStream, state: Arc<RwLock<IpcState>>) -> Resu
 
         let response = handle_request(request, state.clone()).await;
 
-        send_response(&mut writer, &response).await?;
-
-        // Persist config only after mutating requests. Read-only requests
-        // (the GUI polls GetStatus every 3s) must not churn the file.
-        if response_should_persist(&response, is_mutation) {
+        // Persist BEFORE answering. The reply used to go out first and the
+        // `?` on the write returned early when a client disconnected mid-reply,
+        // so a change the daemon had already applied in RAM and in the pipeline
+        // was never written and vanished on restart. Saving first also means a
+        // failed save can still be reported to the client that asked.
+        //
+        // Read-only requests never write: the GUI polls GetStatus every 3s.
+        let response = if response_should_persist(&response, is_mutation) {
             let st = state.read().await;
-            if let Err(e) = crate::save_config(&st) {
-                warn!("Failed to save config: {}", e);
-            }
-        }
+            after_persist(&response, crate::save_config(&st).map_err(|e| e.to_string()))
+        } else {
+            response
+        };
+
+        send_response(&mut writer, &response).await?;
     }
 
     Ok(())
@@ -1155,13 +1179,14 @@ async fn process_http_body(
 
     let response = handle_request(request, state.clone()).await;
 
-    // Persist config after mutations (same rule as Unix socket)
-    if response_should_persist(&response, is_mutation) {
+    // Persist before answering, through the same rule and the same helper as the
+    // Unix socket, so the two paths cannot drift apart on what a client is told.
+    let response = if response_should_persist(&response, is_mutation) {
         let st = state.read().await;
-        if let Err(e) = crate::save_config(&st) {
-            warn!("Failed to save config (http): {}", e);
-        }
-    }
+        after_persist(&response, crate::save_config(&st).map_err(|e| e.to_string()))
+    } else {
+        response
+    };
 
     let json = serde_json::to_string(&response)?;
     write_http(&mut stream, 200, cors_origin.as_deref(), "", &json).await
@@ -1532,6 +1557,41 @@ mod tests {
         assert!(parse_request_head(b"").is_none());
         assert!(parse_request_head(b"not-a-request-line\r\n\r\n").is_none());
         assert!(parse_request_head(b"GET\r\n\r\n").is_none());
+    }
+
+    /// A save that failed must not be reported as a completed change. The value
+    /// is live in RAM and in the pipeline, but it is not on disk, so a restart
+    /// silently reverts it while the GUI shows it as accepted.
+    #[test]
+    fn a_failed_save_is_reported_rather_than_swallowed() {
+        let answer = after_persist(&Response::Ok, Err("No space left on device".to_string()));
+        match answer {
+            Response::Error { message } => {
+                assert!(
+                    message.contains("not be saved") || message.contains("not saved"),
+                    "the reason must say it was not saved: {message}"
+                );
+                assert!(
+                    message.contains("No space left"),
+                    "the underlying cause must survive: {message}"
+                );
+            }
+            other => panic!("a failed save must not answer Ok, got {other:?}"),
+        }
+    }
+
+    /// The success path is unchanged, including the payload the client asked
+    /// for — a GUI that asked to toggle mode still needs the new mode back.
+    #[test]
+    fn a_successful_save_answers_unchanged() {
+        assert!(matches!(
+            after_persist(&Response::Ok, Ok(())),
+            Response::Ok
+        ));
+        assert!(matches!(
+            after_persist(&Response::Mode(AudioMode::Surround71), Ok(())),
+            Response::Mode(AudioMode::Surround71)
+        ));
     }
 
     // ─── Deleting a profile ──────────────────────────────────
