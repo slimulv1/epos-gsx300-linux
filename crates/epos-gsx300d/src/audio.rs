@@ -865,11 +865,12 @@ impl AudioPipeline {
         // Only conclusive absences advance the miss counter, and only a clean
         // streak clears it. Resetting on the first good poll would let a
         // flapping chain defeat the retry cadence.
+        let mut recovered = 0;
         let missing = match outcome {
             ChainProbe::Present => {
-                if self.eq_chain_recovered_polls.fetch_add(1, Ordering::Relaxed) + 1
-                    >= RECOVERY_POLLS
-                {
+                recovered =
+                    self.eq_chain_recovered_polls.fetch_add(1, Ordering::Relaxed) + 1;
+                if recovered >= RECOVERY_POLLS {
                     self.eq_chain_missing_polls.store(0, Ordering::Relaxed);
                     self.eq_chain_recovered_polls.store(0, Ordering::Relaxed);
                 }
@@ -883,7 +884,11 @@ impl AudioPipeline {
             // the chain or trigger a restart.
             ChainProbe::Unknown => self.eq_chain_missing_polls.load(Ordering::Relaxed),
         };
-        let decision = eq_route_decision(outcome, missing);
+        // Whether anything is parked on raw right now is the difference between
+        // asserting a route and moving running audio, so the decision needs to
+        // know. Nothing is tracked yet, so this is always false today; the
+        // ledger that makes it true arrives with the return path.
+        let decision = eq_route_decision(outcome, missing, recovered, false);
 
         // The decision is the instruction. Routing used to be handed the raw
         // probe result instead, so the grace period below only delayed the log
@@ -2702,8 +2707,24 @@ pub(crate) struct EqRouteDecision {
 ///
 /// An `Unknown` probe is always `Hold`. That is the whole point of the
 /// distinction — a `pw-cli` hiccup must not bounce audio between two sinks.
-pub(crate) fn eq_route_decision(outcome: ChainProbe, missing_polls: u32) -> EqRouteDecision {
+pub(crate) fn eq_route_decision(
+    outcome: ChainProbe,
+    missing_polls: u32,
+    recovered_polls: u32,
+    streams_waiting_to_return: bool,
+) -> EqRouteDecision {
     match outcome {
+        // A single healthy poll is enough to leave the route alone, and it always
+        // was. It is not enough to *move the user's audio back onto the anchor*,
+        // because that is an action on running audio and a flapping chain would
+        // do it every other poll. With streams still parked on raw from a rescue,
+        // the alive side has to be confirmed the same way the dead side is.
+        ChainProbe::Present if streams_waiting_to_return && recovered_polls < RECOVERY_POLLS => {
+            EqRouteDecision {
+                action: EqRouteAction::Hold,
+                request_restart: false,
+            }
+        }
         ChainProbe::Present => EqRouteDecision {
             action: EqRouteAction::AssertAnchor,
             request_restart: false,
@@ -3965,7 +3986,7 @@ mod tests {
     /// A healthy chain is the only reason to sit on the anchor.
     #[test]
     fn eq_route_holds_the_anchor_while_the_chain_is_up() {
-        let d = eq_route_decision(ChainProbe::Present, 0);
+        let d = eq_route_decision(ChainProbe::Present, 0, RECOVERY_POLLS, false);
         assert_eq!(
             d.action,
             EqRouteAction::AssertAnchor,
@@ -4006,13 +4027,58 @@ mod tests {
     /// `pw-cli` hiccup from bouncing a user's audio between two sinks.
     #[test]
     fn an_unusable_probe_never_moves_the_route() {
-        let d = eq_route_decision(ChainProbe::Unknown, 3);
+        let d = eq_route_decision(ChainProbe::Unknown, 3, RECOVERY_POLLS, false);
         assert_eq!(
             d.action,
             EqRouteAction::Hold,
             "a timed-out probe is not evidence the chain is gone"
         );
         assert!(!d.request_restart, "and must not restart anything");
+    }
+
+    /// With streams still parked on raw from a rescue, one healthy poll must not
+    /// drag the user's audio back onto the anchor.
+    ///
+    /// Asserting the route is harmless; *moving running audio* is not, and it is
+    /// the same code path. A chain that flaps would otherwise haul the streams
+    /// back and forth every other poll — the behaviour that cost the user their
+    /// audio once already, from the other direction.
+    #[test]
+    fn one_healthy_poll_does_not_bring_streams_back() {
+        let d = eq_route_decision(ChainProbe::Present, 0, 1, true);
+        assert_eq!(
+            d.action,
+            EqRouteAction::Hold,
+            "one good poll must not move the user's audio"
+        );
+        assert!(!d.request_restart);
+    }
+
+    /// The other side: with nothing parked, one healthy poll is exactly as
+    /// responsive as it has always been.
+    #[test]
+    fn one_healthy_poll_still_asserts_when_no_stream_is_waiting() {
+        assert_eq!(
+            eq_route_decision(ChainProbe::Present, 0, 1, false).action,
+            EqRouteAction::AssertAnchor
+        );
+    }
+
+    /// Once the chain has been healthy for long enough, the streams come home.
+    #[test]
+    fn a_confirmed_recovery_brings_the_streams_back() {
+        let d = eq_route_decision(ChainProbe::Present, 0, RECOVERY_POLLS, true);
+        assert_eq!(d.action, EqRouteAction::AssertAnchor);
+    }
+
+    /// The dead side is unaffected: it is confirmed the same way, and a stream
+    /// waiting to come back does not soften that.
+    #[test]
+    fn a_waiting_stream_does_not_soften_the_dead_side() {
+        assert_eq!(
+            eq_route_decision(ChainProbe::Absent, 1, 0, true).action,
+            EqRouteAction::Hold
+        );
     }
 
     /// One absent poll is not acted on.
@@ -4025,7 +4091,7 @@ mod tests {
     /// loop ran repeatedly and the user lost sound to it.
     #[test]
     fn one_absent_poll_holds_and_asks_for_nothing() {
-        let d = eq_route_decision(ChainProbe::Absent, 1);
+        let d = eq_route_decision(ChainProbe::Absent, 1, RECOVERY_POLLS, false);
         assert_eq!(
             d.action,
             EqRouteAction::Hold,
@@ -4040,7 +4106,7 @@ mod tests {
     /// The second consecutive miss is the one that acts.
     #[test]
     fn a_second_absent_poll_rescues_playback() {
-        let d = eq_route_decision(ChainProbe::Absent, 2);
+        let d = eq_route_decision(ChainProbe::Absent, 2, RECOVERY_POLLS, false);
         assert_eq!(d.action, EqRouteAction::FallBackToRaw);
         assert!(d.request_restart, "a chain still absent now is worth a restart");
     }
@@ -4049,7 +4115,7 @@ mod tests {
     /// is unprocessed but audible. Silence is the worse failure.
     #[test]
     fn eq_route_falls_back_to_raw_after_the_grace_period() {
-        let d = eq_route_decision(ChainProbe::Absent, EQ_CHAIN_CONFIRM_POLLS);
+        let d = eq_route_decision(ChainProbe::Absent, EQ_CHAIN_CONFIRM_POLLS, RECOVERY_POLLS, false);
         assert_eq!(
             d.action,
             EqRouteAction::FallBackToRaw,
@@ -4063,27 +4129,27 @@ mod tests {
     #[test]
     fn eq_restarts_are_rate_limited() {
         assert!(
-            !eq_route_decision(ChainProbe::Absent, 1).request_restart,
+            !eq_route_decision(ChainProbe::Absent, 1, RECOVERY_POLLS, false).request_restart,
             "one bad read must not restart anything, or it causes its own next miss"
         );
         assert!(
-            eq_route_decision(ChainProbe::Absent, 2).request_restart,
+            eq_route_decision(ChainProbe::Absent, 2, RECOVERY_POLLS, false).request_restart,
             "a confirmed absence asks for a restart"
         );
         assert!(
-            !eq_route_decision(ChainProbe::Absent, 3).request_restart,
+            !eq_route_decision(ChainProbe::Absent, 3, RECOVERY_POLLS, false).request_restart,
             "and then not on every poll"
         );
         assert!(
-            !eq_route_decision(ChainProbe::Absent, 7).request_restart,
+            !eq_route_decision(ChainProbe::Absent, 7, RECOVERY_POLLS, false).request_restart,
             "not on an off-cadence poll either"
         );
         assert!(
-            eq_route_decision(ChainProbe::Absent, 8).request_restart,
+            eq_route_decision(ChainProbe::Absent, 8, RECOVERY_POLLS, false).request_restart,
             "a periodic retry is still wanted"
         );
         assert!(
-            eq_route_decision(ChainProbe::Absent, 14).request_restart,
+            eq_route_decision(ChainProbe::Absent, 14, RECOVERY_POLLS, false).request_restart,
             "and it keeps retrying slowly"
         );
     }
