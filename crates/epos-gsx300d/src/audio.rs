@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use epos_shared::config::{AudioConfig, EqConfig, VoiceMode};
 use epos_shared::ipc::MicInputState;
 use epos_shared::device::DeviceInfo;
+use crate::streams;
 use crate::sync::lock;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -1185,7 +1186,7 @@ impl AudioPipeline {
                 return Ok(Vec::new());
             }
         };
-        let streams: Vec<RescueStream> = match serde_json::from_str(&listing) {
+        let streams: Vec<streams::RescueStream> = match serde_json::from_str(&listing) {
             Ok(parsed) => parsed,
             Err(e) => {
                 warn!("sink-input JSON did not parse for the anchor rescue: {e}");
@@ -1193,7 +1194,7 @@ impl AudioPipeline {
             }
         };
         let mut moved = Vec::new();
-        for index in streams_to_rescue(&streams, anchor_index) {
+        for index in streams::streams_to_rescue(&streams, anchor_index) {
             match run_probe(
                 "pactl",
                 &["move-sink-input", &index.to_string(), raw_sink],
@@ -2931,51 +2932,9 @@ fn sink_index_of(listing: &str, sink_name: &str) -> Option<u32> {
 /// Parse `pactl list short sink-inputs` and return the indices of streams
 /// currently attached to `sink_index`.
 ///
-/// Needed because moving the default sink does not retarget streams that are
-/// already playing: a long-running stream stays pinned to `epos-eq-input` and
-/// stays silent after a fallback, so the fallback has to move it explicitly.
-/// One entry of `pactl -f json list sink-inputs`, as far as a rescue cares.
-///
-/// `#[serde(default)]` throughout, so a pactl that grows or drops a field still
-/// parses rather than turning a rescue into a parse error.
-#[derive(Debug, serde::Deserialize)]
-struct RescueStream {
-    index: u32,
-    sink: u32,
-    #[serde(default)]
-    properties: std::collections::HashMap<String, String>,
-}
-
-/// Node-name prefix for the streams the daemon owns itself.
-///
-/// A prefix rather than a fixed list, because the sidetone node only exists while
-/// the sidetone is on, and a list would be wrong the moment that changed.
-const OWN_NODE_PREFIX: &str = "epos-";
-
-/// Which streams to pull off a dead anchor.
-///
-/// The daemon's own streams are excluded by name, and this fixes a bug that was
-/// waiting to happen: `epos-eq-output` is the monitor that keeps the EQ chain
-/// draining and it sits on the anchor permanently. A rescue that moved it would
-/// stop the chain outright — causing the very outage the rescue exists to prevent,
-/// and then reporting that it had saved the audio.
-///
-/// Corked streams are included. An application that is open but quiet will be on
-/// the raw sink when it next speaks, which beats a per-application decision made
-/// at the moment of the failure.
-fn streams_to_rescue(streams: &[RescueStream], anchor_index: u32) -> Vec<u32> {
-    streams
-        .iter()
-        .filter(|s| s.sink == anchor_index)
-        .filter(|s| {
-            !s.properties
-                .get("node.name")
-                .is_some_and(|n| n.starts_with(OWN_NODE_PREFIX))
-        })
-        .map(|s| s.index)
-        .collect()
-}
-
+/// Test-only since `2d08b6d`: the rescue reads the JSON listing, because the
+/// short form has no node name and the node name is what tells the daemon's own
+/// streams from the user's. Kept as a check on the short form's column order.
 #[cfg(test)]
 fn sink_input_indices_on(listing: &str, sink_index: u32) -> Vec<u32> {
     let wanted = sink_index.to_string();
@@ -5363,45 +5322,6 @@ mod tests {
                 &[speakers.to_string(), raw.to_string()],),
             OutputDecision::Untouched
         );
-    }
-
-    // ─── Rescuing a dead anchor ─────────────────────────────────────
-
-    /// The daemon's own stream on the anchor is the monitor that keeps the chain
-    /// draining. Moving it stops the chain — which is the outage the rescue exists
-    /// to prevent, and by then the rescue cannot undo what it did.
-    #[test]
-    fn the_rescue_never_moves_the_daemons_own_stream() {
-        // Shapes taken from `pactl -f json list sink-inputs` on this machine.
-        let json = r#"[
-          {"index":38,"sink":33,"corked":false,"properties":{"node.name":"output.games_sink"}},
-          {"index":4835,"sink":33,"corked":false,"properties":{"node.name":"epos-eq-output"}},
-          {"index":168,"sink":33,"corked":false,"properties":{"node.name":"epos-sidetone-output"}}
-        ]"#;
-        let streams: Vec<RescueStream> = serde_json::from_str(json).expect("fixture parses");
-        assert_eq!(
-            streams_to_rescue(&streams, 33),
-            vec![38],
-            "the EQ monitor is what keeps the chain alive; it must not be moved"
-        );
-    }
-
-    /// A stream with no node name at all is still somebody's audio.
-    #[test]
-    fn a_nameless_stream_on_the_anchor_is_still_rescued() {
-        let streams: Vec<RescueStream> =
-            serde_json::from_str(r#"[{"index":7,"sink":33}]"#).expect("fixture parses");
-        assert_eq!(streams_to_rescue(&streams, 33), vec![7]);
-    }
-
-    /// Streams on other sinks are not ours to move.
-    #[test]
-    fn streams_elsewhere_are_left_alone_by_the_rescue() {
-        let streams: Vec<RescueStream> = serde_json::from_str(
-            r#"[{"index":7,"sink":74,"properties":{"node.name":"Firefox"}}]"#,
-        )
-        .expect("fixture parses");
-        assert!(streams_to_rescue(&streams, 33).is_empty());
     }
 
     // ─── Choosing where to go when leaving the EPOS ────────────────

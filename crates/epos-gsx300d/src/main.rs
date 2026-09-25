@@ -6,6 +6,7 @@ mod hid_io;
 mod hwinfo;
 mod ipc;
 mod led;
+mod streams;
 mod sync;
 
 use crate::audio::AudioPipeline;
