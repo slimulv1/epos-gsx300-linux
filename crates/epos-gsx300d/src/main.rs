@@ -800,11 +800,33 @@ async fn volume_watch_loop(state: Arc<RwLock<IpcState>>) {
 
         let st = state.write().await;
 
-        // The ceiling is applied before anything else, and it writes. A sink
-        // pushed past 100% by pavucontrol, the DE applet or `wpctl` has to come
-        // back, and the only place that can see it is here: `apply_volume`
-        // clamps what the daemon writes, and the read used to clamp on the way
-        // in, so outside callers had no path back.
+        // The ceiling, over every published sink rather than only the one
+        // playing. A cap that follows the default leaves every other device
+        // unlimited for as long as it is not the one making noise - and the user
+        // asked for the ceiling to cover all of them, EPOS included.
+        //
+        // One `pactl list sinks` covers the whole set; the per-sink write only
+        // happens for something actually over the line, so a healthy system pays
+        // one subprocess per tick and no writes at all.
+        if let Ok(listing) = run_status("pactl", &["list", "sinks"], COMMAND_BUDGET).await {
+            for (name, level) in sinks_to_cap(&listing, &sink) {
+                info!("sink {name} is at {level}%, above the 100% ceiling — pulling it back");
+                if let Err(detail) = run_status(
+                    "pactl",
+                    &["set-sink-volume", &name, "100%"],
+                    COMMAND_BUDGET,
+                )
+                .await
+                {
+                    warn!("could not pull {name} back to 100%: {detail}");
+                }
+            }
+        }
+
+        // The followed sink's own cap, kept separate because it also has to
+        // update the trackers below: a sink pushed past 100% by pavucontrol, the
+        // DE applet or `wpctl` has to come back, and `apply_volume` only clamps
+        // what the daemon itself writes.
         let capped = cap_sink_volume(raw);
         if let Some(level) = capped.write {
             info!("sink {sink} is at {raw}%, above the 100% ceiling — pulling it back");
@@ -1289,6 +1311,58 @@ pub fn chain_stage_to_apply(current: i32) -> Option<i32> {
     } else {
         Some(100)
     }
+}
+
+/// Every published sink whose volume is above 100%, as `(name, level)`.
+///
+/// `pactl list short sinks` carries no volume, so this reads the long form and
+/// takes each block's `Name` and the first `N%` of its `Volume` line. The first
+/// channel is deliberate: every sink PipeWire publishes has a front-left, and
+/// averaging the channels would hide a sink whose right channel was pushed
+/// over while the left was not.
+///
+/// Pure, and tested against output captured from this machine, because a parser
+/// that silently finds nothing is indistinguishable from a machine where no sink
+/// is over the ceiling - which is the failure this is here to prevent.
+pub fn sinks_over_cap(listing: &str) -> Vec<(String, i32)> {
+    let mut out = Vec::new();
+    let mut name: Option<String> = None;
+    for line in listing.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("Name: ") {
+            name = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("Volume: ") {
+            let Some(sink) = name.take() else { continue };
+            let Some(pct) = rest.split('/').nth(1) else {
+                continue;
+            };
+            let Ok(level) = pct.trim().trim_end_matches('%').trim().parse::<i32>() else {
+                continue;
+            };
+            if level > 100 {
+                out.push((sink, level));
+            }
+        }
+    }
+    out
+}
+
+/// The sinks the watcher has to pull back, excluding the one it follows.
+///
+/// The followed sink is excluded because it is capped by a separate path that
+/// also updates the trackers; writing it here as well would have the two writes
+/// race for no reason.
+///
+/// Split out from the watcher because the parser being correct is not the same
+/// claim as the caller acting on all of it. Testing `sinks_over_cap` alone
+/// proved a list of over-ceiling devices could be built and said nothing about
+/// whether every one of them got written - a mutation that narrowed this to the
+/// single playing sink passed the parser tests untouched.
+pub fn sinks_to_cap(listing: &str, followed: &str) -> Vec<(String, i32)> {
+    sinks_over_cap(listing)
+        .into_iter()
+        .filter(|(name, _)| name != followed)
+        .collect()
 }
 
 /// Decide whether a hand-edited `device.volume` should be put on the sink.
@@ -1827,6 +1901,137 @@ mod tests {
     //     playing last owned it. Moving from speakers at 20% onto the headset
     //     handed the headset the speakers' level, and the save worker wrote it
     //     back, so the next boot began "Volume restored to 20% at boot".
+
+    /// The ceiling covers every sink, not only the one playing.
+    ///
+    /// The first version capped the sink the daemon was following, which is the
+    /// default. That left every other device unlimited: playback on the headset,
+    /// and the speakers could sit at 150% indefinitely. A ceiling that applies to
+    /// one device is not a ceiling.
+    ///
+    /// Parsed against output captured from this machine rather than a shape
+    /// imagined for it - `pactl list short sinks` carries no volume at all, and
+    /// the long form puts every channel on one line.
+    #[test]
+    fn every_sink_over_the_ceiling_is_found_not_just_the_one_playing() {
+        // Captured verbatim from `pactl list sinks` here, with over-ceiling
+        // values set on two unrelated devices.
+        let listing = "\
+Sink #36
+\tState: IDLE
+\tName: games_sink
+\tVolume: front-left: 65536 / 100% / 0.00 dB,   front-right: 65536 / 100% / 0.00 dB
+\tBase Volume: 65536 / 100% / 0.00 dB
+Sink #60
+\tName: alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__SPDIF__sink
+\tVolume: front-left: 98304 / 150% / 10.61 dB,   front-right: 98304 / 150% / 10.61 dB
+Sink #61
+\tName: alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink
+\tVolume: front-left: 72089 / 110% / 1.64 dB,   front-right: 65536 / 100% / 0.00 dB
+Sink #26125
+\tName: epos-eq-processed
+\tVolume: front-left: 65536 / 100% / 0.00 dB,   front-right: 65536 / 100% / 0.00 dB
+";
+        assert_eq!(
+            sinks_over_cap(listing),
+            vec![
+                (
+                    "alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__SPDIF__sink".to_string(),
+                    150
+                ),
+                (
+                    "alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink".to_string(),
+                    110
+                ),
+            ],
+            "both over-ceiling devices must be found, whatever is playing"
+        );
+    }
+
+    /// A sink exactly at the ceiling is left alone, and a listing with nothing
+    /// over it yields nothing rather than every sink.
+    #[test]
+    fn a_sink_at_the_ceiling_is_not_treated_as_over_it() {
+        let listing = "\
+Sink #0
+\tName: at_ceiling
+\tVolume: front-left: 65536 / 100% / 0.00 dB,   front-right: 65536 / 100% / 0.00 dB
+Sink #1
+\tName: below
+\tVolume: front-left: 32768 / 50% / -18.06 dB,   front-right: 32768 / 50% / -18.06 dB
+";
+        assert!(sinks_over_cap(listing).is_empty());
+    }
+
+    /// Every over-ceiling sink is acted on, not only the one playing.
+    ///
+    /// This is the gap the parser tests could not see. They prove a list of
+    /// over-ceiling devices can be built; this proves the watcher acts on all of
+    /// it. A mutation that narrowed the watcher to the single followed sink
+    /// passed every parser test and would have left the speakers at 150% while
+    /// the user believed the ceiling covered the machine.
+    #[test]
+    fn the_watcher_acts_on_every_over_ceiling_sink_and_not_just_the_playing_one() {
+        let listing = "\
+Sink #0
+\tName: speakers
+\tVolume: front-left: 98304 / 150% / 10.61 dB
+Sink #1
+\tName: headphones
+\tVolume: front-left: 72089 / 110% / 1.64 dB
+Sink #2
+\tName: playing_now
+\tVolume: front-left: 98304 / 130% / 5.00 dB
+Sink #3
+\tName: quiet_one
+\tVolume: front-left: 32768 / 50% / -18.06 dB
+";
+        assert_eq!(
+            sinks_to_cap(listing, "playing_now"),
+            vec![
+                ("speakers".to_string(), 150),
+                ("headphones".to_string(), 110),
+            ],
+            "both idle devices over the ceiling must be written; the followed \
+             sink is handled by its own path and the quiet one is not touched"
+        );
+        // With a different sink playing, the followed one simply moves out of
+        // this list - the point is that the other two do not.
+        assert_eq!(
+            sinks_to_cap(listing, "quiet_one"),
+            vec![
+                ("speakers".to_string(), 150),
+                ("headphones".to_string(), 110),
+                ("playing_now".to_string(), 130),
+            ]
+        );
+    }
+
+    /// An unreadable volume is skipped, and cannot capture the next sink's name.
+    ///
+    /// The name is consumed rather than copied so a block whose `Volume:` failed
+    /// to parse cannot leave its name behind for the next reading. That is
+    /// defensive rather than observable - every block `pactl list sinks` prints
+    /// carries its own `Name:` line, which overwrites whatever was held - so
+    /// consuming and copying are equivalent on real output, and a mutation
+    /// between them is expected to survive. It is written this way so a future
+    /// caller that reads the two fields separately cannot reintroduce the leak.
+    #[test]
+    fn an_unreadable_volume_is_skipped_and_cannot_capture_the_next_sink() {
+        let listing = "\
+Sink #0
+\tName: broken
+\tVolume: not-a-number
+Sink #1
+\tName: over_the_line
+\tVolume: front-left: 98304 / 150% / 10.61 dB
+";
+        assert_eq!(
+            sinks_over_cap(listing),
+            vec![("over_the_line".to_string(), 150)],
+            "the over-ceiling sink must be reported under its own name"
+        );
+    }
 
     /// The chain's unaccounted-for stage is held at unity, and only when it is
     /// not already there.
