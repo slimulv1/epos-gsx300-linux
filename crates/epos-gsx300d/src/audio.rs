@@ -2600,6 +2600,21 @@ const EQ_OUTPUT_NAME: &str = "epos-eq-output";
 /// counter and defeats the retry cadence.
 const RECOVERY_POLLS: u32 = 2;
 
+/// Consecutive absent polls before the chain is believed.
+///
+/// This used to be 1, and the reason it is not is measured rather than argued. A
+/// single absent poll both moved playback to raw and asked for an instance
+/// restart — and restarting the instance is itself what makes the node absent for
+/// the next poll. So one bad read started a loop that kept re-triggering itself,
+/// and every iteration flipped the default between the anchor and raw, which
+/// WirePlumber answers by moving the user's streams back and forth with it. The
+/// user lost audio to it.
+///
+/// The cost is honest: a chain that is genuinely dead now takes one extra poll,
+/// five seconds, before playback is rescued. That is the trade — five seconds of
+/// silence once, instead of a loop that can take the audio away indefinitely.
+const EQ_CHAIN_CONFIRM_POLLS: u32 = 2;
+
 /// After the first conclusive absence, ask for an instance restart on this poll
 /// and then every `RESTART_RETRY_POLLS` polls. 6 polls = 30 s, so a chain
 /// that cannot start is retried without becoming a restart storm.
@@ -2679,12 +2694,21 @@ pub(crate) fn eq_route_decision(outcome: ChainProbe, missing_polls: u32) -> EqRo
             action: EqRouteAction::Hold,
             request_restart: false,
         },
+        ChainProbe::Absent if missing_polls < EQ_CHAIN_CONFIRM_POLLS => EqRouteDecision {
+            action: EqRouteAction::Hold,
+            request_restart: false,
+        },
         ChainProbe::Absent => EqRouteDecision {
             action: EqRouteAction::FallBackToRaw,
-            // First attempt immediately, then every `RESTART_RETRY_POLLS`
-            // polls (1, 7, 13, ...). Restarting the same broken instance every
-            // 5 s would be a storm; never restarting leaves the EQ dead.
-            request_restart: restart_due(missing_polls),
+            // Then every `RESTART_RETRY_POLLS` polls (2, 8, 14, ...). Restarting
+            // the same instance every 5 s would be a storm; never restarting
+            // leaves the EQ dead.
+            // The cadence is counted from the first *confirmed* miss, not from the
+            // first absent poll: otherwise the two unconfirmed polls eat two of the
+            // retry slots and the first restart would not come until poll 7. The
+            // shared helper is left alone because `voice` and `sidetone` have no
+            // confirm gate and must keep their own cadence.
+            request_restart: restart_due(missing_polls - EQ_CHAIN_CONFIRM_POLLS + 1),
         },
     }
 }
@@ -3930,23 +3954,41 @@ mod tests {
         assert!(!d.request_restart, "and must not restart anything");
     }
 
-    /// A conclusively absent chain is handled at once. Audio safety cannot wait
-    /// on a grace period: every extra poll is extra silence.
+    /// One absent poll is not acted on.
+    ///
+    /// This inverts a decision that was made deliberately, for the right reason at
+    /// the time — "audio safety cannot wait on a grace period" — and was wrong
+    /// anyway, because the action taken on that single poll is what destroyed the
+    /// audio. Acting means asking for an instance restart, and the restart is what
+    /// makes the next poll absent: the poll causes its own evidence. Measured, that
+    /// loop ran repeatedly and the user lost sound to it.
     #[test]
-    fn a_conclusive_absence_falls_back_immediately() {
+    fn one_absent_poll_holds_and_asks_for_nothing() {
         let d = eq_route_decision(ChainProbe::Absent, 1);
         assert_eq!(
             d.action,
-            EqRouteAction::FallBackToRaw,
-            "a confirmed dead chain must be left at once, not after a delay"
+            EqRouteAction::Hold,
+            "a single bad read must not move playback or restart a healthy instance"
         );
+        assert!(
+            !d.request_restart,
+            "a restart is what makes the next poll absent; it must not be self-triggering"
+        );
+    }
+
+    /// The second consecutive miss is the one that acts.
+    #[test]
+    fn a_second_absent_poll_rescues_playback() {
+        let d = eq_route_decision(ChainProbe::Absent, 2);
+        assert_eq!(d.action, EqRouteAction::FallBackToRaw);
+        assert!(d.request_restart, "a chain still absent now is worth a restart");
     }
 
     /// After the grace period the route must fall back to raw hardware, which
     /// is unprocessed but audible. Silence is the worse failure.
     #[test]
     fn eq_route_falls_back_to_raw_after_the_grace_period() {
-        let d = eq_route_decision(ChainProbe::Absent, 1);
+        let d = eq_route_decision(ChainProbe::Absent, EQ_CHAIN_CONFIRM_POLLS);
         assert_eq!(
             d.action,
             EqRouteAction::FallBackToRaw,
@@ -3960,23 +4002,27 @@ mod tests {
     #[test]
     fn eq_restarts_are_rate_limited() {
         assert!(
-            eq_route_decision(ChainProbe::Absent, 1).request_restart,
-            "the first conclusive absence asks for a restart"
+            !eq_route_decision(ChainProbe::Absent, 1).request_restart,
+            "one bad read must not restart anything, or it causes its own next miss"
         );
         assert!(
-            !eq_route_decision(ChainProbe::Absent, 2).request_restart,
-            "no restart on every poll"
+            eq_route_decision(ChainProbe::Absent, 2).request_restart,
+            "a confirmed absence asks for a restart"
         );
         assert!(
-            !eq_route_decision(ChainProbe::Absent, 6).request_restart,
+            !eq_route_decision(ChainProbe::Absent, 3).request_restart,
+            "and then not on every poll"
+        );
+        assert!(
+            !eq_route_decision(ChainProbe::Absent, 7).request_restart,
             "not on an off-cadence poll either"
         );
         assert!(
-            eq_route_decision(ChainProbe::Absent, 7).request_restart,
+            eq_route_decision(ChainProbe::Absent, 8).request_restart,
             "a periodic retry is still wanted"
         );
         assert!(
-            eq_route_decision(ChainProbe::Absent, 13).request_restart,
+            eq_route_decision(ChainProbe::Absent, 14).request_restart,
             "and it keeps retrying slowly"
         );
     }
