@@ -182,15 +182,6 @@ pub enum OutputRoute {
     Raw,
 }
 
-/// Decide which sink should be the PipeWire default, given the EQ toggle and
-/// whether the device is present.
-///
-/// `None` means "do not touch the default sink". While the EPOS is absent there
-/// is no `Raw` sink to point at, and forcibly claiming the default would yank
-/// audio away from whatever device the user is actually using.
-///
-/// Pure policy, deliberately free of I/O so it can be tested directly.
-
 /// One entry of `pactl -f json list sink-inputs`.
 ///
 /// Only the fields the routing decision needs. Every one is `#[serde(default)]`
@@ -265,8 +256,13 @@ pub enum ToggleOutcome {
     /// The sink list could not be read, so no choice could be made.
     CouldNotDecide,
 }
-  /// What to do with the default sink on this poll.
-  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What to do with the default sink on this poll.
+///
+/// Two of the three variants mean "leave the default alone", and they are not
+/// the same case: `Untouched` is the EPOS being absent, `RespectUserChoice` is
+/// the user having pointed the default somewhere that is neither of our sinks.
+/// They used to be a single `None`, and the function's own doc still said so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputDecision {
     /// Point the default sink at the given route.
     Set(OutputRoute),
@@ -298,6 +294,11 @@ pub enum OutputDecision {
 /// recording it. The cost of the inference was not complexity, it was wrongness:
 /// on a profile change it took the user from the speakers to the headset while
 /// they were on the speakers.
+///
+/// Leaving the default alone is a decision, not a failure, and it is two
+/// different ones: the EPOS being absent, and the user having pointed the
+/// default at a sink that is neither of ours. `OutputDecision` keeps those
+/// apart, and this is the reason that enum exists.
 pub fn desired_output_route(
     eq_enabled: bool,
     device_connected: bool,
@@ -3812,6 +3813,261 @@ mod tests {
             !between.contains("pub(crate) fn sink_index_to_name"),
             "the two doc comments have merged again: nothing separates the \
              name-to-index doc from the function above it"
+        );
+    }
+
+    /// The `///` lines sitting immediately above `item`, top to bottom, or `None`
+    /// if there is no doc comment directly above it.
+    ///
+    /// "Directly" is the entire point, and it is where `#[derive]` bites. A doc
+    /// comment is not attached to what follows it; it is attached to whatever
+    /// *item* comes next, and the blank line in between changes nothing. So a
+    /// comment that ends, then a blank line, then a comment, then a struct is
+    /// one merged doc comment on that struct - the blank line is invisible to
+    /// rustdoc. This function returns `None` for that arrangement on purpose: it
+    /// is precisely the case where a reader's eyes and the toolchain disagree
+    /// about which words belong to which item.
+    /// Byte offsets where one `///` block is followed by nothing but blank lines
+    /// and then another `///` line.
+    ///
+    /// A blank line between two doc comments separates them for a reader and
+    /// nothing at all for rustdoc, which collects `#[doc]` attributes up to the
+    /// next item regardless of the whitespace in between. So the two blocks are
+    /// one doc, and every word of the earlier one ends up describing whatever
+    /// came after the later one. Three separate doc comments in this file were
+    /// wrong this way and each was found by accident, which is the argument for
+    /// looking for the pattern rather than for the individual items.
+    ///
+    /// This finds the arrangement, not the damage, so it needs no list of what
+    /// each block was supposed to say. That is the point: a new stranded block
+    /// is caught the day it is written.
+    fn doc_blocks_split_by_a_blank_line(source: &str) -> Vec<usize> {
+        let lines: Vec<&str> = source.lines().collect();
+        let mut found = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.trim_start().starts_with("///") {
+                continue;
+            }
+            // Skip to the end of this block, then past any blank lines.
+            let mut j = i;
+            while lines.get(j).is_some_and(|l| l.trim_start().starts_with("///")) {
+                j += 1;
+            }
+            let mut k = j;
+            while lines.get(k).is_some_and(|l| l.trim().is_empty()) {
+                k += 1;
+            }
+            if k > j && lines.get(k).is_some_and(|l| l.trim_start().starts_with("///")) {
+                found.push(lines[..i].iter().map(|l| l.len() + 1).sum::<usize>());
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn no_doc_block_in_this_file_is_stranded_before_another_one() {
+        let source = include_str!("audio.rs");
+        let found = doc_blocks_split_by_a_blank_line(source);
+        assert!(
+            found.is_empty(),
+            "{} doc block(s) are separated from the next by a blank line, so \
+             rustdoc merges them onto whatever follows. Offsets: {found:?}",
+            found.len()
+        );
+    }
+
+    /// The check above is the one that would have caught all three, and it only
+    /// works if it recognises the arrangement on synthetic source.
+    #[test]
+    fn a_doc_block_stranded_before_another_is_recognised() {
+        let stranded = "/// First, about a function.\n\n/// Second, about a struct.\nstruct S {}\n";
+        assert_eq!(
+            doc_blocks_split_by_a_blank_line(stranded),
+            vec![0],
+            "one block, one blank line, another block: one merge, reported once"
+        );
+
+        let touching = "/// One block.\n///\n/// Still one block.\nstruct S {}\n";
+        assert!(
+            doc_blocks_split_by_a_blank_line(touching).is_empty(),
+            "a blank `///` line is a paragraph break inside one block, not a split"
+        );
+
+        let separated_by_item = "/// First.\nfn a() {}\n\n/// Second.\nfn b() {}\n";
+        assert!(
+            doc_blocks_split_by_a_blank_line(separated_by_item).is_empty(),
+            "an item between two blocks ends the first one; it is not stranded"
+        );
+    }
+
+    fn doc_block_above<'a>(source: &'a str, item: &str) -> Option<Vec<&'a str>> {
+        let before = source.get(..source.find(item)?)?.lines().rev();
+        let mut block: Vec<&str> = Vec::new();
+        for line in before {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("///") {
+                block.push(line);
+            } else if trimmed.starts_with("#[") {
+                // An attribute is still part of the item it sits on. A struct
+                // with a `#[derive]` between its doc and its `struct` keyword is
+                // the ordinary case, not the awkward one, and stopping here
+                // would report every derived type as undocumented.
+                continue;
+            } else {
+                break;
+            }
+        }
+        if block.is_empty() {
+            return None;
+        }
+        block.reverse();
+        Some(block)
+    }
+
+    /// A doc comment belongs to the item directly beneath it, or to nothing.
+    ///
+    /// Four arrangements, checked by hand on synthetic source so the rule is
+    /// pinned without needing a real defect to be present. The third is the one
+    /// that bit this file: a blank line between two doc comments does not
+    /// separate them, so both get merged onto the struct and the function above
+    /// keeps the tail of the lot.
+    #[test]
+    fn a_doc_comment_is_only_read_when_it_touches_the_item() {
+        let touching = "/// Does a thing.\n///\n/// It touches it.\nfn a() {}\n";
+        assert_eq!(
+            doc_block_above(touching, "fn a()"),
+            Some(vec!["/// Does a thing.", "///", "/// It touches it."]),
+            "a doc directly above an item is that item's doc, blank `///` lines \
+             included"
+        );
+
+        let blank_between = "/// Does a thing.\n\n/// One entry of a listing.\nstruct S {}\n";
+        assert_eq!(
+            doc_block_above(blank_between, "struct S"),
+            Some(vec!["/// One entry of a listing."]),
+            "a blank line does not detach the comment above it, it only splits the \
+             text: what reaches the struct is the nearest block, and the earlier \
+             lines are silently appended to the same doc"
+        );
+
+        let derived = "/// One entry of a listing.\n#[derive(Debug)]\nstruct S {}\n";
+        assert_eq!(
+            doc_block_above(derived, "struct S"),
+            Some(vec!["/// One entry of a listing."]),
+            "a derive attribute is part of the item, so the doc above it is \
+             still the doc of the struct"
+        );
+
+        let other_item_between = "/// Does a thing.\nconst K: u8 = 0;\nfn a() {}\n";
+        assert_eq!(
+            doc_block_above(other_item_between, "fn a()"),
+            None,
+            "a comment separated by another item is not this item's doc"
+        );
+
+        assert_eq!(
+            doc_block_above("fn a() {}\n", "fn a()"),
+            None,
+            "an undocumented item has no doc, and that is not an error here"
+        );
+    }
+
+    /// Neither of the two items whose docs got swapped has drifted back.
+    ///
+    /// `desired_output_route`'s doc was split: its first eight lines sat 109
+    /// lines earlier, above `struct SinkInput`, with a blank line and then that
+    /// struct's own doc. Rustdoc merged all of it, so `SinkInput` opened by
+    /// describing a function that decides which sink playback attaches to, and
+    /// `desired_output_route` opened with "One entry of
+    /// `pactl -f json list sink-inputs`". Neither had a correct description, and
+    /// nothing about it is a compile error or a test failure - the code is
+    /// perfect and the documentation is wrong, which is the hardest kind to
+    /// notice and the easiest to reintroduce.
+    ///
+    /// Asserting the opening line of each, rather than counting doc comments,
+    /// because the swap is what was wrong: both items were present and both had
+    /// text. Only whose text it is can tell.
+    #[test]
+    fn the_routing_function_and_the_pactl_struct_keep_their_own_docs() {
+        let source = include_str!("audio.rs");
+        // Built from pieces so this test does not contain the literal it looks
+        // for. The first version of the probe test matched its own pattern
+        // string and failed on three hits where there was one.
+        let route_fn = concat!("pub fn desired_output_route", "(");
+        let struct_line = concat!("struct SinkInput", " {");
+
+        let route_doc = doc_block_above(source, route_fn).unwrap_or_else(|| {
+            panic!("{route_fn} has no doc comment of its own immediately above it")
+        });
+        assert!(
+            route_doc[0].contains("Which sink the default"),
+            "the doc above desired_output_route opens with {:?}, which is not what \
+             this function does",
+            route_doc[0]
+        );
+
+        let struct_doc = doc_block_above(source, struct_line).unwrap_or_else(|| {
+            panic!("{struct_line} has no doc comment of its own immediately above it")
+        });
+        assert!(
+            struct_doc[0].contains("One entry of"),
+            "the doc above SinkInput opens with {:?}, which is the routing \
+             function's doc - the two have merged again",
+            struct_doc[0]
+        );
+    }
+
+    /// A doc comment may not promise a return value the function cannot return.
+    ///
+    /// `desired_output_route` returned `Option<OutputRoute>` until `bf5f918`
+    /// replaced that with an `OutputDecision` enum, because "the EPOS is absent"
+    /// and "the user chose a different device" are different facts and `None`
+    /// had been standing in for both. The enum was added; the sentence was not
+    /// touched. The doc went on explaining what `None` meant - that it means do
+    /// not touch the default sink - several hundred characters above a return
+    /// type with no `None` in it. The code was right and the doc described a
+    /// function that had not existed since the day before.
+    ///
+    /// The whole point is that no test could have caught this by behaviour, so it
+    /// is checked by reading: the claim, and the signature it claims about, are
+    /// both pinned here.
+    #[test]
+    fn a_doc_may_not_promise_a_return_value_that_is_gone() {
+        let source = include_str!("audio.rs");
+        let route_fn = concat!("pub fn desired_output_route", "(");
+        let doc = doc_block_above(source, route_fn).expect("the function is documented");
+        let text = doc.join("\n");
+
+        // The stale claim, gone.
+        assert!(
+            !text.contains("None"),
+            "the doc still explains what None means, but this returns \
+             OutputDecision: {}",
+            text
+        );
+        // And the signature it describes is the real one, so the sentence about
+        // leaving the default alone names a variant that exists.
+        assert!(
+            text.contains("OutputDecision"),
+            "the doc should say which decision type it returns, so a reader can \
+             check the sentence above it against the enum"
+        );
+        // Read the signature up to and including the line carrying the return
+        // type. The first version stopped before it, because that is the line
+        // with the opening brace on it - so it collected every parameter and not
+        // the one thing the test is about.
+        let body = &source[source.find(route_fn).expect("still there")..];
+        let mut signature = String::new();
+        for line in body.lines() {
+            signature.push_str(line);
+            if line.contains("->") {
+                break;
+            }
+        }
+        assert!(
+            signature.contains("-> OutputDecision"),
+            "the return type changed shape again; this test pins the old one: {}",
+            signature
         );
     }
 
