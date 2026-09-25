@@ -59,12 +59,73 @@
 
 ## Key Facts
 
-1. **Stereo only** — 7.1 is software-only (EPOS Gaming Suite, Windows only)
+1. **Stereo only** — 7.1 is software-only (EPOS Gaming Suite, Windows only).
+   See "7.1 Surround on Linux" below: it is a PC-side binaural DSP, not a
+   device mode, so the USB stream is 2 channels either way.
 2. **No 44.1kHz** — only 48kHz and 96kHz in USB descriptors
 3. **Volume dial** — local analog gain, no software sync on Linux
 4. **LED ring** — blue = stereo, red = surround (state persists from Windows)
 5. **Low power** — CX20988 is a headset codec, not a standalone DAC
 6. **Recommended impedance** — 25-75 ohm headphones
+
+### 7.1 Surround on Linux
+
+**The "7.1" is a Windows program, not a setting in the headset.**
+
+EPOS's own wording, for the record:
+
+- *"7.1 @ 16 bit 48 kHz **with EPOS Gaming Suite**"* (GSX 300 fact sheet)
+- *"proprietary 7.1 Surround Sound, created from extensive research into
+  **binaural** sound perception"* (Gaming Suite page)
+- *"The EPOS Software Suite and its **7.1 processing** only support 16-bit
+  audio"* (GSX 300 troubleshooting)
+- *"**SMART BUTTON assigns a command** to your device's smart button, letting
+  you switch between 2.0 stereo/7.1 surround or switch between your sound
+  profiles"* (Gaming Suite FAQ)
+
+So on Windows the Gaming Suite intercepts the stream, applies a binaural 7.1
+processor to it, sends the result as a **16-bit 48 kHz stereo** stream, drives
+the ring red, and programs what the smart button does. The device itself is
+handed stereo in both modes.
+
+**Measured on this unit, 2026-09-25.** The USB descriptor has exactly one
+playback streaming interface:
+
+```
+interface 1  Audio Streaming  bNrChannels = 1  EP 0x81 IN    (mic)
+interface 2  Audio Streaming  bNrChannels = 2  EP 0x01 OUT   (playback)
+```
+
+No 8-channel interface exists to select, and PipeWire publishes one EPOS sink,
+`analog-stereo`, `s24le 2ch`. This matches the fact sheet exactly: the GSX 300's
+output is a single 3.5 mm **headphone** jack.
+
+Earlier hardware work recorded the button pressing three times
+(`HARDWARE-BOOK.md` D2c) and the mode/LED **not persisting** — consistent with
+the button's function being assigned by the Windows software, so on Linux it has
+no valid assignment to carry out.
+
+**Consequence for this daemon.** `AudioMode` cannot change what is heard, on
+this hardware, on Linux. Nothing in the audio path reads it; it reaches only the
+LED colour, the `notify-send` text, and the config file. Two follow-ups that are
+*not* done yet, and are decisions rather than bugs:
+
+- The ring and the desktop notification report a mode that does not exist. See
+  the `SetMode` / `ToggleMode` handlers in `ipc.rs`.
+- No safe write path to the device was found. Report `0x04` is a **read** bus
+  (`[flags, len, addr_hi, addr_lo]`, flags `0x00` RAM / `0x20` EEPROM); reports
+  `0x06`/`0x07`/`0x1A` are the firmware/profile-write path and are hard-blocked
+  in `led.rs` because writing them risks bricking the unit.
+
+**Not the same on every GSX.** An Arch thread reports the GSX 1000 2nd Edition
+exposing a working 7.1 sink on PipeWire, because that unit presents an
+8-channel endpoint. The GSX 300 does not. Check the descriptor before assuming
+either way.
+
+**What was not tried:** sending speculative commands on report `0x04`. The bus is
+a memory read path and the neighbouring reports are flash writes; guessing at
+either risks the hardware, so the question stays open rather than being answered
+by experiment.
 
 ---
 
