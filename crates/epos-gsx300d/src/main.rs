@@ -95,7 +95,7 @@ async fn main() -> Result<()> {
     let mut audio = AudioPipeline::new(&config.audio);
     if let Some(ref d) = device {
         audio.set_device(d);
-        if let Err(e) = audio.apply_full().await {
+        if let Err(e) = audio.apply_full(config.mode).await {
             warn!("Failed to apply initial audio config: {}", e);
         }
         // Make the running instances a function of the config, deterministically.
@@ -319,7 +319,8 @@ async fn main() -> Result<()> {
                             crate::ipc::sync_active_profile(&mut st);
                             let audio_cfg = st.config.audio.clone();
                             st.audio.update_config(&audio_cfg);
-                            if let Err(e) = st.audio.apply_eq().await {
+                            let mode = st.config.mode;
+                            if let Err(e) = st.audio.apply_eq(mode).await {
                                 warn!("Failed to toggle EQ: {}", e);
                             }
                             if let Err(e) = save_config(&st) {
@@ -371,7 +372,9 @@ async fn main() -> Result<()> {
                                     st.sync_led();
                                     let audio_cfg = st.config.audio.clone();
                                     st.audio.update_config(&audio_cfg);
-                                    match st.audio.apply_full().await {
+                                    // Read the mode before the mutable borrow of `st.audio`.
+                                    let mode = st.config.mode;
+                                    match st.audio.apply_full(mode).await {
                                         // apply_full() already enqueues any required instance restart on the
                                         // RestartBus; `changed` only reports whether a conf actually differed.
                                         Ok(true) => debug!("audio conf changed - instance restart enqueued"),
@@ -856,7 +859,9 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
                     st.hw_info = hw;
                 }
                 st.audio.set_device(d);
-                match st.audio.apply_full().await {
+                // Read the mode before the mutable borrow of `st.audio`.
+                let mode = st.config.mode;
+                match st.audio.apply_full(mode).await {
                     // apply_full() already enqueues any required instance restart on the
                     // RestartBus; `changed` only reports whether a conf actually differed.
                     Ok(true) => debug!("audio conf changed - instance restart enqueued"),
@@ -942,7 +947,9 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
                         }
                         let audio_cfg = st.config.audio.clone();
                         st.audio.update_config(&audio_cfg);
-                        match st.audio.apply_full().await {
+                        // Read the mode before the mutable borrow of `st.audio`.
+                        let mode = st.config.mode;
+                        match st.audio.apply_full(mode).await {
                             Ok(true) => debug!("audio conf changed - instance restart enqueued"),
                             Ok(false) => debug!("audio conf unchanged - no instance restart"),
                             Err(e) => warn!("Failed to apply config on first connect: {}", e),
@@ -1375,7 +1382,9 @@ async fn config_watch_loop(state: Arc<RwLock<IpcState>>) {
         if audio_changed || active_profile_changed {
             let audio_cfg = st.config.audio.clone();
             st.audio.update_config(&audio_cfg);
-            match st.audio.apply_full().await {
+            // Read the mode before the mutable borrow of `st.audio`.
+            let mode = st.config.mode;
+            match st.audio.apply_full(mode).await {
                 // apply_full() already enqueues any required instance restart on the
                 // RestartBus; `changed` only reports whether a conf actually differed.
                 Ok(true) => debug!("audio conf changed - instance restart enqueued"),

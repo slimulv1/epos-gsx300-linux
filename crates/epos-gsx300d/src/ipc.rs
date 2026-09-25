@@ -539,7 +539,11 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
             if let Err(e) = state.audio.route_output().await {
                 warn!("Failed to route output after EQ change: {}", e);
             }
-            match state.audio.apply_eq().await {
+            // Read the mode before the mutable borrow: it is a Copy field of the
+            // config the pipeline is about to be handed, and the EQ conf is
+            // written from it.
+            let mode = state.config.mode;
+            match state.audio.apply_eq(mode).await {
                 Ok(changed) => {
                     // DSP confs are seeded per-role (pipewire-epos@eq) by
                     // write_instance_conf, which restarts only that instance.
@@ -748,7 +752,8 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
                 // would be silently ignored.
                 let audio_cfg = state.config.audio.clone();
                 state.audio.update_config(&audio_cfg);
-                match state.audio.apply_full().await {
+                let mode = state.config.mode;
+                match state.audio.apply_full(mode).await {
                     // apply_full() already enqueues any required instance restart on the
                     // RestartBus; `changed` only reports whether a conf actually differed.
                     Ok(true) => debug!("audio conf changed - instance restart enqueued"),
@@ -837,7 +842,8 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
                     let audio_cfg = state.config.audio.clone();
                     state.audio.update_config(&audio_cfg);
                       state.sync_led();
-                    match state.audio.apply_full().await {
+                    let mode = state.config.mode;
+                    match state.audio.apply_full(mode).await {
                         // apply_full() already enqueues any required instance restart on the
                         // RestartBus; `changed` only reports whether a conf actually differed.
                         Ok(true) => debug!("audio conf changed - instance restart enqueued"),
@@ -905,7 +911,8 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
                     // SetActiveProfile above.
                     let audio_cfg = state.config.audio.clone();
                     state.audio.update_config(&audio_cfg);
-                    match state.audio.apply_full().await {
+                    let mode = state.config.mode;
+                    match state.audio.apply_full(mode).await {
                         // apply_full() already enqueues any required instance restart on the
                         // RestartBus; `changed` only reports whether a conf actually differed.
                         Ok(true) => debug!("audio conf changed - instance restart enqueued"),

@@ -1761,7 +1761,10 @@ impl AudioPipeline {
 
     /// Apply the full audio config (EQ, mic gain, sidetone, noise gate, voice).
     /// Returns which of the three epos instances need a restart.
-    pub async fn apply_full(&mut self) -> Result<bool> {
+    pub async fn apply_full(
+        &mut self,
+        mode: epos_shared::config::AudioMode,
+    ) -> Result<bool> {
         // A mic-gain failure must not abort the rest. `usable_alsa_card(None)`
         // is an error while USB has enumerated but ALSA has not, and letting
         // that propagate with `?` meant no EQ/voice/sidetone conf was written
@@ -1773,7 +1776,7 @@ impl AudioPipeline {
             warn!("Mic gain not applied: {e}");
         }
         let mut changed = false;
-        changed |= self.write_eq_conf()?;
+        changed |= self.write_eq_conf_for(mode)?;
         changed |= self.write_voice_conf()?;
         changed |= self.write_sidetone_conf()?;
         // WirePlumber's device.restore-routes replays the saved input
@@ -1815,10 +1818,15 @@ impl AudioPipeline {
 
     /// Apply configuration and device together
     #[allow(dead_code)]
-    pub async fn apply(&mut self, config: &AudioConfig, device: &DeviceInfo) -> Result<()> {
+    pub async fn apply(
+          &mut self,
+          config: &AudioConfig,
+          device: &DeviceInfo,
+          mode: epos_shared::config::AudioMode,
+      ) -> Result<()> {
         self.config = config.clone();
         self.device = Some(device.clone());
-        self.apply_full().await?;
+        self.apply_full(mode).await?;
         Ok(())
     }
 
@@ -2293,15 +2301,29 @@ impl AudioPipeline {
     // to the EPOS hardware sink. Kill the instance → sink vanishes → pinned
     // streams go silent (fail-closed), A2+ untouched.
 
-    fn write_eq_conf(&self) -> Result<bool> {
+    fn write_eq_conf_with_mode(&self, mode: epos_shared::config::AudioMode) -> Result<bool> {
         let (sink, _src) = self.node_names();
         let bands = if self.config.eq.enabled {
             self.config.eq.bands.as_slice()
         } else {
             &[]
         };
-        let eq_conf = generate_eq_instance_conf(bands, &sink);
+        let eq_conf = generate_eq_instance_conf(bands, &sink, mode);
         self.write_instance_conf("eq", &eq_conf)
+    }
+
+    /// Write the eq instance conf using the mode the pipeline already holds.
+    ///
+    /// The mode is a property of the active profile, and the pipeline's own
+    /// `config` is the `AudioConfig` subsection of it - it has no mode, and
+    /// inventing a second source of truth here is how the renderer and the LED
+    /// would end up disagreeing about what mode the headset is in. Callers pass
+    /// the mode they already have.
+    pub(crate) fn write_eq_conf_for(
+        &self,
+        mode: epos_shared::config::AudioMode,
+    ) -> Result<bool> {
+        self.write_eq_conf_with_mode(mode)
     }
 
     /// Apply EQ from config — write the eq instance conf.
@@ -2312,8 +2334,8 @@ impl AudioPipeline {
     /// values, so the UI showed the new EQ but the mic sounded unchanged.
     ///
     /// Returns true if either on-disk conf changed (restart needed).
-    pub async fn apply_eq(&mut self) -> Result<bool> {
-        let mut changed = self.write_eq_conf()?;
+    pub async fn apply_eq(&mut self, mode: epos_shared::config::AudioMode) -> Result<bool> {
+        let mut changed = self.write_eq_conf_for(mode)?;
         if self.config.voice_enhancer.mode == VoiceMode::Custom {
             changed |= self.write_voice_conf()?;
         }
@@ -2502,54 +2524,131 @@ context.objects = [
     )
 }
 
-/// Generate the `eq` instance conf: 9-band EQ filter-chain that captures the
-/// MAIN null-sink monitor `epos-eq-input.monitor` (the static fail-closed
-/// anchor installed once at install time) and plays the processed audio to the
-/// EPOS hardware sink. Apps keep targeting `epos-eq-input`; if this instance
-/// dies, the anchor sink remains → streams stay silent, never routed to A2+.
-/// Flat bands → passthrough `copy` node so the path always flows.
-fn generate_eq_instance_conf(bands: &[epos_shared::config::EqBand], sink: &str) -> String {
+/// Generate the `eq` instance conf: 9-band EQ filter-chain that captures into
+/// `epos-eq-processed` (an `Audio/Sink`, so apps target it and it keeps
+/// existing) and plays the processed audio to the EPOS hardware sink. Flat
+/// bands → passthrough `copy` node so the path always flows.
+///
+/// In `Surround71` the chain ends in the binaural 7.1 renderer instead, and the
+/// graph has to be built differently rather than merely extended:
+///
+/// * **Two biquad chains, not one.** Declaring `inputs`/`outputs` explicitly
+///   turns off filter-chain's per-channel graph duplication - which is what
+///   lets the stereo pair reach the renderer together. A shared chain would then
+///   apply one ear's correction to both.
+/// * **Explicit `inputs`/`outputs`.** Without them the graph is duplicated once
+///   per channel, so a stereo source is split into two mono paths and the
+///   renderer never sees a pair.
+/// * **The renderer's own names.** `label =` is the LADSPA descriptor's `Label`
+///   (what `find_desc()` compares) and the link targets are `PortNames[]`
+///   entries (what `ports[i].name` is set from). The human-facing port labels
+///   are not reachable from a conf.
+fn generate_eq_instance_conf(
+    bands: &[epos_shared::config::EqBand],
+    sink: &str,
+    mode: epos_shared::config::AudioMode,
+) -> String {
+    use epos_shared::config::AudioMode;
+
+    let surround = mode == AudioMode::Surround71;
+
     let mut nodes = String::new();
     let mut links = String::new();
-    let mut prev: Option<String> = None;
-    let mut active = 0usize;
 
     // Sanitised: the EQ bands arrive from the client and from config.json.
-    for (i, (freq, gain, q)) in sanitize_bands(bands).into_iter().enumerate() {
-        let name = format!("eq_band_{i}");
-        nodes.push_str(&format!(
-            r#"
+    let sanitized = sanitize_bands(bands);
+    let active = sanitized.len();
+
+    // One chain in stereo, one per ear in 7.1. See the note on the function.
+    let ears: &[&str] = if surround { &["l", "r"] } else { &[""] };
+    for ear in ears {
+        let mut prev: Option<String> = None;
+        for (i, (freq, gain, q)) in sanitized.iter().enumerate() {
+            let name = if ear.is_empty() {
+                format!("eq_band_{i}")
+            } else {
+                format!("eq_{ear}_{i}")
+            };
+            nodes.push_str(&format!(
+                r#"
                     {{
                         type  = builtin
                         name  = "{name}"
                         label = bq_peaking
                         control = {{ "Freq" = {freq} "Q" = {q} "Gain" = {gain} }}
                     }}"#,
-            freq = freq,
-            q = q,
-            gain = gain,
-        ));
-        if let Some(p) = prev.take() {
-            links.push_str(&format!(
-                r#"
-                    {{ output = "{p}:Out" input = "{name}:In" }}"#,
-                p = p,
-                name = name
+                freq = freq,
+                q = q,
+                gain = gain,
             ));
+            if let Some(p) = prev.take() {
+                links.push_str(&format!(
+                    r#"
+                    {{ output = "{p}:Out" input = "{name}:In" }}"#,
+                    p = p,
+                    name = name
+                ));
+            }
+            prev = Some(name);
         }
-        prev = Some(name);
-        active += 1;
     }
 
     if active == 0 {
         // Passthrough — EQ off / all flat: keep the path flowing.
-        nodes.push_str(
-            r#"
-                    { type = builtin name = passthrough label = copy }"#,
-        );
+        for ear in ears {
+            let name = if ear.is_empty() {
+                "passthrough".to_string()
+            } else {
+                format!("passthrough_{ear}")
+            };
+            nodes.push_str(&format!(
+                r#"
+                    {{ type = builtin name = "{name}" label = copy }}"#,
+                name = name
+            ));
+        }
     } else {
         info!("EQ: {} active band(s)", active);
     }
+
+    // The graph's entry and exit ports. In stereo these are omitted, which is
+    // what has always made filter-chain duplicate the graph per channel. In 7.1
+    // they are mandatory, and declaring them is the whole reason the renderer
+    // works: a duplicated graph is a pair of mono paths, and a binaural renderer
+    // fed one channel at a time has no stereo image to place.
+    let (graph_inputs, graph_outputs) = if surround {
+        let last = active.saturating_sub(1);
+        let (in_l, out_l) = if active == 0 {
+            ("passthrough_l:Out".to_string(), "surround:input_left".to_string())
+        } else {
+            (format!("eq_l_{last}:Out"), "surround:input_left".to_string())
+        };
+        let (in_r, out_r) = if active == 0 {
+            ("passthrough_r:Out".to_string(), "surround:input_right".to_string())
+        } else {
+            (format!("eq_r_{last}:Out"), "surround:input_right".to_string())
+        };
+        links.push_str(&format!(
+            r#"
+                    {{ output = "{in_l}" input = "{out_l}" }}
+                    {{ output = "{in_r}" input = "{out_r}" }}"#
+        ));
+        nodes.push_str(
+            r#"
+                    {
+                        type   = ladspa
+                        name   = surround
+                        plugin = "epos-surround"
+                        label  = "EPOS 7.1 Binaural Surround"
+                    }"#,
+        );
+        (
+            "inputs  = [ \"eq_l_0:In\" \"eq_r_0:In\" ]".to_string(),
+            "outputs = [ \"surround:output_left\" \"surround:output_right\" ]".to_string(),
+        )
+    } else {
+        (String::new(), String::new())
+    };
 
     // NOTE: the EQ capture side deliberately has NO `node.dont-fallback`.
     //
@@ -2573,6 +2672,8 @@ fn generate_eq_instance_conf(bands: &[epos_shared::config::EqBand], sink: &str) 
             ]
             links = [{links}
             ]
+            {graph_inputs}
+            {graph_outputs}
         }}
         audio.channels = 2
         audio.position = [ FL FR ]
@@ -2597,6 +2698,8 @@ fn generate_eq_instance_conf(bands: &[epos_shared::config::EqBand], sink: &str) 
         sink_description = EQ_SINK_DESCRIPTION,
         nodes = nodes,
         links = links,
+        graph_inputs = graph_inputs,
+        graph_outputs = graph_outputs,
     );
     instance_base_conf("eq", &module)
 }
@@ -4072,7 +4175,7 @@ mod tests {
     /// never fail and verified nothing.
     #[test]
     fn eq_role_with_passthrough_graph_expects_no_node() {
-        let conf = generate_eq_instance_conf(&[], "sink");
+        let conf = generate_eq_instance_conf(&[], "sink", epos_shared::config::AudioMode::Stereo);
         assert!(
             !conf.contains("eq_band_"),
             "sanity: an empty band list must produce a passthrough graph"
@@ -4096,6 +4199,7 @@ mod tests {
                 q: 1.0,
             }],
             "sink",
+            epos_shared::config::AudioMode::Stereo,
         );
         assert!(conf.contains("eq_band_"), "sanity: the band must reach the graph");
         assert_eq!(eq_expected_node(&conf), Some(EQ_SINK_NAME));
@@ -4181,7 +4285,7 @@ mod tests {
 
     fn sample_filter_chain_confs() -> [(&'static str, String); 2] {
         [
-            ("eq", generate_eq_instance_conf(&[], "sink")),
+            ("eq", generate_eq_instance_conf(&[], "sink", epos_shared::config::AudioMode::Stereo)),
             (
                 "voice",
                 generate_voice_instance_conf("source", false, 50.0, &VoiceMode::Off, &[]),
@@ -4231,7 +4335,7 @@ mod tests {
     /// it the chain runs and the band shapes the output.
     #[test]
     fn eq_capture_side_never_sets_dont_fallback() {
-        let conf = generate_eq_instance_conf(&[], "sink");
+        let conf = generate_eq_instance_conf(&[], "sink", epos_shared::config::AudioMode::Stereo);
         let capture = conf
             .split("capture.props")
             .nth(1)
@@ -4248,7 +4352,7 @@ mod tests {
     /// sink if the headset disappears.
     #[test]
     fn eq_playback_side_keeps_dont_fallback() {
-        let conf = generate_eq_instance_conf(&[], "sink");
+        let conf = generate_eq_instance_conf(&[], "sink", epos_shared::config::AudioMode::Stereo);
         let playback = conf
             .split("playback.props")
             .nth(1)
@@ -4477,6 +4581,275 @@ mod tests {
             OutputDecision::Untouched);
     }
 
+    /// Write the generated conf to a path for the real loader to try.
+    ///
+    /// Every other test here inspects the string. That cannot see a syntax
+    /// PipeWire rejects, and a rejected graph is not a degraded EQ - the module
+    /// fails to load, the instance dies, and the chain is silent. This exists so
+    /// the generated text can be handed to the actual thing:
+    ///
+    ///   cargo test -p epos-gsx300d dump_eq_confs
+    ///   cp /tmp/epos-eq-*.conf ~/.config/pipewire-epos/eq/pipewire.conf
+    ///   systemctl --user restart pipewire-epos@eq
+    ///
+    #[test]
+    fn dump_eq_confs() {
+        let bands: Vec<epos_shared::config::EqBand> = [64.0, 1000.0, 8000.0]
+            .iter()
+            .map(|f| epos_shared::config::EqBand {
+                freq: *f as u32,
+                gain_db: 3.0,
+                q: 1.0,
+            })
+            .collect();
+        for (name, mode) in [
+            ("surround71", epos_shared::config::AudioMode::Surround71),
+            ("stereo", epos_shared::config::AudioMode::Stereo),
+        ] {
+            // The real, serial-bearing ALSA node name. A placeholder like "sink"
+            // produces a conf that is syntactically fine and passes every string
+            // assertion, and then publishes nothing at all: the playback stream's
+            // target does not exist, so the chain never reaches MAIN and
+            // `epos-eq-processed` never appears. That is exactly what happened the
+            // first time this conf was handed to PipeWire.
+            let conf = generate_eq_instance_conf(
+                &bands,
+                crate::devices::EPOS_SINK_FALLBACK,
+                mode,
+            );
+            let path = format!("/tmp/epos-eq-{name}.conf");
+            std::fs::write(&path, conf).expect("write conf");
+            println!("  wrote {path}");
+        }
+    }
+
+    /// The playback target must be a node that exists, and a conf saying
+    /// otherwise is the most expensive kind of wrong: it is valid syntax, it
+    /// passes every substring assertion in this file, the instance starts, the
+    /// module loads, and no audio comes out and no `epos-eq-processed` node ever
+    /// appears. Nothing in the log says why.
+    ///
+    /// It cost a full round trip to find once - a hand-built conf with the real
+    /// node name ran, and a generator-built one with the literal "sink" did not,
+    /// with the graph otherwise byte-identical apart from the band count.
+    #[test]
+    fn the_eq_conf_targets_a_real_sink_not_a_placeholder() {
+        let conf = generate_eq_instance_conf(
+            &[epos_shared::config::EqBand {
+                freq: 1000,
+                gain_db: 6.0,
+                q: 1.0,
+            }],
+            crate::devices::EPOS_SINK_FALLBACK,
+            epos_shared::config::AudioMode::Surround71,
+        );
+        assert!(
+            conf.contains(crate::devices::EPOS_SINK_FALLBACK),
+            "the generated conf must target the real EPOS sink node name:\n{conf}"
+        );
+        for placeholder in ["target.object = \"sink\"", "target.object = \"\""] {
+            assert!(
+                !conf.contains(placeholder),
+                "{placeholder} names no node. The playback stream has no target, \
+                 the chain never publishes, and the EQ is silent with nothing in \
+                 the log to say so."
+            );
+        }
+    }
+
+    /// A 7.1 profile has to put the binaural renderer in the chain, and only a
+    /// 7.1 one.
+    ///
+    /// The renderer's LADSPA `label` must be the descriptor's **Label** and its
+    /// link targets must be entries in **PortNames[]**, never the port labels.
+    /// Both were checked against the plugin and neither is guessable:
+    /// `find_desc()` in PipeWire's LADSPA adapter matches `Label`, and
+    /// `ports[i].name = d->PortNames[i]` is where the link names come from. A
+    /// conf written against the human-facing port labels loads a graph that
+    /// silently drops the filter.
+    #[test]
+    fn surround_mode_emits_the_renderer_with_the_names_the_host_resolves() {
+        let conf = generate_eq_instance_conf(
+            &[epos_shared::config::EqBand {
+                freq: 1000,
+                gain_db: 6.0,
+                q: 1.0,
+            }],
+            "sink",
+            epos_shared::config::AudioMode::Surround71,
+        );
+
+        assert!(
+            conf.contains(r#"type   = ladspa"#),
+            "the renderer has to be a ladspa node; sanity:\n{conf}"
+        );
+        assert!(
+            conf.contains(r#"plugin = "epos-surround""#),
+            "plugin = is the library name, without .so"
+        );
+        assert!(
+            conf.contains(r#"label  = "EPOS 7.1 Binaural Surround""#),
+            "label = must be the descriptor's Label field, which is what \
+             find_desc() compares against - not the port labels and not the Name"
+        );
+        // PortNames[] entries, verified against the built plugin by
+        // tools/abi.c and pinned by the plugin's own test.
+        for want in [
+            "surround:input_left",
+            "surround:input_right",
+            "surround:output_left",
+            "surround:output_right",
+        ] {
+            assert!(
+                conf.contains(want),
+                "the graph must reference {want}, which is a PortNames[] entry"
+            );
+        }
+        for wrong in ["surround:In FL", "surround:Out L", "surround:In L"] {
+            assert!(
+                !conf.contains(wrong),
+                "{wrong} is a port Label, not a PortNames[] entry. filter-chain \
+                 resolves link targets from PortNames[] and would not find it."
+            );
+        }
+    }
+
+    /// The EQ bands must survive into a 7.1 graph, and each ear needs its own
+    /// chain.
+    ///
+    /// This is the part that is easy to get wrong and hard to notice. Once the
+    /// graph declares explicit `inputs`, filter-chain stops duplicating it per
+    /// channel:
+    ///
+    /// > inputs and outputs can be omitted, in which case ... The graph will
+    /// > then be duplicated as many times to match the number of input/output
+    /// > channels of the streams.
+    ///
+    /// So a single shared biquad chain - which is what the stereo graph has
+    /// always been, and which is correct there - would give one ear's
+    /// correction to both, and the 9-band EQ would quietly stop being a stereo
+    /// EQ. Two chains, one per ear, is the price of the renderer, and this test
+    /// is what stops it being paid silently.
+    #[test]
+    fn surround_mode_gives_each_ear_its_own_eq_chain() {
+        let bands: Vec<epos_shared::config::EqBand> = [1000.0, 4000.0]
+            .iter()
+            .map(|f| epos_shared::config::EqBand {
+                freq: *f as u32,
+                gain_db: 6.0,
+                q: 1.0,
+            })
+            .collect();
+        let conf = generate_eq_instance_conf(
+            &bands,
+            "sink",
+            epos_shared::config::AudioMode::Surround71,
+        );
+
+        for ear in ["l", "r"] {
+            for k in 0..bands.len() {
+                assert!(
+                    conf.contains(&format!("eq_{ear}_{k}")),
+                    "ear {ear} must have its own biquad {k}; a shared chain would \
+                     give one ear's correction to both"
+                );
+            }
+        }
+        // The chain has to be *wired*, not merely declared. A generator that
+        // emitted both sets of biquads but linked only the left one would satisfy
+        // every assertion above and play the right ear unfiltered - so the last
+        // node of each chain is checked to reach its own renderer input.
+        assert!(
+            conf.contains(r#"{ output = "eq_l_1:Out" input = "surround:input_left" }"#),
+            "the left chain's last band must reach the renderer's left input:\n{conf}"
+        );
+        assert!(
+            conf.contains(r#"{ output = "eq_r_1:Out" input = "surround:input_right" }"#),
+            "the right chain's last band must reach the renderer's right input:\n{conf}"
+        );
+
+        // And no link may name a node the graph does not contain. PipeWire
+        // refuses the whole module on an unknown port, so a dangling reference is
+        // not a degraded EQ - it is a dead chain and no audio at all. This is
+        // the check that catches a generator building one ear and wiring both.
+        // Nodes are declared as `name <spaces>= <id>`, and the conf is not
+        // consistent about quoting: the builtin biquads write `name  = "eq_l_0"`
+        // and the LADSPA node writes `name   = surround` bare, the same way
+        // `label = bq_peaking` is bare. Matching the literal text would miss
+        // whichever form the test was not written for - which is exactly what
+        // happened, twice, before this accepted both.
+        let declared: std::collections::BTreeSet<String> = conf
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                let rest = l.strip_prefix("name")?;
+                let rest = rest.trim_start().strip_prefix('=')?.trim_start();
+                Some(
+                    rest.trim_matches('"')
+                        .split_whitespace()
+                        .next()?
+                        .to_string(),
+                )
+            })
+            .collect();
+        for (a, b) in [
+            ("eq_l_1:Out", "surround:input_left"),
+            ("eq_r_1:Out", "surround:input_right"),
+        ] {
+            let (node, _) = a.split_once(':').expect("a link target has a node part");
+            assert!(
+                declared.contains(node),
+                "the graph links from {node} but never declares it; PipeWire \
+                 rejects an unknown port outright, so this is a dead chain, not \
+                 a degraded one.\nDeclared nodes: {declared:?}"
+            );
+            let target = b.split_once(':').expect("a link source has a node part").0;
+            assert!(
+                declared.contains(target),
+                "the graph links into {target} but never declares it:\n{declared:?}"
+            );
+        }
+        assert!(
+            conf.contains(r#"inputs  = [ "eq_l_0:In" "eq_r_0:In" ]"#),
+            "the stream's two channels must be declared explicitly, or \
+             filter-chain duplicates the graph per channel and the stereo pair \
+             never reaches the renderer together:\n{conf}"
+        );
+        assert!(
+            conf.contains(r#"outputs = [ "surround:output_left" "surround:output_right" ]"#),
+            "both ears out, declared explicitly:\n{conf}"
+        );
+    }
+
+    /// A stereo profile must not carry the renderer at all.
+    ///
+    /// Not "carry it with the widening off": carrying it means paying for the
+    /// convolution on every stream for no benefit. The measured cost is about
+    /// 10% of one core, so a 2.0 profile that silently included it would tax
+    /// every game for a feature the user turned off.
+    #[test]
+    fn stereo_mode_never_mentions_the_renderer() {
+        let conf = generate_eq_instance_conf(
+            &[epos_shared::config::EqBand {
+                freq: 1000,
+                gain_db: 6.0,
+                q: 1.0,
+            }],
+            "sink",
+            epos_shared::config::AudioMode::Stereo,
+        );
+        assert!(
+            !conf.contains("ladspa") && !conf.contains("surround"),
+            "a 2.0 profile must not build the 7.1 renderer:\n{conf}"
+        );
+        // ...and the stereo graph keeps the single shared chain it always had.
+        assert!(
+            conf.contains("eq_band_0") && !conf.contains("eq_l_0"),
+            "stereo is unchanged: one shared chain, duplicated per channel by \
+             filter-chain as before:\n{conf}"
+        );
+    }
+
     /// The health check must judge the EQ by its chain node when the EQ is
     /// actually engaged, not by the always-present static anchor.
     #[test]
@@ -4488,6 +4861,7 @@ mod tests {
                 q: 1.0,
             }],
             "sink",
+            epos_shared::config::AudioMode::Stereo,
         );
         assert!(
             with_bands.contains("eq_band_"),
@@ -4498,7 +4872,7 @@ mod tests {
             Some(EQ_SINK_NAME),
             "with bands in the graph, the chain node is what must be published"
         );
-        let passthrough = generate_eq_instance_conf(&[], "sink");
+        let passthrough = generate_eq_instance_conf(&[], "sink", epos_shared::config::AudioMode::Stereo);
         assert_eq!(
             eq_expected_node(&passthrough),
             None,

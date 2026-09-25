@@ -33,3 +33,8 @@ crates/epos-gsx300-gui/.vite/
 docs/reverse-engineering/dumps/*.bin
 # stray session transcripts accidentally copied into the repo
 session-*.md
+
+# PipeWire's own LADSPA header, fetched by tools/abi.c at check time rather than
+# vendored: it has to be the revision the host compiles, and a copy in the tree
+# would drift from it without anybody noticing.
+crates/epos-surround-ladspa/tools/ladspa.h
