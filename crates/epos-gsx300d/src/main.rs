@@ -766,27 +766,33 @@ async fn volume_watch_loop(state: Arc<RwLock<IpcState>>) {
             None => continue,
         };
 
-        // The anchor is held at unity before anything else, and independently of
-        // which sink the watcher follows. It is a volume stage of its own in the
-        // middle of the chain, the user has no control over it, and left alone it
-        // was found at 26% - 35 dB - which is the difference between a chain that
-        // is loud and one that is not.
-        //
-        // Only while the chain is actually in use: the anchor is a sink the
-        // daemon publishes, and a volume write to it on every tick of a system
-        // with the headset switched off is a pactl call per second for nothing.
+        // The second stage of the chain is held at unity, and independently of
+        // which sink the watcher follows. The anchor is the user's control - it
+        // is the default sink, and it is what the daemon writes to now - so it is
+        // left alone. The raw EPOS sink is the other factor in the product, and
+        // it was found at 26% (-35 dB) across restarts with the user's own
+        // control at 100%.
         if st_chain_in_use(&state).await {
-            if let Some(now) = read_sink_volume(crate::audio::EQ_SINK_NAME).await {
-                if let Some(want) = anchor_level_to_apply(now) {
-                    debug!("EQ anchor is at {now}%, holding it at {want}%");
-                    if let Err(detail) = run_status(
-                        "pactl",
-                        &["set-sink-volume", crate::audio::EQ_SINK_NAME, &format!("{want}%")],
-                        COMMAND_BUDGET,
-                    )
-                    .await
-                    {
-                        warn!("could not hold the EQ anchor at {want}%: {detail}");
+            let raw_sink = {
+                let st = state.read().await;
+                st.pipewire_nodes
+                    .as_ref()
+                    .map(|(sink, _)| sink.clone())
+                    .unwrap_or_default()
+            };
+            if !raw_sink.is_empty() {
+                if let Some(now) = read_sink_volume(&raw_sink).await {
+                    if let Some(want) = chain_stage_to_apply(now) {
+                        debug!("chain's second stage is at {now}%, holding it at {want}%");
+                        if let Err(detail) = run_status(
+                            "pactl",
+                            &["set-sink-volume", &raw_sink, &format!("{want}%")],
+                            COMMAND_BUDGET,
+                        )
+                        .await
+                        {
+                            warn!("could not hold the second stage at {want}%: {detail}");
+                        }
                     }
                 }
             }
@@ -1260,24 +1266,24 @@ pub fn volume_on_target_change(remembered: Option<i32>, on_disk: i32) -> VolumeV
     }
 }
 
-/// The level the EQ anchor must be held at, or `None` to leave it alone.
+/// The level a stage of the chain must be held at, or `None` to leave it alone.
 ///
-/// The chain has two volume-controlled stages and the user can only see one:
-/// `epos-eq-processed` is a real filter-chain sink with its own volume, and it
-/// sits *before* the hardware sink the daemon writes to. Nothing held the first
-/// one, and PipeWire restored it at 26% — -35 dB — across restarts, so a chain
-/// whose hardware end was at 100% still arrived at the ear a third of full
-/// scale.
+/// Used for the one stage the user does **not** control. The chain is
+/// `app -> anchor -> EQ -> raw EPOS -> DAC`, and both nodes have a volume, so
+/// they multiply. The anchor is the default sink, which is what the desktop
+/// applet, pavucontrol, `wpctl` and the media keys all write to, and the daemon
+/// now follows it as well - so the anchor is the user's control and is left
+/// alone. The raw EPOS sink is the other half of the product, and two
+/// independently adjustable attenuators is one too many: the user can only
+/// account for the one they are looking at.
 ///
-/// The note on `volume_target_sink` says the anchor's volume is a no-op. That
-/// was measured when the anchor was a null-sink feeding the chain through its
-/// monitor; `c18edd7` replaced it with the chain's own sink, and the measurement
-/// did not come with it. The user confirms it directly: both stages at 100% was
-/// "đủ lớn", and the same chain with the anchor at 26% is quiet again.
+/// Unity is the only defensible value for the unaccounted-for half. Anything
+/// else is a level nobody chose and nobody can see. It was found at 26% -
+/// -35 dB - after a restart, with the hardware end the user had set to 100%.
 ///
-/// Unity is the only defensible value. Anything else would be a second control
-/// the user cannot reach, which is the fault being removed.
-pub fn anchor_level_to_apply(current: i32) -> Option<i32> {
+/// The "not already there" check is what keeps this from being a `pactl` call
+/// every second for the life of the daemon.
+pub fn chain_stage_to_apply(current: i32) -> Option<i32> {
     if current == 100 {
         None
     } else {
@@ -1822,22 +1828,23 @@ mod tests {
     //     handed the headset the speakers' level, and the save worker wrote it
     //     back, so the next boot began "Volume restored to 20% at boot".
 
-    /// The EQ anchor is held at unity, and only when it is not already there.
+    /// The chain's unaccounted-for stage is held at unity, and only when it is
+    /// not already there.
     ///
     /// The watcher runs every second, so writing unconditionally would be a
     /// `pactl` call per second for the life of the daemon.
     #[test]
-    fn the_eq_anchor_is_held_at_unity() {
+    fn the_second_stage_of_the_chain_is_held_at_unity() {
         assert_eq!(
-            anchor_level_to_apply(26),
+            chain_stage_to_apply(26),
             Some(100),
-            "the anchor was found at 26% -35 dB - with nothing holding it, the \
-             chain was a third of full scale before the user's own control"
+            "the raw EPOS sink was found at 26% -35 dB - with the user's own \
+             control at 100%, so the headset was a third of full scale"
         );
-        assert_eq!(anchor_level_to_apply(0), Some(100));
-        assert_eq!(anchor_level_to_apply(150), Some(100));
+        assert_eq!(chain_stage_to_apply(0), Some(100));
+        assert_eq!(chain_stage_to_apply(150), Some(100));
         assert_eq!(
-            anchor_level_to_apply(100),
+            chain_stage_to_apply(100),
             None,
             "already at unity: no write"
         );

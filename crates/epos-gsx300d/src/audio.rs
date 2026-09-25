@@ -508,7 +508,17 @@ pub fn volume_target_sink(default_sink: &str, epos_sink: &str, eq_anchor: &str) 
         return epos_sink.to_string();
     }
     if default_sink == eq_anchor {
-        return epos_sink.to_string();
+        // The anchor itself, not the hardware sink behind it.
+        //
+        // This used to return `epos_sink`, on the strength of a measurement that
+        // the anchor's volume changed nothing - true when the anchor was a
+        // null-sink feeding the chain through its monitor, before `c18edd7`
+        // replaced it with the chain's own sink. Following that note sent the
+        // daemon to the raw hardware sink while every external control wrote to
+        // the default sink, which is the anchor: the user's own volume control
+        // and the dial were adjusting two different nodes, and neither was what
+        // the other was showing.
+        return eq_anchor.to_string();
     }
     if default_sink == epos_sink {
         return default_sink.to_string();
@@ -5530,17 +5540,39 @@ mod tests {
     // volumes were visible at once: the anchor at 46 %, the EPOS sink at 14 %,
     // the speakers at 20 %, and the GUI showing the EPOS sink's 14 %.
 
-    /// The measured case: with the EQ on, playback sits on the anchor, whose
-    /// volume does nothing, so the EPOS sink is the only useful target.
+    /// Playback on the anchor means the anchor is what gets the volume.
+    ///
+    /// This reverses the case the note above describes, and the reason is that
+    /// the note's measurement stopped being true. It found "440 Hz 16.17 to
+    /// 16.89" when the anchor's volume was forced to 0% - no change at all -
+    /// and concluded the anchor's volume was a no-op. The anchor then was
+    /// `epos-eq-input`, a null-sink whose *monitor* fed the filter-chain, so
+    /// setting the null-sink's own volume indeed changed nothing. `c18edd7`
+    /// replaced it with the chain's own sink and the measurement did not come
+    /// with it.
+    ///
+    /// The consequence of believing the stale note was worse than a dead
+    /// control. The daemon wrote the user's volume to the raw EPOS sink while
+    /// every external control - the desktop applet, pavucontrol, `wpctl`, media
+    /// keys - writes to the *default* sink, which is the anchor. Two actors, two
+    /// nodes. The user's own control and the dial were adjusting different
+    /// things, and the number on screen belonged to neither.
+    ///
+    /// So the daemon follows the default sink, which is the same node the user's
+    /// tools target. One control, one node. The raw EPOS sink is then the second
+    /// stage of the chain and is held at unity, because two independently
+    /// adjustable attenuators multiply and the user can only account for one.
     #[test]
-    fn with_the_eq_on_the_hardware_sink_is_the_volume_target() {
+    fn playback_on_the_anchor_makes_the_anchor_the_volume_target() {
         assert_eq!(
             volume_target_sink(
                 EQ_SINK_NAME,
                 "alsa_output.usb-EPOS-00.analog-stereo",
                 EQ_SINK_NAME,
             ),
-            "alsa_output.usb-EPOS-00.analog-stereo"
+            EQ_SINK_NAME,
+            "the daemon must write where the user's own volume control writes, \
+             or adjusting the volume does nothing"
         );
     }
 
