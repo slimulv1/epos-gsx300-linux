@@ -800,25 +800,44 @@ async fn volume_watch_loop(state: Arc<RwLock<IpcState>>) {
 
         let st = state.write().await;
 
-        // The ceiling, over every published sink rather than only the one
-        // playing. A cap that follows the default leaves every other device
-        // unlimited for as long as it is not the one making noise - and the user
-        // asked for the ceiling to cover all of them, EPOS included.
+        // The ceiling, over every volume-bearing object in the system rather
+        // than only the sinks.
         //
-        // One `pactl list sinks` covers the whole set; the per-sink write only
-        // happens for something actually over the line, so a healthy system pays
-        // one subprocess per tick and no writes at all.
-        if let Ok(listing) = run_status("pactl", &["list", "sinks"], COMMAND_BUDGET).await {
-            for (name, level) in sinks_to_cap(&listing, &sink) {
-                info!("sink {name} is at {level}%, above the 100% ceiling — pulling it back");
+        // The sink-only version of this looked complete and was not: measured on
+        // this machine with it in place, 4 of 4 sink-inputs and 9 of 9 sources
+        // were at 150% with the daemon silent, because `pactl list sinks` does
+        // not mention either. The user asked for the ceiling to cover the whole
+        // audio system and it covered a quarter of it.
+        //
+        // Four listings per tick, one subprocess each, and a write only for
+        // something actually over the line - so a healthy system pays four reads
+        // per second and no writes at all. The followed sink is skipped because
+        // it is capped below by a path that also updates the trackers.
+        for kind in [
+            VolumeKind::Sink,
+            VolumeKind::SinkInput,
+            VolumeKind::Source,
+            VolumeKind::SourceOutput,
+        ] {
+            let listing =
+                run_status("pactl", &["list", kind.list_arg()], COMMAND_BUDGET).await;
+            let Ok(listing) = listing else { continue };
+            for (id, level) in over_cap_in(kind, &listing) {
+                if kind == VolumeKind::Sink && id == sink {
+                    continue;
+                }
+                info!(
+                    "{} {id} is at {level}%, above the 100% ceiling — pulling it back",
+                    kind.list_arg()
+                );
                 if let Err(detail) = run_status(
                     "pactl",
-                    &["set-sink-volume", &name, "100%"],
+                    &[kind.set_verb(), &id, "100%"],
                     COMMAND_BUDGET,
                 )
                 .await
                 {
-                    warn!("could not pull {name} back to 100%: {detail}");
+                    warn!("could not pull {} {id} back to 100%: {detail}", kind.list_arg());
                 }
             }
         }
@@ -1365,6 +1384,112 @@ pub fn sinks_to_cap(listing: &str, followed: &str) -> Vec<(String, i32)> {
         .collect()
 }
 
+/// What kind of object a volume belongs to, and the `pactl` verb that writes it.
+///
+/// The ceiling was applied to sinks only, and the rest of the system was found
+/// by measurement rather than assumed: with four sink-inputs and nine sources
+/// sitting at 150% and the daemon reporting a clean bill of health. A cap on
+/// sinks is not a cap on the machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeKind {
+    Sink,
+    SinkInput,
+    Source,
+    SourceOutput,
+}
+
+impl VolumeKind {
+    /// The `pactl list` sub-command that produces this kind's listing.
+    pub fn list_arg(self) -> &'static str {
+        match self {
+            VolumeKind::Sink => "sinks",
+            VolumeKind::SinkInput => "sink-inputs",
+            VolumeKind::Source => "sources",
+            VolumeKind::SourceOutput => "source-outputs",
+        }
+    }
+
+    /// The `pactl set-*-volume` verb that writes it. Verified by running each
+    /// one against the live graph rather than read off `--help`, which does not
+    /// list them on this pactl at all.
+    pub fn set_verb(self) -> &'static str {
+        match self {
+            VolumeKind::Sink => "set-sink-volume",
+            VolumeKind::SinkInput => "set-sink-input-volume",
+            VolumeKind::Source => "set-source-volume",
+            VolumeKind::SourceOutput => "set-source-output-volume",
+        }
+    }
+
+    /// How a block in this kind's listing is identified.
+    fn id_field(self) -> IdField {
+        match self {
+            VolumeKind::Sink | VolumeKind::Source => IdField::Named,
+            VolumeKind::SinkInput | VolumeKind::SourceOutput => IdField::Index,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdField {
+    /// `Name: <name>`, written by name.
+    Named,
+    /// The numeric id from the `Sink Input #<n>` block header.
+    Index,
+}
+
+/// Every object of `kind` in `listing` whose level is above 100%, as
+/// `(identifier, level)`.
+///
+/// The identifier is a sink name or a numeric index depending on the kind, and
+/// the caller passes the matching half back to `pactl set-*-volume` unchanged.
+pub fn over_cap_in(kind: VolumeKind, listing: &str) -> Vec<(String, i32)> {
+    let mut out = Vec::new();
+    let mut name: Option<String> = None;
+    let mut id: Option<String> = None;
+    let header = match kind {
+        VolumeKind::Sink => "Sink #",
+        VolumeKind::SinkInput => "Sink Input #",
+        VolumeKind::Source => "Source #",
+        VolumeKind::SourceOutput => "Source Output #",
+    };
+    for raw in listing.lines() {
+        let line = raw.trim();
+        if let Some(rest) = line.strip_prefix(header) {
+            // A new block invalidates whatever the previous one held.
+            id = Some(rest.split_whitespace().next().unwrap_or("").to_string());
+            name = None;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("Name: ") {
+            name = Some(rest.trim().to_string());
+            continue;
+        }
+        if !line.starts_with("Volume: ") {
+            continue;
+        }
+        let key = match kind.id_field() {
+            IdField::Named => name.clone(),
+            IdField::Index => id.clone(),
+        };
+        let Some(key) = key.filter(|k| !k.is_empty()) else {
+            continue;
+        };
+        let Some(pct) = line
+            .strip_prefix("Volume: ")
+            .and_then(|rest| rest.split('/').nth(1))
+            .map(|s| s.trim().trim_end_matches('%').trim())
+            .and_then(|s| s.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pct > 100 {
+            out.push((key, pct));
+        }
+    }
+    out
+}
+
 /// Decide whether a hand-edited `device.volume` should be put on the sink.
 ///
 /// Pure. The watcher used to copy the value into `st.config` and nothing else,
@@ -1901,6 +2026,108 @@ mod tests {
     //     playing last owned it. Moving from speakers at 20% onto the headset
     //     handed the headset the speakers' level, and the save worker wrote it
     //     back, so the next boot began "Volume restored to 20% at boot".
+
+    /// The ceiling covers per-application volumes and capture volumes too.
+    ///
+    /// Measured on this machine with the sink-only cap in place: 4 of 4
+    /// sink-inputs and 9 of 9 sources sitting at 150%, and the daemon quiet,
+    /// because `pactl list sinks` never mentions either. A ceiling that leaves
+    /// the microphone and every application's own volume unlimited is not a
+    /// ceiling on the machine.
+    ///
+    /// Both listings are captured verbatim from this machine. The shapes differ
+    /// in the way that matters: a `Sink Input` block is identified only by the
+    /// number in its header and has no `Name:`, while a `Source` block has a
+    /// `Name:` and is written by name. Reading either with the other's rules
+    /// finds nothing, and finding nothing looks exactly like a clean system.
+    #[test]
+    fn application_and_capture_volumes_are_covered_too() {
+        let sink_inputs = "\
+Sink Input #35
+\tDriver: protocol-native
+\tSink: 26125
+\tMute: no
+\tVolume: front-left: 98304 / 150% / 10.57 dB,   front-right: 98304 / 150% / 10.57 dB
+\tapplication.name = \"firefox\"
+Sink Input #2536
+\tSink: 26125
+\tMute: no
+\tVolume: front-left: 32768 / 50% / -18.06 dB,   front-right: 32768 / 50% / -18.06 dB
+\tapplication.name = \"opencode\"
+";
+        assert_eq!(
+            over_cap_in(VolumeKind::SinkInput, sink_inputs),
+            vec![("35".to_string(), 150)],
+            "a sink input is found by the number in its header, and one under \
+             the ceiling is left out"
+        );
+
+        let sources = "\
+Source #36
+\tName: alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__SPDIF__sink.monitor
+\tMute: no
+\tVolume: mono: 98304 / 150% / 10.57 dB
+\tDescription: Monitor of SPDIF
+Source #37
+\tName: alsa_input.usb-Sennheiser_EPOS_GSX_300_A003200202602692-00.mono-fallback
+\tMute: no
+\tVolume: mono: 65536 / 100% / 0.00 dB
+";
+        assert_eq!(
+            over_cap_in(VolumeKind::Source, sources),
+            vec![(
+                "alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__SPDIF__sink.monitor"
+                    .to_string(),
+                150
+            )],
+            "a source is found by name, including the monitor sources"
+        );
+    }
+
+    /// A block with a volume but no usable identifier is skipped rather than
+    /// written with an empty one, and a new header clears the previous block's
+    /// identity so a source cannot be written with a sink input's number.
+    #[test]
+    fn a_block_with_no_usable_identifier_is_skipped() {
+        let listing = "\
+Source Output #7
+\tDriver: protocol-native
+\tSource: 36
+\tVolume: mono: 98304 / 150% / 10.57 dB
+\tapplication.name = \"some_recorder\"
+";
+        assert_eq!(
+            over_cap_in(VolumeKind::SourceOutput, listing),
+            vec![("7".to_string(), 150)],
+            "a source output is found by the number in its header"
+        );
+        // The same text read as a source has no Name, so nothing is found - and
+        // finding nothing is the correct answer, not a silent pass over it.
+        assert!(over_cap_in(VolumeKind::Source, listing).is_empty());
+    }
+
+    /// Every kind maps to a `pactl` verb that exists, and the verbs are
+    /// distinct - two kinds sharing one verb would mean one of them was never
+    /// being written.
+    #[test]
+    fn every_kind_has_its_own_write_verb() {
+        let kinds = [
+            VolumeKind::Sink,
+            VolumeKind::SinkInput,
+            VolumeKind::Source,
+            VolumeKind::SourceOutput,
+        ];
+        let mut verbs: Vec<&str> = kinds.iter().map(|k| k.set_verb()).collect();
+        let before = verbs.len();
+        verbs.sort_unstable();
+        verbs.dedup();
+        assert_eq!(verbs.len(), before, "two kinds share a write verb");
+        assert_eq!(
+            VolumeKind::Sink.set_verb(),
+            "set-sink-volume",
+            "the verb a cap depends on has to be the real one"
+        );
+    }
 
     /// The ceiling covers every sink, not only the one playing.
     ///
