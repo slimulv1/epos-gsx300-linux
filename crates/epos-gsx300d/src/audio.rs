@@ -808,16 +808,15 @@ impl AudioPipeline {
         if !is_epos_sink(&current, &raw_sink) {
             return (ExitOutcome::AlreadyAway, None);
         }
-        let sink_listing =
-            match run_probe("pactl", &["list", "short", "sinks"], PROBE_BUDGET).await {
-                Probe::Ran(listing) => listing,
-                other => {
-                    // Not "nowhere to go" — we could not look. Saying otherwise
-                    // would blame the user's hardware for a probe that failed.
-                    warn!("Could not list sinks to leave the EPOS: {other:?}");
-                    return (ExitOutcome::CouldNotDecide, None);
-                }
-            };
+        let sink_listing = match list_short("sinks").await {
+            Ok(listing) => listing,
+            // Not "nowhere to go" — we could not look. Saying otherwise
+            // would blame the user's hardware for a probe that failed.
+            Err(why) => {
+                warn!("Could not list sinks to leave the EPOS: {why}");
+                return (ExitOutcome::CouldNotDecide, None);
+            }
+        };
         let sinks = sink_names_from_listing(&sink_listing);
         let by_index = sink_index_to_name(&sink_listing);
         // Which sink is actually carrying audio, which is not the same question as
@@ -868,10 +867,10 @@ impl AudioPipeline {
     /// and a pinned stream nobody remembers is a stream that never comes back.
     async fn plan_leave(&self, target: &str) -> Option<streams::StreamMovePlan> {
         let (raw_sink, _) = self.node_names();
-        let sinks = match run_probe("pactl", &["list", "short", "sinks"], PROBE_BUDGET).await {
-            Probe::Ran(out) => out,
-            other => {
-                warn!("Could not list sinks to leave the EPOS: {other:?}");
+        let sinks = match list_short("sinks").await {
+            Ok(out) => out,
+            Err(why) => {
+                warn!("Could not list sinks to leave the EPOS: {why}");
                 return None;
             }
         };
@@ -942,16 +941,15 @@ impl AudioPipeline {
     pub async fn enter_epos(&self) -> EnterOutcome {
         let (raw_sink, _) = self.node_names();
         let current = Self::read_default_sink().await.unwrap_or_default();
-        let sink_listing =
-            match run_probe("pactl", &["list", "short", "sinks"], PROBE_BUDGET).await {
-                Probe::Ran(listing) => listing,
-                other => {
-                    // Not "no device" - we could not look. Saying otherwise would
-                    // blame the user's hardware for a probe that failed.
-                    warn!("Could not list sinks to enter the EPOS: {other:?}");
-                    return EnterOutcome::CouldNotDecide;
-                }
-            };
+        let sink_listing = match list_short("sinks").await {
+            Ok(listing) => listing,
+            // Not "no device" - we could not look. Saying otherwise would
+            // blame the user's hardware for a probe that failed.
+            Err(why) => {
+                warn!("Could not list sinks to enter the EPOS: {why}");
+                return EnterOutcome::CouldNotDecide;
+            }
+        };
         let published = sink_names_from_listing(&sink_listing);
         let target = match crate::led::enter_target(&current, &raw_sink, EQ_SINK_NAME, &published)
         {
@@ -1442,10 +1440,10 @@ impl AudioPipeline {
             .map(|d| d.pipewire_sink.as_str())
             .filter(|s| !s.is_empty())?
             .to_string();
-        let sinks = match run_probe("pactl", &["list", "short", "sinks"], PROBE_BUDGET).await {
-            Probe::Ran(out) => out,
-            other => {
-                warn!("Could not list sinks for anchor rescue: {other:?}");
+        let sinks = match list_short("sinks").await {
+            Ok(out) => out,
+            Err(why) => {
+                warn!("Could not list sinks for anchor rescue: {why}");
                 return None;
             }
         };
@@ -1517,21 +1515,20 @@ impl AudioPipeline {
         // belong to this session, and an unplaceable ledger is dropped rather
         // than acted on.
         let cookie = Self::session_cookie().await;
-        let sinks = match run_probe("pactl", &["list", "short", "sinks"], PROBE_BUDGET).await {
-            Probe::Ran(out) => out,
-            other => {
-                warn!("Could not list sinks for the EQ return: {other:?}");
+        let sinks = match list_short("sinks").await {
+            Ok(out) => out,
+            Err(why) => {
+                warn!("Could not list sinks for the EQ return: {why}");
                 return None;
             }
         };
         let Some(raw_index) = sink_index_of(&sinks, &raw_sink) else {
             return None;
         };
-        let inputs = match run_probe("pactl", &["list", "short", "sink-inputs"], PROBE_BUDGET).await
-        {
-            Probe::Ran(out) => out,
-            other => {
-                warn!("Could not list sink inputs for the EQ return: {other:?}");
+        let inputs = match list_short("sink-inputs").await {
+            Ok(out) => out,
+            Err(why) => {
+                warn!("Could not list sink inputs for the EQ return: {why}");
                 return None;
             }
         };
@@ -3509,17 +3506,6 @@ pub(crate) fn role_health_action(
     }
 }
 
-/// Resolve a sink NAME to its numeric index from `pactl list short sinks`.
-///
-/// `pactl list short sink-inputs` identifies the sink by index, never by name,
-/// so the name has to be resolved first or the rescue silently matches nothing.
-/// The names in a `pactl list short sinks` listing.
-///
-/// Deliberately the *sink* listing and not `pw-cli ls Node`. The node listing is
-/// every node in the graph — drivers, bridges, stream nodes — and choosing a
-/// playback destination from it picks `Dummy-Driver`, which is not an output at
-/// all. Measured: a long press tried to set the default to `Dummy-Driver` and
-/// `pactl` refused.
 /// The index -> name pairs in a `pactl list short sinks` listing.
 ///
 /// The names alone are not enough. `pactl list sink-inputs` identifies its sink by
@@ -3548,6 +3534,43 @@ pub(crate) fn sink_names_from_listing(listing: &str) -> Vec<String> {
         .collect()
 }
 
+/// The listing from a `pactl list short <what>` probe, or why there is none.
+///
+/// Pure, so the rule is pinned rather than re-typed at each call site. Six
+/// callers had the same match on `Probe::Ran` with the same shape, and only two
+/// things varying: the wording of the warning, and what the caller returns when
+/// there is no listing. That is the shape in which a message quietly drifts away
+/// from the behaviour it describes — one of them had gained an explanatory note
+/// about not blaming the user's hardware that the other five lacked, for no
+/// reason other than that they were written at different times.
+///
+/// The caller's own wording stays with the caller. What is not repeated is the
+/// plumbing, and the rule that a probe which did not answer is reported as "could
+/// not look" rather than as whatever the caller might otherwise have concluded.
+fn listing_from_probe(outcome: Probe) -> Result<String, String> {
+    match outcome {
+        Probe::Ran(listing) => Ok(listing),
+        other => Err(format!("{other:?}")),
+    }
+}
+
+/// `pactl list short <what>`, with the standard probe budget.
+async fn list_short(what: &str) -> Result<String, String> {
+    listing_from_probe(run_probe("pactl", &["list", "short", what], PROBE_BUDGET).await)
+}
+
+/// Resolve a sink NAME to its numeric index from a `pactl list short sinks`
+/// listing.
+///
+/// The inverse of [`sink_index_to_name`], and needed because
+/// `pactl list short sink-inputs` identifies its sink by index and never by name —
+/// so the name has to be resolved first or the rescue silently matches nothing.
+///
+/// This doc used to sit at the top of `sink_index_to_name`'s, with no blank line
+/// between the two, so rustdoc merged them and the index-to-name function was
+/// documented as the name-to-index one while this one had none. Two functions
+/// whose contracts are inverses are exactly the pair a reader checks them
+/// against, so it is worth having each say which direction it goes.
 fn sink_index_of(listing: &str, sink_name: &str) -> Option<u32> {
     listing.lines().find_map(|line| {
         let mut f = line.split_whitespace();
@@ -3685,6 +3708,113 @@ impl Drop for AudioPipeline {
 
 #[cfg(test)]
 mod tests {
+    /// A probe that answered hands its listing back; one that did not says why.
+    ///
+    /// Six call sites shared this rule by re-typing it, and one of them had
+    /// drifted: it carried a note about not blaming the user's hardware for a
+    /// failed probe, the other five did not. The drift is the argument for the
+    /// shared version — the same rule written six times is six chances to write
+    /// it slightly differently, and the difference is invisible until someone
+    /// reads all six and wonders why only one bothers to explain itself.
+    #[test]
+    fn a_probe_that_answered_hands_back_its_listing_and_one_that_did_not_says_why() {
+        assert_eq!(
+            listing_from_probe(Probe::Ran("60\talsa_output.sink\tPipeWire\tf32\tIDLE".into())),
+            Ok("60\talsa_output.sink\tPipeWire\tf32\tIDLE".to_string())
+        );
+        // A probe that could not look must not be reported as an empty listing.
+        // That is the whole point of the Err arm: "no sinks exist" and "we could
+        // not ask" are different facts, and the second is flattened into the
+        // first by a caller that only ever matched the success arm.
+        for outcome in [Probe::TimedOut, Probe::SpawnFailed("boom".into())] {
+            // `Probe` is not `Copy`, so the label is taken before the value is
+            // moved into the call.
+            let label = format!("{outcome:?}");
+            let err = listing_from_probe(outcome)
+                .expect_err("a probe that did not answer must not look like a listing");
+            assert!(
+                !err.is_empty(),
+                "the reason has to be carried, or a failure is indistinguishable \
+                 from an empty listing: {label}"
+            );
+        }
+    }
+
+    /// The six former call sites now share one probe, so the wording of "could
+    /// not look" cannot drift between them again.
+    ///
+    /// The duplication being pinned is textual, so the check is textual, and it
+    /// has to be careful about itself: the first version of this test matched its
+    /// own doc comment and its own pattern string, and failed on three hits where
+    /// there was one. A test that cannot tell its own text from the code is worse
+    /// than no test, so the pattern is built from pieces and only the code above
+    /// the test module is counted.
+    #[test]
+    fn the_sink_listing_probe_is_written_once() {
+        let source = include_str!("audio.rs");
+        let code = match source.split_once("#[cfg(test)]\nmod tests {") {
+            Some((code, _)) => code,
+            None => panic!("the test module anchor moved; update this test"),
+        };
+        let pattern = concat!("run_probe(\"pactl\", &[\"list\",", " \"short\"");
+        assert_eq!(
+            code.matches(pattern).count(),
+            1,
+            "exactly one listing probe, the helper's own; every call site goes \
+             through list_short"
+        );
+        assert_eq!(
+            code.matches("list_short(").count(),
+            7,
+            "six call sites plus the helper's own body"
+        );
+    }
+
+    /// The two sink resolvers are inverses, and each documents its own direction.
+    ///
+    /// Their doc comments used to be one comment: `sink_index_of`'s description
+    /// sat directly above `sink_index_to_name`'s with no blank line, so rustdoc
+    /// merged them — the name-to-index function was documented as the index-to-
+    /// name one, and the index-to-name one opened by describing the reverse. Two
+    /// functions that are inverses are the pair a reader checks them against, so
+    /// both the behaviour and the separation are pinned here.
+    #[test]
+    fn the_two_sink_resolvers_are_inverses_and_documented_separately() {
+        let listing =
+            "60\talsa_output.epos\tPipeWire\tf32\tIDLE\n74\tspeakers\tPipeWire\ts32\tRUNNING";
+        let index = sink_index_of(listing, "speakers").expect("speakers is listed");
+        assert_eq!(index, 74);
+        assert_eq!(
+            sink_index_to_name(listing).get(&index).map(String::as_str),
+            Some("speakers"),
+            "the two resolvers must agree in both directions"
+        );
+        // Neither guesses for something that is not listed.
+        assert_eq!(sink_index_of(listing, "absent"), None);
+        assert_eq!(sink_index_to_name(listing).get(&999), None);
+
+        // And the doc comment has to stay attached to the right one. Checked by
+        // looking at what sits between the two mentions, not by counting: a blank
+        // line is what separates them, and its absence is the whole defect.
+        let source = include_str!("audio.rs");
+        let doc_at = source
+            .find("/// Resolve a sink NAME to its numeric index")
+            .expect("sink_index_of keeps its own doc comment");
+        let fn_at = source
+            .find("fn sink_index_of(")
+            .expect("sink_index_of still exists");
+        assert!(
+            doc_at < fn_at,
+            "the doc must precede the function it documents"
+        );
+        let between = &source[doc_at..fn_at];
+        assert!(
+            !between.contains("pub(crate) fn sink_index_to_name"),
+            "the two doc comments have merged again: nothing separates the \
+             name-to-index doc from the function above it"
+        );
+    }
+
     /// The ledger directory is private, and stays private.
     ///
     /// This property had no test at all: `0o700` appeared in `save_ledger` and in
