@@ -1624,7 +1624,16 @@ impl AudioPipeline {
         let result = match text {
             Some(text) => {
                 if let Some(dir) = path.parent() {
+                    // 0700, matching the config directory: the ledger holds this
+                    // session's cookie and the stream indices it belongs to, and
+                    // the default umask would leave the directory world-readable.
                     let _ = std::fs::create_dir_all(dir);
+                    let _ = std::fs::set_permissions(
+                        dir,
+                        std::fs::Permissions::from(std::os::unix::fs::PermissionsExt::from_mode(
+                            0o700,
+                        )),
+                    );
                 }
                 let tmp = path.with_extension("json.tmp");
                 std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &path))
@@ -1649,6 +1658,13 @@ impl AudioPipeline {
     async fn load_ledger(&self) {
         let Some(path) = ledger_path() else { return };
         let Ok(text) = std::fs::read_to_string(&path) else { return };
+        // Best effort: an existing directory from an older run is tightened too.
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::set_permissions(
+                dir,
+                std::fs::Permissions::from(std::os::unix::fs::PermissionsExt::from_mode(0o700)),
+            );
+        }
         let cookie = Self::session_cookie().await;
         let restored = lock(&self.stream_ledger).restore(&text, cookie.as_deref());
         if restored {
