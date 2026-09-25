@@ -178,6 +178,24 @@ pub fn streams_to_leave(entries: &[RescueStream], our_sink_indices: &[u32]) -> V
         .collect()
 }
 
+/// The line to log after a batch of streams was moved.
+///
+/// A pure function because the wording is the whole point. Leaving the EPOS and
+/// returning to the EQ both forget the streams in the ledger, and when they
+/// shared one arm the log claimed audio was "back on the EQ anchor" at the
+/// moment it had just been moved to the user's speakers. Found by pressing the
+/// button for the first time since that code shipped.
+pub fn moved_message(purpose: MovePurpose, count: usize, destination: &str) -> String {
+    match purpose {
+        MovePurpose::Leave => {
+            format!("{count} stream(s) moved off the EPOS to {destination}")
+        }
+        MovePurpose::Return | MovePurpose::Rescue => {
+            format!("{count} stream(s) are back on the EQ anchor")
+        }
+    }
+}
+
 /// One stream's sink, as resolved by the caller from a listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamOnSink {
@@ -708,6 +726,25 @@ mod tests {
         let moved = streams_to_leave(&leave_entries(), &[33]);
         assert!(moved.contains(&36543));
         assert!(!moved.contains(&33570), "33570 is already on the speakers");
+    }
+
+    // ─── The log wording ───────────────────────────────────────────
+
+    /// Leaving says where the audio went. It must not say "back on the EQ
+    /// anchor": that is the opposite destination, and the first live press
+    /// produced exactly that false line.
+    #[test]
+    fn leaving_names_the_device_the_audio_went_to() {
+        let line = moved_message(MovePurpose::Leave, 3, "alsa_output.speakers");
+        assert!(line.contains("alsa_output.speakers"), "got: {line}");
+        assert!(!line.contains("anchor"), "got: {line}");
+    }
+
+    /// Returning does name the anchor, which is where they went.
+    #[test]
+    fn returning_names_the_anchor() {
+        let line = moved_message(MovePurpose::Return, 3, "epos-eq-processed");
+        assert!(line.contains("EQ anchor"), "got: {line}");
     }
 
     // ─── Recording a finished plan ─────────────────────────────────

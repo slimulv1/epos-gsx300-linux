@@ -1738,7 +1738,10 @@ impl AudioPipeline {
                 ledger.note_returned(&moved);
                 if ledger.is_empty() {
                     self.returning_streams.store(false, Ordering::Relaxed);
-                    info!("{} stream(s) are back on the EQ anchor", moved.len());
+                    info!(
+                        "{}",
+                        streams::moved_message(plan.purpose, moved.len(), &plan.destination)
+                    );
                 }
             }
         }
