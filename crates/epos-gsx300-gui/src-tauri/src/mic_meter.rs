@@ -755,8 +755,58 @@ mod tests {
     /// a flaky test rather than as anything to do with the code under test. The
     /// daemon's equivalent needed retry loops for the same reason; distinct
     /// names need none.
+    /// Run a script program, retrying the one failure a freshly written script
+    /// produces: `ETXTBSY`.
+    ///
+    /// Measured, not hypothesised: this failed 1 run in 30 with
+    /// `Text file busy (os error 26)`, and the failing test moved between runs,
+    /// which is what a resource race looks like rather than a logic error. The
+    /// kernel returns it from `exec` when something still holds the file open
+    /// for writing, and a script written microseconds earlier is exactly that
+    /// situation under a loaded machine.
+    ///
+    /// The daemon already has this: `devices::capped_dump` retries eight times
+    /// for the same fault, in the same words, because it hit the same race. A
+    /// test helper that writes a script and immediately runs it has the same
+    /// exposure and was missing the same answer.
+    async fn run_script(
+        program: &str,
+        budget: std::time::Duration,
+    ) -> Result<Option<String>, String> {
+        const ATTEMPTS: u32 = 8;
+        let mut last = String::new();
+        for attempt in 0..ATTEMPTS {
+            match resolve_source_with(program, budget).await {
+                Err(why)
+                    if why.contains("Text file busy") || why.contains("os error 26") =>
+                {
+                    last = why;
+                    if attempt + 1 == ATTEMPTS {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        20 * (attempt as u64 + 1),
+                    ))
+                    .await;
+                }
+                other => return other,
+            }
+        }
+        Err(last)
+    }
+
+    /// `exec`, and that is the whole point of the line.
+    ///
+    /// A plain `sleep 600` makes the shell fork a child, and killing the shell
+    /// on timeout leaves that child running. 25 runs of this suite left 239
+    /// orphaned `sleep 600` processes behind, which is what finally made a 10 s
+    /// budget flaky — the machine got slower as the suite leaked. `exec`
+    /// replaces the shell, so there is one process and killing it kills the
+    /// sleep. It also means the test that polls `/proc` for the script path is
+    /// now looking at the process that actually does the waiting, instead of at
+    /// a shell that has already exited.
     fn never_exits(name: &str) -> String {
-        script_program(name, "#!/bin/sh\nsleep 600\n")
+        script_program(name, "#!/bin/sh\nexec sleep 600\n")
     }
 
     /// No process with this path in its command line, as far as `/proc` can see.
@@ -787,7 +837,7 @@ mod tests {
     async fn abandoning_a_dump_also_takes_the_process_with_it() {
         let program = never_exits("killed");
         let result =
-            resolve_source_with(&program, std::time::Duration::from_millis(200)).await;
+            run_script(&program, std::time::Duration::from_millis(200)).await;
         assert!(result.is_err(), "the dump never answers, so this must time out");
 
         let mut still_running = true;
@@ -894,7 +944,7 @@ mod tests {
         let program = never_exits("abandoned");
         let started = std::time::Instant::now();
         let result =
-            resolve_source_with(&program, std::time::Duration::from_millis(200)).await;
+            run_script(&program, std::time::Duration::from_millis(200)).await;
         let elapsed = started.elapsed();
 
         assert!(
@@ -905,6 +955,10 @@ mod tests {
             elapsed < std::time::Duration::from_secs(5),
             "must give up near its budget, took {elapsed:?}"
         );
+        // The script is named by pid, so a run that leaves it behind leaves a
+        // file that no later run will ever reuse. 30 runs of this suite left 32
+        // of them in /tmp.
+        let _ = std::fs::remove_file(&program);
     }
 
     /// The budget is not a promise to fail: a program that answers is read.
@@ -924,7 +978,7 @@ cat <<'JSON'
 JSON
 "#,
         );
-        let found = resolve_source_with(&program, std::time::Duration::from_secs(10))
+        let found = run_script(&program, std::time::Duration::from_secs(10))
             .await
             .expect("the dump answered")
             .expect("the node is in there");
@@ -942,7 +996,7 @@ JSON
     #[tokio::test]
     async fn a_dump_that_exits_non_zero_is_an_absent_device_not_a_failure() {
         let program = script_program("fail", "#!/bin/sh\nexit 1\n");
-        let found = resolve_source_with(&program, std::time::Duration::from_secs(10))
+        let found = run_script(&program, std::time::Duration::from_secs(10))
             .await
             .expect("a non-zero exit is an answer, not an error");
         assert!(found.is_none(), "nothing was dumped, so nothing was found");
@@ -1002,6 +1056,10 @@ JSON
             .join("tests/fixtures")
             .join(name);
         let bytes = std::fs::read(path).expect("fixture missing");
+        // `chunks_exact`, not `as_chunks`: `as_chunks` is still unstable on
+        // this toolchain and clippy suggests it anyway, so the lint is silenced
+        // with the reason written down rather than left to fail a build.
+        #[allow(clippy::chunks_exact_to_as_chunks)]
         bytes
             .chunks_exact(2)
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
@@ -1051,7 +1109,7 @@ JSON
         let a1 = (end_sec * 48000).min(n);
         let amp = 32768.0 * 10f64.powf(rms_dbfs / 20.0) * std::f64::consts::SQRT_2;
         for (k, s) in samples[a0..a1].iter_mut().enumerate() {
-            let t = (a0 as usize + k) as f64 / 48000.0;
+            let t = (a0 + k) as f64 / 48000.0;
             let v = amp
                 * (0.7 * (2.0 * std::f64::consts::PI * 220.0 * t).sin()
                     + 0.3 * (2.0 * std::f64::consts::PI * 1100.0 * t).sin());
@@ -1087,7 +1145,7 @@ JSON
         let noise_sfm = spectral_flatness(norm.iter().copied());
         assert!(noise_sfm > 0.50, "flat noise reads {noise_sfm:.3}");
 
-        let silence = spectral_flatness(std::iter::repeat(0.0_f32).take(CHUNK_SAMPLES as usize));
+        let silence = spectral_flatness(std::iter::repeat_n(0.0_f32, CHUNK_SAMPLES as usize));
         assert_eq!(silence, 1.0);
     }
 
@@ -1163,7 +1221,7 @@ JSON
         // Find the first engagement.
         let first = levels.iter().position(|l| l.active).expect("speech must engage");
         let t_engage = first as f32 / 33.0;
-        assert!(t_engage >= 3.0 && t_engage <= 6.0, "engage at {t_engage}s");
+        assert!((3.0..=6.0).contains(&t_engage), "engage at {t_engage}s");
 
         // Floor should have primed near the hiss center (-38 ± 5 dBFS).
         assert!(core.floor_db > -43.0 && core.floor_db < -33.0, "floor {:?}", core.floor_db);
@@ -1195,7 +1253,7 @@ JSON
         let first = levels.iter().position(|l| l.active).expect("quiet speech must engage");
         let t_engage = first as f32 / 33.0;
         assert!(
-            t_engage >= 5.0 && t_engage <= 8.2,
+            (5.0..=8.2).contains(&t_engage),
             "quiet speech engage {t_engage:.1}s (tone at 6-8s)"
         );
         let peak_rel = levels.iter().map(|l| l.db).fold(0.0_f32, f32::max);
@@ -1227,7 +1285,7 @@ JSON
         let first = levels.iter().position(|l| l.active).expect("loud broadband must engage");
         let t_engage = first as f32 / 33.0;
         assert!(
-            t_engage >= 3.5 && t_engage <= 6.0,
+            (3.5..=6.0).contains(&t_engage),
             "loud burst engage {t_engage:.1}s"
         );
     }

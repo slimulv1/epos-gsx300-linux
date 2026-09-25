@@ -552,6 +552,10 @@ mod tests {
 
     /// The cap the daemon ships with is a number, not an aspiration: it is the
     /// difference between one poll and a watchdog that cannot keep up.
+    /// The tautology is the guard: these compare two constants, so the
+    /// test can only fail if someone edits the constant. That is the point
+    /// — these encode a policy choice, not a computation.
+    #[allow(clippy::assertions_on_constants)]
     #[test]
     fn the_shipped_cap_is_bounded() {
         assert!(MAX_STREAM_MOVES > 0 && MAX_STREAM_MOVES <= 64);

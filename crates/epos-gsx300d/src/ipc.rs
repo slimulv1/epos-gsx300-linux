@@ -1753,7 +1753,7 @@ mod tests {
     /// still a line, because `lines()` treats it as one.
     #[tokio::test]
     async fn closing_the_connection_ends_it_and_keeps_the_half_written_line() {
-        let (mut silent, server) = socket_pair().await;
+        let (silent, server) = socket_pair().await;
         let (mut half, half_server) = socket_pair().await;
 
         drop(silent);
@@ -1780,8 +1780,7 @@ mod tests {
     }
 
     fn profile(name: &str, mic_gain: u32) -> epos_shared::Profile {
-        let mut audio = AudioConfig::default();
-        audio.mic_gain = mic_gain;
+        let audio = AudioConfig { mic_gain, ..AudioConfig::default() };
         epos_shared::Profile {
             name: name.into(),
             mode: epos_shared::AudioMode::Stereo,
@@ -1795,8 +1794,7 @@ mod tests {
     #[test]
     fn live_edit_is_written_into_the_active_profile() {
         let mut profiles = vec![profile("FLAT", 80), profile("MUSIC", 50)];
-        let mut live = AudioConfig::default();
-        live.mic_gain = 37;
+        let mut live = AudioConfig { mic_gain: 37, ..AudioConfig::default() };
         live.voice_enhancer.mode = VoiceMode::Warm;
 
         sync_profile_audio(&mut profiles, "MUSIC", &live);
@@ -1810,8 +1808,7 @@ mod tests {
     #[test]
     fn other_profiles_are_left_untouched() {
         let mut profiles = vec![profile("FLAT", 80), profile("MUSIC", 50)];
-        let mut live = AudioConfig::default();
-        live.mic_gain = 37;
+        let live = AudioConfig { mic_gain: 37, ..AudioConfig::default() };
 
         sync_profile_audio(&mut profiles, "MUSIC", &live);
 
@@ -1823,8 +1820,7 @@ mod tests {
     #[test]
     fn unknown_active_profile_is_a_no_op() {
         let mut profiles = vec![profile("FLAT", 80)];
-        let mut live = AudioConfig::default();
-        live.mic_gain = 37;
+        let live = AudioConfig { mic_gain: 37, ..AudioConfig::default() };
 
         sync_profile_audio(&mut profiles, "", &live);
         sync_profile_audio(&mut profiles, "DOES-NOT-EXIST", &live);
@@ -1838,10 +1834,12 @@ mod tests {
     /// clicked.
     #[test]
     fn editing_eq_while_custom_updates_the_voice_bands() {
-        let mut audio = AudioConfig::default();
-        audio.voice_enhancer = VoiceEnhancerConfig {
-            mode: VoiceMode::Custom,
-            custom_bands: None,
+        let mut audio = AudioConfig {
+            voice_enhancer: VoiceEnhancerConfig {
+                mode: VoiceMode::Custom,
+                custom_bands: None,
+            },
+            ..AudioConfig::default()
         };
 
         let new_eq = epos_shared::config::EqConfig {
@@ -1886,10 +1884,12 @@ mod tests {
     #[test]
     fn non_custom_modes_do_not_get_eq_derived_bands() {
         for mode in [VoiceMode::Off, VoiceMode::Warm, VoiceMode::Clear] {
-            let mut audio = AudioConfig::default();
-            audio.voice_enhancer = VoiceEnhancerConfig {
-                mode,
-                custom_bands: None,
+            let mut audio = AudioConfig {
+                voice_enhancer: VoiceEnhancerConfig {
+                    mode,
+                    custom_bands: None,
+                },
+                ..AudioConfig::default()
             };
             let eq = epos_shared::config::EqConfig {
                 enabled: true,

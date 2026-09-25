@@ -539,8 +539,7 @@ mod tests {
     #[test]
     fn a_dangling_active_profile_never_resets_the_audio() {
         for active in ["", "DOES-NOT-EXIST"] {
-            let mut config = Config::default();
-            config.active_profile = active.to_string();
+            let mut config = Config { active_profile: active.to_string(), ..Config::default() };
             config.audio.mic_gain = 88;
 
             assert!(

@@ -3859,8 +3859,7 @@ mod tests {
 
         // Each one separately: a single hostile config that trips all three
         // would still pass if the funnel only fixed the first.
-        let mut gain = AudioConfig::default();
-        gain.mic_gain = 4_000_000_000;
+        let gain = AudioConfig { mic_gain: 4_000_000_000, ..AudioConfig::default() };
         pipeline.update_config(&gain);
         assert_eq!(
             pipeline.config.mic_gain, 100,
@@ -3925,8 +3924,7 @@ mod tests {
     /// a profile read out of the user's own file.
     #[test]
     fn the_value_bound_does_not_depend_on_which_copy_is_held() {
-        let mut cfg = AudioConfig::default();
-        cfg.mic_gain = 9_999;
+        let mut cfg = AudioConfig { mic_gain: 9_999, ..AudioConfig::default() };
         cfg.sidetone.level = 3.0;
         cfg.sidetone.enabled = true;
         cfg.noise_gate.threshold_db = 12.0;
@@ -4078,8 +4076,7 @@ mod tests {
     #[test]
     fn an_untouched_config_passes_through_the_funnel_unchanged() {
         let mut pipeline = AudioPipeline::new(&AudioConfig::default());
-        let mut cfg = AudioConfig::default();
-        cfg.mic_gain = 55;
+        let mut cfg = AudioConfig { mic_gain: 55, ..AudioConfig::default() };
         cfg.sidetone.level = 0.4;
         cfg.noise_gate.threshold_db = -35.0;
         pipeline.update_config(&cfg);
@@ -4171,7 +4168,7 @@ mod tests {
         );
         // Neither guesses for something that is not listed.
         assert_eq!(sink_index_of(listing, "absent"), None);
-        assert_eq!(sink_index_to_name(listing).get(&999), None);
+        assert!(!sink_index_to_name(listing).contains_key(&999));
 
         // And the doc comment has to stay attached to the right one. Checked by
         // looking at what sits between the two mentions, not by counting: a blank
@@ -5030,8 +5027,7 @@ mod tests {
     /// IPC edge — a profile carrying 5000 must not reach `amixer` either.
     #[test]
     fn pipeline_clamps_an_oversized_gain_from_any_source() {
-        let mut cfg = AudioConfig::default();
-        cfg.mic_gain = 5_000;
+        let cfg = AudioConfig { mic_gain: 5_000, ..AudioConfig::default() };
         let pipeline = AudioPipeline::new(&cfg);
         assert_eq!(pipeline.config.mic_gain, 100);
     }
@@ -5592,6 +5588,10 @@ mod tests {
 
     /// A single healthy poll must not erase a failure, or a flapping chain
     /// defeats the retry cadence and restarts every other cycle.
+    /// The tautology is the guard: these compare two constants, so the
+    /// test can only fail if someone edits the constant. That is the point
+    /// — these encode a policy choice, not a computation.
+    #[allow(clippy::assertions_on_constants)]
     #[test]
     fn recovery_needs_more_than_one_clean_poll() {
         assert!(
@@ -6180,6 +6180,10 @@ mod tests {
     /// The thresholds have to mean something: a single-probe threshold would let
     /// a single glitch declare a dead microphone, and a huge one would mean the
     /// check never fires.
+    /// The tautology is the guard: these compare two constants, so the
+    /// test can only fail if someone edits the constant. That is the point
+    /// — these encode a policy choice, not a computation.
+    #[allow(clippy::assertions_on_constants)]
     #[test]
     fn the_verdict_needs_more_than_one_probe_and_fewer_than_many() {
         assert!(MIC_SILENT_PROBES > 1, "one probe is not evidence");
@@ -6841,7 +6845,7 @@ mod tests {
         assert_eq!(by_index.get(&74).map(String::as_str),
                    Some("alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink"));
         assert_eq!(by_index.get(&33).map(String::as_str), Some("epos-eq-input"));
-        assert!(by_index.get(&999).is_none());
+        assert!(!by_index.contains_key(&999));
     }
 
     /// An empty or malformed listing yields no destinations rather than a guess.
