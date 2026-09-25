@@ -76,6 +76,8 @@ pub struct AudioPipeline {
     /// Whether a return is under way, so the log says it once per outage rather
     /// than once per poll.
     returning_streams: AtomicBool,
+    /// Whether the on-disk ledger has been read yet this run.
+    ledger_loaded: AtomicBool,
 }
 
 /// Microphone signal watchdog bookkeeping.
@@ -184,6 +186,52 @@ pub enum ExitOutcome {
     /// There was nowhere to go. The default was left untouched.
     NowhereToGo,
     /// The sinks could not be listed, so no choice could be made.
+    CouldNotDecide,
+}
+
+/// What a long press did when it was asked to enter the EPOS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnterOutcome {
+    /// Playback was already on the EPOS, so there was nothing to enter.
+    AlreadyHere,
+    /// Playback now routes through the EPOS device.
+    Entered(String),
+    /// The daemon knows no EPOS sink name, so nothing was changed.
+    NoDevice,
+    /// The EPOS sink is not published, so nothing was changed.
+    NotPublished(String),
+    /// The sinks could not be listed, so no choice could be made.
+    CouldNotDecide,
+}
+
+/// What a long press did, plus the stream moves it wants made afterwards.
+///
+/// Split because the moves must not run under the state lock: one
+/// `move-sink-input` per stream at a 5 s budget is minutes of subprocess time, and
+/// holding a read lock across that parks every IPC request and watcher behind it.
+pub struct ToggleResult {
+    pub outcome: ToggleOutcome,
+    pub moves: Option<streams::StreamMovePlan>,
+}
+
+/// What a long press did, whichever direction it went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToggleOutcome {
+    /// Playback was moved onto the EPOS device, named.
+    Entered(String),
+    /// Playback was moved off the EPOS to this device.
+    Left(String),
+    /// Already on the EPOS, so nothing was changed.
+    AlreadyHere,
+    /// Already off the EPOS, so nothing was changed.
+    AlreadyAway,
+    /// Leaving had nowhere to go, so the default was left untouched.
+    NowhereToGo,
+    /// No EPOS sink name is known, so the default was left untouched.
+    NoDevice,
+    /// The EPOS sink is not published, so the default was left untouched.
+    NotPublished(String),
+    /// The sink list could not be read, so no choice could be made.
     CouldNotDecide,
 }
   /// What to do with the default sink on this poll.
@@ -678,6 +726,7 @@ impl AudioPipeline {
             epos_in_use: AtomicBool::new(false),
             stream_ledger: Mutex::new(streams::StreamLedger::new(LEDGER_CAP)),
             returning_streams: AtomicBool::new(false),
+            ledger_loaded: AtomicBool::new(false),
             previous_sink: Mutex::new(None),
         };
         // Same funnel as update_config, so a hand-edited config.json is bounded
@@ -708,7 +757,7 @@ impl AudioPipeline {
     /// that is not ours. With neither, the default is left alone — pointing it at
     /// a sink that does not exist would be silence, and staying on the EPOS with
     /// a log line saying why is at least honest.
-    pub async fn exit_epos(&self) -> ExitOutcome {
+    pub async fn exit_epos(&self) -> (ExitOutcome, Option<streams::StreamMovePlan>) {
         let (raw_sink, _) = self.node_names();
         let current = Self::read_default_sink().await.unwrap_or_default();
         // Playback is somewhere else already: there is nothing to leave. Asking
@@ -716,7 +765,7 @@ impl AudioPipeline {
         // point — the first version negated it and reported the opposite of what
         // was true, on hardware, with the user sitting on the EPOS.
         if !is_epos_sink(&current, &raw_sink) {
-            return ExitOutcome::AlreadyAway;
+            return (ExitOutcome::AlreadyAway, None);
         }
         let sink_listing =
             match run_probe("pactl", &["list", "short", "sinks"], PROBE_BUDGET).await {
@@ -725,7 +774,7 @@ impl AudioPipeline {
                     // Not "nowhere to go" — we could not look. Saying otherwise
                     // would blame the user's hardware for a probe that failed.
                     warn!("Could not list sinks to leave the EPOS: {other:?}");
-                    return ExitOutcome::CouldNotDecide;
+                    return (ExitOutcome::CouldNotDecide, None);
                 }
             };
         let sinks = sink_names_from_listing(&sink_listing);
@@ -752,17 +801,181 @@ impl AudioPipeline {
                 sinks.len(),
                 remembered
             );
-            return ExitOutcome::NowhereToGo;
+            return (ExitOutcome::NowhereToGo, None);
         };
         if let Err(e) = Self::set_default_sink(&target).await {
             warn!("Could not leave the EPOS for {target}: {e}");
-            return ExitOutcome::NowhereToGo;
+            return (ExitOutcome::NowhereToGo, None);
         }
         // The routing poll has not run yet, so the cached "in use" would leave the
         // ring lit and the EQ reported as in the path for up to one poll. Correct it
         // from what just happened, which is an observation and not a guess.
         self.note_default_sink(Some(&target), false);
-        ExitOutcome::Moved(target)
+        // Changing the default only steers streams opened afterwards. Anything the
+        // rescue pinned to our hardware with `move-sink-input` keeps playing there,
+        // which is how the EPOS went on carrying the user's audio after they left
+        // it. So leaving also decides what has to be moved, and the caller runs it
+        // with no lock held.
+        let moves = self.plan_leave(&target).await;
+        (ExitOutcome::Moved(target), moves)
+    }
+
+    /// Decide which streams have to be moved off the EPOS hardware.
+    ///
+    /// Every user stream on either of our sinks, not only the ones the ledger knows:
+    /// the ledger is a memory, it was emptied by every restart until this commit,
+    /// and a pinned stream nobody remembers is a stream that never comes back.
+    async fn plan_leave(&self, target: &str) -> Option<streams::StreamMovePlan> {
+        let (raw_sink, _) = self.node_names();
+        let sinks = match run_probe("pactl", &["list", "short", "sinks"], PROBE_BUDGET).await {
+            Probe::Ran(out) => out,
+            other => {
+                warn!("Could not list sinks to leave the EPOS: {other:?}");
+                return None;
+            }
+        };
+        let mut ours = Vec::new();
+        for name in [raw_sink.as_str(), EQ_SINK_NAME] {
+            if let Some(i) = sink_index_of(&sinks, name) {
+                ours.push(i);
+            }
+        }
+        if ours.is_empty() {
+            return None;
+        }
+        let listing = match run_probe(
+            "pactl",
+            &["-f", "json", "list", "sink-inputs"],
+            PROBE_BUDGET,
+        )
+        .await
+        {
+            Probe::Ran(out) => out,
+            other => {
+                warn!("Could not list sink inputs to leave the EPOS: {other:?}");
+                return None;
+            }
+        };
+        let entries: Vec<streams::RescueStream> = match serde_json::from_str(&listing) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("sink-input JSON did not parse while leaving the EPOS: {e}");
+                return None;
+            }
+        };
+        let (indices, dropped) = streams::capped(
+            streams::streams_to_leave(&entries, &ours),
+            streams::MAX_STREAM_MOVES,
+        );
+        if dropped > 0 {
+            warn!(
+                "{dropped} stream(s) were left on the EPOS: leaving is capped at {} \
+                 moves per pass",
+                streams::MAX_STREAM_MOVES
+            );
+        }
+        if indices.is_empty() {
+            return None;
+        }
+        Some(streams::StreamMovePlan {
+            destination: target.to_string(),
+            indices,
+            cookie: Self::session_cookie().await,
+            purpose: streams::MovePurpose::Leave,
+        })
+    }
+
+    /// Move playback onto the EPOS.
+    ///
+    /// The mirror of [`Self::exit_epos`], and deliberately as narrow: the
+    /// destination is the device sink the daemon was configured with, checked
+    /// against the published list, and nothing else. No scan, no first-match, no
+    /// fallback to a sink that merely exists — an earlier attempt at entering the
+    /// EPOS moved live audio into `Dummy-Driver` and the user was left listening
+    /// to a null sink.
+    ///
+    /// No stream is moved explicitly. Measured, changing the default sink drags the
+    /// streams that follow it, so the move that matters is the one the routing poll
+    /// makes every 5 s anyway; doing it here as well is what makes the button feel
+    /// immediate rather than making the user wait out the poll.
+    pub async fn enter_epos(&self) -> EnterOutcome {
+        let (raw_sink, _) = self.node_names();
+        let current = Self::read_default_sink().await.unwrap_or_default();
+        let sink_listing =
+            match run_probe("pactl", &["list", "short", "sinks"], PROBE_BUDGET).await {
+                Probe::Ran(listing) => listing,
+                other => {
+                    // Not "no device" - we could not look. Saying otherwise would
+                    // blame the user's hardware for a probe that failed.
+                    warn!("Could not list sinks to enter the EPOS: {other:?}");
+                    return EnterOutcome::CouldNotDecide;
+                }
+            };
+        let published = sink_names_from_listing(&sink_listing);
+        let target = match crate::led::enter_target(&current, &raw_sink, EQ_SINK_NAME, &published)
+        {
+            crate::led::EnterTarget::AlreadyHere => return EnterOutcome::AlreadyHere,
+            crate::led::EnterTarget::NoDevice => {
+                warn!("No EPOS sink name is known, so the default was left alone");
+                return EnterOutcome::NoDevice;
+            }
+            crate::led::EnterTarget::NotPublished(sink) => {
+                warn!("The EPOS sink {sink} is not published, so the default was left alone");
+                return EnterOutcome::NotPublished(sink);
+            }
+            crate::led::EnterTarget::Go(sink) => sink,
+        };
+        // Remember where playback was. Leaving the EPOS prefers this over a scan,
+        // and the first published non-EPOS sink on this machine is a virtual
+        // loopback, so this is what stops a later exit landing somewhere useless.
+        self.note_default_sink(Some(&current), false);
+        if let Err(e) = Self::set_default_sink(&target).await {
+            warn!("Could not enter the EPOS for {target}: {e}");
+            return EnterOutcome::CouldNotDecide;
+        }
+        // The default is the EPOS device now. Whether the EQ belongs in the path
+        // is the same question the poll asks every cycle, so ask it once here
+        // rather than make the user wait for the next tick. `None` means "work it
+        // out", which is what the poll passes and what keeps a missing chain from
+        // becoming the anchor and silence.
+        if let Err(e) = self.route_output_with_chain(None).await {
+            warn!("Could not assert the EQ route after entering the EPOS: {e}");
+        }
+        // Correct the cached "in use" from what just happened, the same way the
+        // exit does, so the ring lights on this press instead of up to a poll later.
+        self.note_default_sink(Some(&target), true);
+        EnterOutcome::Entered(target)
+    }
+
+    /// Leave the EPOS if playback is on it, enter it if it is not.
+    ///
+    /// The direction comes from [`is_epos_sink`] and nothing else — not the cached
+    /// "in use" flag, which lags a poll, and not a negation of a user-choice test,
+    /// which is how an earlier version reported the opposite of what was true on
+    /// hardware with the user sitting on the EPOS. Each branch re-checks for
+    /// itself, so a default that changed between the two reads still lands on the
+    /// "already" answer rather than a route nobody asked for.
+    pub async fn toggle_epos(&self) -> ToggleResult {
+        let (raw_sink, _) = self.node_names();
+        let current = Self::read_default_sink().await.unwrap_or_default();
+        if is_epos_sink(&current, &raw_sink) {
+            let (outcome, moves) = self.exit_epos().await;
+            let outcome = match outcome {
+                ExitOutcome::AlreadyAway => ToggleOutcome::AlreadyAway,
+                ExitOutcome::Moved(sink) => ToggleOutcome::Left(sink),
+                ExitOutcome::NowhereToGo => ToggleOutcome::NowhereToGo,
+                ExitOutcome::CouldNotDecide => ToggleOutcome::CouldNotDecide,
+            };
+            return ToggleResult { outcome, moves };
+        }
+        let outcome = match self.enter_epos().await {
+            EnterOutcome::AlreadyHere => ToggleOutcome::AlreadyHere,
+            EnterOutcome::Entered(sink) => ToggleOutcome::Entered(sink),
+            EnterOutcome::NoDevice => ToggleOutcome::NoDevice,
+            EnterOutcome::NotPublished(sink) => ToggleOutcome::NotPublished(sink),
+            EnterOutcome::CouldNotDecide => ToggleOutcome::CouldNotDecide,
+        };
+        ToggleResult { outcome, moves: None }
     }
 
     /// The streams that are sending audio, with their sink resolved to a name.
@@ -870,6 +1083,13 @@ impl AudioPipeline {
     /// runs the batch with no lock held and comes back with
     /// [`Self::record_stream_moves`].
     pub async fn eq_plan(&self) -> Option<streams::StreamMovePlan> {
+        // Once per run, before anything can act on the ledger. It has to be a
+        // separate read because a daemon restart does not restart PipeWire: the
+        // indices are still ours, and until this ran they were forgotten, which is
+        // how a stream the rescue had pinned became somebody's permanent problem.
+        if !self.ledger_loaded.swap(true, Ordering::Relaxed) {
+            self.load_ledger().await;
+        }
         if !self.config.eq.enabled {
             self.eq_chain_missing_polls.store(0, Ordering::Relaxed);
             // EQ off: make sure the default sink is the raw device, not a
@@ -1232,7 +1452,7 @@ impl AudioPipeline {
             destination: raw_sink,
             indices,
             cookie: Self::session_cookie().await,
-            returning: false,
+            purpose: streams::MovePurpose::Rescue,
         })
     }
 
@@ -1308,6 +1528,7 @@ impl AudioPipeline {
             if self.returning_streams.swap(false, Ordering::Relaxed) {
                 info!("All rescued streams are back in the EQ audio path");
             }
+            self.save_ledger();
             return None;
         }
         if !self.returning_streams.swap(true, Ordering::Relaxed) {
@@ -1321,7 +1542,7 @@ impl AudioPipeline {
             destination: EQ_SINK_NAME.to_string(),
             indices,
             cookie,
-            returning: true,
+            purpose: streams::MovePurpose::Return,
         })
     }
 
@@ -1362,6 +1583,53 @@ impl AudioPipeline {
     /// A session that changed while the commands ran invalidates the indices: the
     /// numbers now belong to whatever took their place. Recording them would turn
     /// a recoverable outage into somebody else's stream being moved later.
+    /// Write the ledger out, or remove the file when there is nothing to remember.
+    ///
+    /// Best effort by design: losing the file costs a return that has to be
+    /// re-decided by hand, it must never cost the daemon a reply or a route.
+    fn save_ledger(&self) {
+        let Some(path) = ledger_path() else { return };
+        let text = lock(&self.stream_ledger).snapshot();
+        let result = match text {
+            Some(text) => {
+                if let Some(dir) = path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let tmp = path.with_extension("json.tmp");
+                std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &path))
+            }
+            None => match std::fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e),
+            },
+        };
+        if let Err(e) = result {
+            warn!("Could not persist the rescued-stream ledger: {e}");
+        }
+    }
+
+    /// Load the ledger a previous run left behind.
+    ///
+    /// The session cookie is read first and the file is only accepted if it
+    /// belongs to this session, so a stale file cannot sit in memory looking like
+    /// something to act on. A file that is missing, damaged or from another session
+    /// is not an error: there is simply nothing to remember.
+    async fn load_ledger(&self) {
+        let Some(path) = ledger_path() else { return };
+        let Ok(text) = std::fs::read_to_string(&path) else { return };
+        let cookie = Self::session_cookie().await;
+        let restored = lock(&self.stream_ledger).restore(&text, cookie.as_deref());
+        if restored {
+            info!(
+                "Remembered {} rescued stream(s) from the previous run",
+                lock(&self.stream_ledger).len()
+            );
+        } else if std::fs::remove_file(&path).is_ok() {
+            debug!("Discarded a rescued-stream ledger from another session");
+        }
+    }
+
     pub fn record_stream_moves(
         &self,
         plan: &streams::StreamMovePlan,
@@ -1379,7 +1647,7 @@ impl AudioPipeline {
             plan.cookie.as_deref(),
             result.cookie.as_deref(),
             &result.moved,
-            plan.returning,
+            plan.purpose,
         ) {
             streams::RecordAction::Discard(streams::DiscardReason::NothingMoved) => return,
             streams::RecordAction::Discard(why) => {
@@ -1427,6 +1695,7 @@ impl AudioPipeline {
                 }
             }
         }
+        self.save_ledger();
     }
 
     /// The PipeWire session cookie, or `None` when it could not be read.
@@ -2859,6 +3128,20 @@ const RECOVERY_POLLS: u32 = 2;
 /// is not a limit anyone should notice; it exists so a daemon left running for
 /// months cannot accumulate indices.
 const LEDGER_CAP: usize = 64;
+
+/// Where the parked-stream ledger is kept across restarts.
+///
+/// A daemon restart does not restart PipeWire, so the session cookie and the
+/// indices beside it are still meaningful afterwards. Dropping them on restart is
+/// what let a pinned stream become untrackable, and therefore permanent.
+fn ledger_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state"))
+        })?;
+    Some(base.join("epos-gsx300").join("stream-ledger.json"))
+}
 
 /// Consecutive absent polls before the chain is believed.
 ///

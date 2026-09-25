@@ -195,22 +195,79 @@ async fn main() -> Result<()> {
                 // ours, which by the route rule takes the EQ out of the path and
                 // darkens the ring.
                 HidEvent::LongPress => {
-                    let mut st = s.write().await;
-                    st.smart_button_seq
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    match st.audio.exit_epos().await {
-                        audio::ExitOutcome::AlreadyAway => {
+                    // A toggle, not an exit. Asking to leave while already away was
+                    // the state this button was in for its whole life: five presses
+                    // in a row logged "playback is already off the EPOS" and the
+                    // ring stayed dark, because the only way onto the EPOS was the
+                    // GUI. The direction is decided by `toggle_epos` from
+                    // `is_epos_sink`, never from the cached in-use flag, which lags
+                    // a poll.
+                    //
+                    // Read lock, not write. This branch runs pactl with a 5s budget
+                    // per command while holding it, and a write lock here freezes
+                    // every IPC request, the config watcher and the volume watcher
+                    // for the duration. Nothing here writes the state: the sequence
+                    // counter is an atomic and the LED sync reads the pipeline.
+                    let result = {
+                        let st = s.read().await;
+                        st.smart_button_seq
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        st.audio.toggle_epos().await
+                    };
+                    let audio::ToggleResult { outcome, moves } = result;
+                    // Leaving the EPOS has to move the audio with it: changing the
+                    // default only steers streams opened afterwards, and a stream
+                    // the rescue pinned with `move-sink-input` keeps playing on the
+                    // EPOS hardware. Measured: the EPOS DAC carried a louder signal
+                    // than the speakers the user was listening on.
+                    //
+                    // The moves run here with no lock held, for the same reason the
+                    // EQ rescue's do: one subprocess per stream at a 5s budget, and a
+                    // read lock held across that freezes IPC and every watcher. The
+                    // scope above has closed, so taking a lock again cannot nest.
+                    if let Some(plan) = moves {
+                        let moved = AudioPipeline::run_stream_moves(&plan).await;
+                        let st = s.read().await;
+                        st.audio.record_stream_moves(&plan, moved);
+                    }
+                    // The ring is the answer to "am I on the EPOS", so it is
+                    // corrected here rather than up to a poll later. That needs the
+                    // write lock, so it is a second short scope after the first has
+                    // closed - the two must not nest, or the queued writer deadlocks
+                    // against the read this task is still holding.
+                    if matches!(
+                        outcome,
+                        audio::ToggleOutcome::Entered(_) | audio::ToggleOutcome::Left(_)
+                    ) {
+                        let mut st = s.write().await;
+                        st.sync_led();
+                    }
+                    match outcome {
+                        audio::ToggleOutcome::Entered(sink) => {
+                            info!("Smart button long press: entered the EPOS via {sink}");
+                        }
+                        audio::ToggleOutcome::Left(sink) => {
+                            info!("Smart button long press: left the EPOS for {sink}");
+                        }
+                        audio::ToggleOutcome::AlreadyHere => {
+                            info!("Smart button long press: playback is already on the EPOS")
+                        }
+                        audio::ToggleOutcome::AlreadyAway => {
                             info!("Smart button long press: playback is already off the EPOS")
                         }
-                        audio::ExitOutcome::Moved(sink) => {
-                            info!("Smart button long press: left the EPOS for {sink}");
-                            st.sync_led();
-                        }
-                        audio::ExitOutcome::NowhereToGo => warn!(
+                        audio::ToggleOutcome::NoDevice => warn!(
+                            "Smart button long press: no EPOS sink name is known, so the \
+                             default was left alone"
+                        ),
+                        audio::ToggleOutcome::NotPublished(sink) => warn!(
+                            "Smart button long press: the EPOS sink {sink} is not published, \
+                             so the default was left alone"
+                        ),
+                        audio::ToggleOutcome::NowhereToGo => warn!(
                             "Smart button long press: no other published sink to go to, \
                              so the default was left alone"
                         ),
-                        audio::ExitOutcome::CouldNotDecide => warn!(
+                        audio::ToggleOutcome::CouldNotDecide => warn!(
                             "Smart button long press: the sink list could not be read, \
                              so the default was left alone"
                         ),

@@ -173,6 +173,51 @@ pub fn exit_target(
         .map(|s| (*s).to_string())
 }
 
+/// Where a long press should send playback when it is not on the EPOS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnterTarget {
+    /// Playback is already on the EPOS, raw sink or anchor alike.
+    AlreadyHere,
+    /// The daemon has no device sink to go to.
+    NoDevice,
+    /// The device's sink is not published, so the default is left alone.
+    NotPublished(String),
+    /// This sink, and only this sink.
+    Go(String),
+}
+
+/// Which sink to enter when the user asks to go to the EPOS.
+///
+/// Pure, like [`exit_target`], because the destination of someone's audio is
+/// exactly the thing that should not be discovered by trying it on live playback.
+///
+/// The answer is always the device's own sink and never a name found by scanning.
+/// Scanning is what chose `Dummy-Driver` once and moved the user's audio into a
+/// null sink with nothing to say so; the destination has to be the sink the
+/// daemon was configured with, or nothing at all.
+///
+/// `AlreadyHere` covers the whole EPOS rather than just the raw sink, because both
+/// are playback on the EPOS. Asking again from the anchor would mean the button
+/// and the routing disagree, and the honest response to that is a log line, not a
+/// silent re-route.
+pub fn enter_target(
+    current: &str,
+    raw_sink: &str,
+    anchor: &str,
+    published: &[String],
+) -> EnterTarget {
+    if !current.is_empty() && (sink_is_managed(current, raw_sink) || current == anchor) {
+        return EnterTarget::AlreadyHere;
+    }
+    if raw_sink.is_empty() {
+        return EnterTarget::NoDevice;
+    }
+    if !published.iter().any(|s| s == raw_sink) {
+        return EnterTarget::NotPublished(raw_sink.to_string());
+    }
+    EnterTarget::Go(raw_sink.to_string())
+}
+
 /// HID Output payload size for Report ID 0x02 (the LED ring).
 ///
 /// Derived from the 120-byte report descriptor shipped by this device:
@@ -533,6 +578,96 @@ impl Drop for LedController {
 mod tests {
     use super::*;
     use crate::audio::EQ_SINK_NAME;
+
+    // ─── Entering the EPOS ─────────────────────────────────────────
+
+    fn published_sinks() -> Vec<String> {
+        // Measured from `pactl list short sinks` on this machine. `games_sink` is
+        // a virtual loopback and `Dummy-Driver` is not a speaker at all, which is
+        // why a scan for "some sink" is not an answer.
+        [
+            EQ_SINK_NAME.to_string(),
+            "games_sink".to_string(),
+            RAW.to_string(),
+            SPEAKER.to_string(),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    const RAW: &str = "alsa_output.usb-Sennheiser_EPOS_GSX_300-00.analog-stereo";
+    const SPEAKER: &str = "alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink";
+
+    /// From the speakers, a long press goes to the EPOS device.
+    #[test]
+    fn entering_from_the_speakers_uses_the_epos_device() {
+        assert_eq!(
+            enter_target(SPEAKER, RAW, EQ_SINK_NAME, &published_sinks()),
+            EnterTarget::Go(RAW.to_string())
+        );
+    }
+
+    /// The destination is the configured device and never a name from the list.
+    /// Scanning is what once picked `Dummy-Driver` and moved live audio into a
+    /// null sink with no diagnostic, so the list is there to be checked against,
+    /// not chosen from.
+    #[test]
+    fn entering_never_picks_a_name_out_of_the_sink_list() {
+        let mut published = published_sinks();
+        published.insert(0, "Dummy-Driver".to_string());
+        assert_eq!(
+            enter_target(SPEAKER, RAW, EQ_SINK_NAME, &published),
+            EnterTarget::Go(RAW.to_string()),
+            "the first published sink is not the answer; the configured device is"
+        );
+    }
+
+    /// Already on the raw sink: there is nothing to enter.
+    #[test]
+    fn already_on_the_epos_device_is_not_re_entered() {
+        assert_eq!(
+            enter_target(RAW, RAW, EQ_SINK_NAME, &published_sinks()),
+            EnterTarget::AlreadyHere
+        );
+    }
+
+    /// Already on the anchor is also already on the EPOS, EQ and all.
+    #[test]
+    fn already_on_the_anchor_is_not_re_entered() {
+        assert_eq!(
+            enter_target(EQ_SINK_NAME, RAW, EQ_SINK_NAME, &published_sinks()),
+            EnterTarget::AlreadyHere
+        );
+    }
+
+    /// No device name means no guess. The caller leaves the default alone.
+    #[test]
+    fn no_device_means_no_guess() {
+        assert_eq!(
+            enter_target(SPEAKER, "", EQ_SINK_NAME, &published_sinks()),
+            EnterTarget::NoDevice
+        );
+    }
+
+    /// A device that is not published cannot be routed to. Naming it is better
+    /// than a shrug, because "the EPOS is not there" is the actual problem.
+    #[test]
+    fn a_device_that_is_not_published_is_refused_by_name() {
+        assert_eq!(
+            enter_target(SPEAKER, RAW, EQ_SINK_NAME, &[SPEAKER.to_string()]),
+            EnterTarget::NotPublished(RAW.to_string())
+        );
+    }
+
+    /// An empty current sink is not "already here". A default that could not be
+    /// read must not be mistaken for a reason to do nothing.
+    #[test]
+    fn an_unreadable_default_is_not_already_here() {
+        assert_eq!(
+            enter_target("", RAW, EQ_SINK_NAME, &published_sinks()),
+            EnterTarget::Go(RAW.to_string())
+        );
+    }
 
     // ─── What the ring shows ───────────────────────────────────────
     //

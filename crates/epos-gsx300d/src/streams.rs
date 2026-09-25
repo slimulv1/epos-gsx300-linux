@@ -123,8 +123,22 @@ pub struct StreamMovePlan {
     /// The PipeWire session the indices were read in. `None` means the cookie
     /// could not be read, in which case nothing may be recorded.
     pub cookie: Option<String>,
-    /// True for a return, false for a rescue.
-    pub returning: bool,
+    pub purpose: MovePurpose,
+}
+
+/// Why a batch of streams is being moved, which is what the ledger does about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MovePurpose {
+    /// The EQ chain died and playback had to leave the anchor.
+    Rescue,
+    /// The chain is healthy again and the streams go back onto the anchor.
+    Return,
+    /// The user is leaving the EPOS for another device.
+    ///
+    /// Like [`MovePurpose::Return`] as far as the ledger is concerned — the streams
+    /// are not on our hardware any more — but the log line differs, because they
+    /// only come back if the user asks.
+    Leave,
 }
 
 /// What running a plan actually achieved.
@@ -135,6 +149,33 @@ pub struct StreamMoveResult {
     /// The session afterwards. A change from the plan's means PipeWire restarted
     /// mid-plan, so the indices no longer mean what they meant.
     pub cookie: Option<String>,
+}
+
+/// Which streams to move off the EPOS when the user is leaving it.
+///
+/// The mirror of [`streams_to_rescue`], and it exists because of what was measured:
+/// `pactl move-sink-input` *pins* a stream to its sink for good, so a rescue that
+/// parked playback on the raw EPOS left it there after the user long-pressed away.
+/// Changing the default sink does not touch it — that only steers streams opened
+/// afterwards — so the EPOS went on playing the user's audio while the speakers
+/// played the same thing. Measured: a Firefox stream sitting on the EPOS DAC,
+/// uncorked, with the default sink on the speakers, and the EPOS DAC carrying a
+/// *louder* signal than the speakers did.
+///
+/// So leaving takes every user stream off both of our sinks, not only the ones the
+/// ledger happens to know about. The ledger lives in memory and a daemon restart
+/// used to empty it, which is exactly when a pinned stream became untrackable.
+pub fn streams_to_leave(entries: &[RescueStream], our_sink_indices: &[u32]) -> Vec<u32> {
+    entries
+        .iter()
+        .filter(|s| our_sink_indices.contains(&s.sink))
+        .filter(|s| {
+            !s.properties
+                .get("node.name")
+                .is_some_and(|n| is_own_node(n))
+        })
+        .map(|s| s.index)
+        .collect()
 }
 
 /// One stream's sink, as resolved by the caller from a listing.
@@ -240,7 +281,7 @@ pub fn record_action(
     plan_cookie: Option<&str>,
     after_cookie: Option<&str>,
     moved: &[u32],
-    returning: bool,
+    purpose: MovePurpose,
 ) -> RecordAction {
     if moved.is_empty() {
         return RecordAction::Discard(DiscardReason::NothingMoved);
@@ -251,10 +292,11 @@ pub fn record_action(
     if plan_cookie.is_none() {
         return RecordAction::Discard(DiscardReason::NoCookie);
     }
-    if returning {
-        RecordAction::Return(moved.to_vec())
-    } else {
-        RecordAction::Rescue(moved.to_vec())
+    match purpose {
+        MovePurpose::Rescue => RecordAction::Rescue(moved.to_vec()),
+        // Leaving is a return as far as the ledger is concerned: the streams are
+        // no longer on our hardware, so there is nothing left to bring back.
+        MovePurpose::Return | MovePurpose::Leave => RecordAction::Return(moved.to_vec()),
     }
 }
 
@@ -345,6 +387,47 @@ impl StreamLedger {
         for i in indices {
             self.rescued.remove(i);
         }
+    }
+
+    /// The ledger as text, or `None` when there is nothing to remember.
+    ///
+    /// Text rather than a live handle so the caller decides where it lives. It has
+    /// to outlive the process: a daemon restart does not restart PipeWire, so the
+    /// cookie and the indices stay meaningful across one, and throwing them away
+    /// is what let a pinned stream become untrackable and therefore permanent.
+    pub fn snapshot(&self) -> Option<String> {
+        if self.rescued.is_empty() {
+            return None;
+        }
+        let indices: Vec<u32> = self.rescued.iter().copied().collect();
+        let file = serde_json::json!({ "cookie": self.cookie, "indices": indices });
+        serde_json::to_string(&file).ok()
+    }
+
+    /// Load a snapshot, keeping it only if it belongs to the current session.
+    ///
+    /// The session check is here rather than at the point of use so a stale file
+    /// cannot sit in the ledger looking like something to act on. Returns whether
+    /// anything was restored.
+    pub fn restore(&mut self, text: &str, current_cookie: Option<&str>) -> bool {
+        let Ok(file) = serde_json::from_str::<serde_json::Value>(text) else {
+            return false;
+        };
+        let Some(cookie) = file.get("cookie").and_then(|c| c.as_str()) else {
+            return false;
+        };
+        let empty: Vec<u32> = Vec::new();
+        let indices: Vec<u32> = file
+            .get("indices")
+            .and_then(|i| i.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect())
+            .unwrap_or(empty);
+        if indices.is_empty() || Some(cookie) != current_cookie {
+            return false;
+        }
+        self.rescued = indices.into_iter().take(self.cap).collect();
+        self.cookie = Some(cookie.to_string());
+        true
     }
 
     /// How many streams are waiting, for the log line and the route decision.
@@ -537,13 +620,103 @@ mod tests {
         assert_eq!(session_cookie("Cookie:\n"), None);
     }
 
+    // ─── Surviving a restart ────────────────────────────────────────
+
+    /// What the daemon forgets must also survive its own restart, or a pinned
+    /// stream becomes permanent: the rescue moved it, the daemon restarted to
+    /// deploy a fix, and from then on nothing knew it was ours to move.
+    #[test]
+    fn a_snapshot_round_trips_and_needs_the_same_session() {
+        let mut ledger = StreamLedger::new(64);
+        ledger.note_rescued(&[8792, 4714], Some("session-a"));
+        let text = ledger.snapshot().expect("a non-empty ledger has a snapshot");
+
+        let mut restarted = StreamLedger::new(64);
+        assert!(
+            restarted.restore(&text, Some("session-a")),
+            "the same PipeWire session means the indices are still ours"
+        );
+        assert_eq!(restarted.len(), 2);
+    }
+
+    /// A different session refuses the file outright, so a stale ledger never sits
+    /// in memory looking like something to act on.
+    #[test]
+    fn a_snapshot_from_another_session_is_refused() {
+        let mut ledger = StreamLedger::new(64);
+        ledger.note_rescued(&[8792], Some("session-a"));
+        let text = ledger.snapshot().expect("snapshot");
+
+        let mut restarted = StreamLedger::new(64);
+        assert!(!restarted.restore(&text, Some("session-b")));
+        assert!(!restarted.restore(&text, None), "no cookie means no proof");
+        assert!(restarted.is_empty());
+    }
+
+    /// A file that is not ours, or is damaged, changes nothing.
+    #[test]
+    fn a_damaged_snapshot_is_ignored() {
+        let mut ledger = StreamLedger::new(64);
+        assert!(!ledger.restore("not json", Some("c")));
+        assert!(!ledger.restore(r#"{"cookie":"c"}"#, Some("c")));
+        assert!(!ledger.restore(r#"{"cookie":"c","indices":[]}"#, Some("c")));
+        assert!(ledger.is_empty());
+    }
+
+    /// An empty ledger has no file, so leaving no trace is the normal case.
+    #[test]
+    fn an_empty_ledger_has_no_snapshot() {
+        assert!(StreamLedger::new(64).snapshot().is_none());
+    }
+
+    // ─── Leaving the EPOS ──────────────────────────────────────────
+
+    fn leave_entries() -> Vec<RescueStream> {
+        serde_json::from_str(
+            r#"[
+              {"index":8792,"sink":71,"properties":{"node.name":"Firefox"}},
+              {"index":32224,"sink":71,"properties":{"node.name":"epos-eq-output"}},
+              {"index":168,"sink":71,"properties":{"node.name":"epos-sidetone-output"}},
+              {"index":36543,"sink":33,"properties":{"node.name":"paplay"}},
+              {"index":33570,"sink":74,"properties":{"node.name":"Firefox"}}
+            ]"#,
+        )
+        .expect("fixture parses")
+    }
+
+    /// The measured case: leaving takes the user's audio off the EPOS, or it keeps
+    /// playing there while the speakers play it too.
+    #[test]
+    fn leaving_takes_user_streams_off_both_of_our_sinks() {
+        // 71 is the raw EPOS, 33 the EQ anchor, 74 the user's speakers.
+        assert_eq!(
+            streams_to_leave(&leave_entries(), &[71, 33]),
+            vec![8792, 36543],
+            "a stream pinned on the EPOS keeps playing there after the default moves"
+        );
+    }
+
+    /// The daemon's own streams stay: they are the chain being left, not audio.
+    #[test]
+    fn leaving_does_not_take_the_daemons_own_streams() {
+        assert_eq!(streams_to_leave(&leave_entries(), &[71]), vec![8792]);
+    }
+
+    /// A stream already on the user's own device is not ours to move.
+    #[test]
+    fn leaving_leaves_other_devices_alone() {
+        let moved = streams_to_leave(&leave_entries(), &[33]);
+        assert!(moved.contains(&36543));
+        assert!(!moved.contains(&33570), "33570 is already on the speakers");
+    }
+
     // ─── Recording a finished plan ─────────────────────────────────
 
     /// A rescue that moved streams records them.
     #[test]
     fn a_rescue_is_recorded() {
         assert_eq!(
-            record_action(Some("c1"), Some("c1"), &[38, 71], false),
+            record_action(Some("c1"), Some("c1"), &[38, 71], MovePurpose::Rescue),
             RecordAction::Rescue(vec![38, 71])
         );
     }
@@ -552,7 +725,7 @@ mod tests {
     #[test]
     fn a_return_is_forgotten() {
         assert_eq!(
-            record_action(Some("c1"), Some("c1"), &[38], true),
+            record_action(Some("c1"), Some("c1"), &[38], MovePurpose::Return),
             RecordAction::Return(vec![38])
         );
     }
@@ -563,7 +736,7 @@ mod tests {
     #[test]
     fn a_session_change_during_the_move_discards_the_indices() {
         assert_eq!(
-            record_action(Some("c1"), Some("c2"), &[38], false),
+            record_action(Some("c1"), Some("c2"), &[38], MovePurpose::Rescue),
             RecordAction::Discard(DiscardReason::SessionChanged)
         );
     }
@@ -573,7 +746,7 @@ mod tests {
     #[test]
     fn no_cookie_discards_rather_than_guesses() {
         assert_eq!(
-            record_action(None, None, &[38], false),
+            record_action(None, None, &[38], MovePurpose::Rescue),
             RecordAction::Discard(DiscardReason::NoCookie)
         );
     }
@@ -584,7 +757,7 @@ mod tests {
     #[test]
     fn a_changed_session_is_not_reported_as_a_missing_cookie() {
         assert_eq!(
-            record_action(None, Some("c2"), &[38], false),
+            record_action(None, Some("c2"), &[38], MovePurpose::Rescue),
             RecordAction::Discard(DiscardReason::SessionChanged)
         );
     }
@@ -594,7 +767,7 @@ mod tests {
     #[test]
     fn an_empty_move_is_not_a_safety_discard() {
         assert_eq!(
-            record_action(Some("c1"), Some("c1"), &[], false),
+            record_action(Some("c1"), Some("c1"), &[], MovePurpose::Rescue),
             RecordAction::Discard(DiscardReason::NothingMoved)
         );
     }
