@@ -1823,15 +1823,6 @@ impl AudioPipeline {
         Ok(changed)
     }
 
-    /// Apply configuration and device together
-    #[allow(dead_code)]
-    pub async fn apply(&mut self, config: &AudioConfig, device: &DeviceInfo) -> Result<()> {
-        self.config = config.clone();
-        self.device = Some(device.clone());
-        self.apply_full().await?;
-        Ok(())
-    }
-
     // ─── Mic Gain ─────────────────────────────────────────────
 
     pub async fn apply_mic_gain(&self) -> Result<()> {

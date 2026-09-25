@@ -1332,58 +1332,6 @@ pub fn chain_stage_to_apply(current: i32) -> Option<i32> {
     }
 }
 
-/// Every published sink whose volume is above 100%, as `(name, level)`.
-///
-/// `pactl list short sinks` carries no volume, so this reads the long form and
-/// takes each block's `Name` and the first `N%` of its `Volume` line. The first
-/// channel is deliberate: every sink PipeWire publishes has a front-left, and
-/// averaging the channels would hide a sink whose right channel was pushed
-/// over while the left was not.
-///
-/// Pure, and tested against output captured from this machine, because a parser
-/// that silently finds nothing is indistinguishable from a machine where no sink
-/// is over the ceiling - which is the failure this is here to prevent.
-pub fn sinks_over_cap(listing: &str) -> Vec<(String, i32)> {
-    let mut out = Vec::new();
-    let mut name: Option<String> = None;
-    for line in listing.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("Name: ") {
-            name = Some(rest.trim().to_string());
-        } else if let Some(rest) = line.strip_prefix("Volume: ") {
-            let Some(sink) = name.take() else { continue };
-            let Some(pct) = rest.split('/').nth(1) else {
-                continue;
-            };
-            let Ok(level) = pct.trim().trim_end_matches('%').trim().parse::<i32>() else {
-                continue;
-            };
-            if level > 100 {
-                out.push((sink, level));
-            }
-        }
-    }
-    out
-}
-
-/// The sinks the watcher has to pull back, excluding the one it follows.
-///
-/// The followed sink is excluded because it is capped by a separate path that
-/// also updates the trackers; writing it here as well would have the two writes
-/// race for no reason.
-///
-/// Split out from the watcher because the parser being correct is not the same
-/// claim as the caller acting on all of it. Testing `sinks_over_cap` alone
-/// proved a list of over-ceiling devices could be built and said nothing about
-/// whether every one of them got written - a mutation that narrowed this to the
-/// single playing sink passed the parser tests untouched.
-pub fn sinks_to_cap(listing: &str, followed: &str) -> Vec<(String, i32)> {
-    sinks_over_cap(listing)
-        .into_iter()
-        .filter(|(name, _)| name != followed)
-        .collect()
-}
-
 /// What kind of object a volume belongs to, and the `pactl` verb that writes it.
 ///
 /// The ceiling was applied to sinks only, and the rest of the system was found
@@ -2131,18 +2079,18 @@ Source Output #7
 
     /// The ceiling covers every sink, not only the one playing.
     ///
-    /// The first version capped the sink the daemon was following, which is the
-    /// default. That left every other device unlimited: playback on the headset,
-    /// and the speakers could sit at 150% indefinitely. A ceiling that applies to
-    /// one device is not a ceiling.
+    /// The sink path of the parser that actually runs.
     ///
-    /// Parsed against output captured from this machine rather than a shape
-    /// imagined for it - `pactl list short sinks` carries no volume at all, and
-    /// the long form puts every channel on one line.
+    /// These four tests used to call a sink-only copy, `sinks_over_cap`, while
+    /// the watcher called `over_cap_in`. Making `over_cap_in` return nothing for
+    /// `VolumeKind::Sink` - which disables the ceiling for every sink on the
+    /// machine - left the whole suite green. The coverage was on the copy and
+    /// not on the code, and the copy existed only to be covered.
+    ///
+    /// So the assertions are here now, against the path production takes. Same
+    /// listings, captured from this machine.
     #[test]
     fn every_sink_over_the_ceiling_is_found_not_just_the_one_playing() {
-        // Captured verbatim from `pactl list sinks` here, with over-ceiling
-        // values set on two unrelated devices.
         let listing = "\
 Sink #36
 \tState: IDLE
@@ -2160,7 +2108,7 @@ Sink #26125
 \tVolume: front-left: 65536 / 100% / 0.00 dB,   front-right: 65536 / 100% / 0.00 dB
 ";
         assert_eq!(
-            sinks_over_cap(listing),
+            over_cap_in(VolumeKind::Sink, listing),
             vec![
                 (
                     "alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__SPDIF__sink".to_string(),
@@ -2175,8 +2123,11 @@ Sink #26125
         );
     }
 
-    /// A sink exactly at the ceiling is left alone, and a listing with nothing
-    /// over it yields nothing rather than every sink.
+    /// A sink exactly at the ceiling is left alone: a ceiling, not a pin.
+    ///
+    /// `>=` instead of `>` here is the mutation that would turn the whole feature
+    /// into what the user rejected - every sink dragged up to 100% on every
+    /// tick, and no way to turn anything down.
     #[test]
     fn a_sink_at_the_ceiling_is_not_treated_as_over_it() {
         let listing = "\
@@ -2187,18 +2138,16 @@ Sink #1
 \tName: below
 \tVolume: front-left: 32768 / 50% / -18.06 dB,   front-right: 32768 / 50% / -18.06 dB
 ";
-        assert!(sinks_over_cap(listing).is_empty());
+        assert!(over_cap_in(VolumeKind::Sink, listing).is_empty());
     }
 
-    /// Every over-ceiling sink is acted on, not only the one playing.
+    /// Every over-ceiling sink is written, not only the followed one.
     ///
-    /// This is the gap the parser tests could not see. They prove a list of
-    /// over-ceiling devices can be built; this proves the watcher acts on all of
-    /// it. A mutation that narrowed the watcher to the single followed sink
-    /// passed every parser test and would have left the speakers at 150% while
-    /// the user believed the ceiling covered the machine.
+    /// The exclusion the watcher applies is a `continue` on the followed name,
+    /// and this pins the list it filters: the two idle devices over the line must
+    /// both be in it, and the quiet one must not.
     #[test]
-    fn the_watcher_acts_on_every_over_ceiling_sink_and_not_just_the_playing_one() {
+    fn every_over_ceiling_sink_but_the_followed_one_is_written() {
         let listing = "\
 Sink #0
 \tName: speakers
@@ -2213,23 +2162,24 @@ Sink #3
 \tName: quiet_one
 \tVolume: front-left: 32768 / 50% / -18.06 dB
 ";
+        let to_write = |followed: &str| -> Vec<String> {
+            over_cap_in(VolumeKind::Sink, listing)
+                .into_iter()
+                .filter(|(n, _)| n != followed)
+                .map(|(n, _)| n)
+                .collect()
+        };
         assert_eq!(
-            sinks_to_cap(listing, "playing_now"),
-            vec![
-                ("speakers".to_string(), 150),
-                ("headphones".to_string(), 110),
-            ],
-            "both idle devices over the ceiling must be written; the followed \
-             sink is handled by its own path and the quiet one is not touched"
+            to_write("playing_now"),
+            vec!["speakers".to_string(), "headphones".to_string()],
+            "both idle devices over the ceiling must be written"
         );
-        // With a different sink playing, the followed one simply moves out of
-        // this list - the point is that the other two do not.
         assert_eq!(
-            sinks_to_cap(listing, "quiet_one"),
+            to_write("quiet_one"),
             vec![
-                ("speakers".to_string(), 150),
-                ("headphones".to_string(), 110),
-                ("playing_now".to_string(), 130),
+                "speakers".to_string(),
+                "headphones".to_string(),
+                "playing_now".to_string(),
             ]
         );
     }
@@ -2254,7 +2204,7 @@ Sink #1
 \tVolume: front-left: 98304 / 150% / 10.61 dB
 ";
         assert_eq!(
-            sinks_over_cap(listing),
+            over_cap_in(VolumeKind::Sink, listing),
             vec![("over_the_line".to_string(), 150)],
             "the over-ceiling sink must be reported under its own name"
         );

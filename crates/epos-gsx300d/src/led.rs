@@ -474,21 +474,10 @@ impl LedController {
         anyhow::bail!("GSX 300 not found in /sys/class/hidraw")
     }
 
-    /// Check if the hidraw device is accessible
-    #[allow(dead_code)]
-    pub fn is_accessible(&self) -> bool {
-        self.file.is_some()
-    }
-
     /// True when the last write failed, i.e. LED control is not working.
     /// Callers can surface this instead of pretending the ring is in sync.
     pub fn write_failing(&self) -> bool {
         self.last_write_failed
-    }
-
-    #[allow(dead_code)]
-    pub fn current_indicator(&self) -> Option<LedIndicator> {
-        self.current_indicator
     }
 }
 
