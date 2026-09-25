@@ -14,28 +14,23 @@ static inline double db(double ratio) { return 20.0 * log10(ratio); }
 #define NCTRL 4
 enum { P_OUT_L, P_OUT_R, P_IN_L, P_IN_R, P_GAIN, P_SPREAD, P_FRONT_W, P_REAR_LVL, P_NPORTS };
 
-typedef struct { int hint; double lower, upper; const char *name; } PortRange;
-typedef int PortDescriptor;
-typedef struct { const char *label, *name; const void *properties; int property_count; } Properties;
-typedef struct {
-    unsigned long unique_id;
-    const char *label;
-    Properties properties;
-    const char *name, *maker, *copyright;
-    unsigned long port_count;
-    const PortDescriptor *port_descriptors;
-    const char *const *port_names;
-    const PortRange *port_range_hints;
-    const char *implementation_data;
-    void *(*instantiate)(const void *, unsigned long);
-    void (*connect_port)(void *, unsigned long, float *);
-    int (*activate)(void *);
-    void (*run)(void *, unsigned long);
-    void (*run_adding)(void *, unsigned long);
-    void (*set_run_adding_gain)(void *, float);
-    void (*deactivate)(void *);
-    void (*cleanup)(void *);
-} Descriptor;
+/* The descriptor comes from PipeWire's own header, not from a transcription of
+ * it. This file previously declared it by hand, and a hand-written struct that
+ * disagrees with the host is precisely the class of bug this crate spent a
+ * session fixing: `LADSPA_Properties` and `LADSPA_Data` differ from the
+ * published LADSPA 1.1 spec in PipeWire's copy, and a copy made here drifted
+ * from both. `tools/abi.c` is the tool that exists to catch that, and it works
+ * because it includes the header rather than restating it. This file now does
+ * the same thing, so there is one declaration in the tree instead of two.
+ *
+ * Fetch the header next to this file before building; see tools/README.md. */
+#include "ladspa.h"
+
+/* PipeWire's header names these differently; aliases so the call sites below
+ * read the same as the plugin's own port constants. */
+typedef LADSPA_PortRangeHint PortRange;
+typedef LADSPA_PortDescriptor PortDescriptor;
+typedef LADSPA_Descriptor Descriptor;
 
 typedef struct { double el, er, peak_l, peak_r; } Reading;
 
@@ -78,25 +73,3 @@ static inline Reading run_side(const Descriptor *d, float *il, float *ir,
     free(ol); free(or_);
     return r;
 }
-
-/* Read one HRIR straight out of the baked blob inside the .so, so the data is
- * measured where it is actually used rather than trusted from a second copy. */
-typedef struct { unsigned long unique_id; const char *label; Properties properties;
-  const char *name, *maker, *copyright; unsigned long port_count;
-  const int *port_descriptors; const char *const *port_names; const PortRange *port_range_hints;
-  const char *implementation_data;
-  void *(*instantiate)(const void *, unsigned long);
-  void (*connect_port)(void *, unsigned long, float *);
-  int (*activate)(void *);
-  void (*run)(void *, unsigned long);
-  void (*run_adding)(void *, unsigned long);
-  void (*set_run_adding_gain)(void *, float);
-  void (*deactivate)(void *);
-  void (*cleanup)(void *);
-  int _pad;
-} ProbeDesc;
-
-/* The blob is a private static, so the only way to see the filters the plugin
- * really convolves with is to measure its response. The per-ear peak of each
- * speaker is recovered by driving one speaker and taking the peak, which is what
- * the harness already does. */

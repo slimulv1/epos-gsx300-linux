@@ -22,43 +22,18 @@
 #include <string.h>
 #include <time.h>
 
-#define LADSPA_PORT_INPUT 1
-#define LADSPA_PORT_OUTPUT 2
-#define LADSPA_PORT_CONTROL 4
-#define LADSPA_PORT_AUDIO 8
 
-typedef struct { int hint; double lower, upper; const char *name; } PortRange;
-typedef int PortDescriptor;
+/* The descriptor comes from PipeWire's own header, not from a transcription of
+ * it. This file previously declared it by hand and was wrong about it in exactly
+ * the two places the published LADSPA 1.1 spec differs from the header PipeWire
+ * ships - `LADSPA_Properties` is an int and `LADSPA_Data` is a float - which
+ * made it segfault on a descriptor that loads perfectly well. It agreed with
+ * tools/abi.c only by accident. One declaration in the tree, from the source. */
+#include "ladspa.h"
 
-typedef struct {
-    const char *label, *name;
-    const void *properties;
-    int property_count;
-} Properties;
-
-typedef struct {
-    unsigned long unique_id;
-    const char *label;
-    Properties properties;          /* by value, per the LADSPA header */
-    const char *name, *maker, *copyright;
-    unsigned long port_count;
-    const PortDescriptor *port_descriptors;
-    const char *const *port_names;
-    const PortRange *port_range_hints;
-    const char *implementation_data;
-    void *(*instantiate)(const void *, unsigned long);
-    void (*connect_port)(void *, unsigned long, float *);
-    int (*activate)(void *);
-    void (*run)(void *, unsigned long);
-    /* These two sit between run and deactivate in the LADSPA descriptor. Leave
-     * them out and deactivate/cleanup read the wrong words - which does not
-     * crash at the descriptor, it crashes when the mismatched pointer is
-     * called, pointing at run_adding or at the address of a function's code. */
-    void (*run_adding)(void *, unsigned long);
-    void (*set_run_adding_gain)(void *, float);
-    void (*deactivate)(void *);
-    void (*cleanup)(void *);
-} Descriptor;
+typedef LADSPA_PortRangeHint PortRange;
+typedef LADSPA_PortDescriptor PortDescriptor;
+typedef LADSPA_Descriptor Descriptor;
 
 #define RATE 48000
 #define NCTRL 4
@@ -132,14 +107,14 @@ int main(int argc, char **argv) {
     if (!d) { fprintf(stderr, "  ladspa_descriptor(0) is NULL\n"); return 1; }
 
     printf("  unique_id %lu  Label \"%s\"  Name \"%s\"  ports %lu\n",
-           d->unique_id, d->label, d->name, d->port_count);
+           d->UniqueID, d->Label, d->Name, d->PortCount);
     printf("  ports:");
-    for (unsigned long i = 0; i < d->port_count; i++) {
-        int f = d->port_descriptors[i];
+    for (unsigned long i = 0; i < d->PortCount; i++) {
+        int f = d->PortDescriptors[i];
         const char *kind = (f & LADSPA_PORT_AUDIO)
                          ? ((f & LADSPA_PORT_INPUT) ? "audio-in " : "audio-out")
                          : "control  ";
-        printf(" [%lu]%s:%-13s", i, kind, d->port_names[i]);
+        printf(" [%lu]%s:%-13s", i, kind, d->PortNames[i]);
     }
     printf("\n");
 
