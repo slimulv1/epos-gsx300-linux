@@ -157,9 +157,13 @@ impl Default for RestartBus {
 /// change: app streams -> this sink -> `epos-eq-output` -> the EPOS hardware
 /// sink, with no monitor anywhere in the path.
 ///
-/// The static null-sink is deliberately left installed. If this instance dies,
-/// the sink below disappears with it, and anything still pointed at the vanished
-/// name has nowhere to leak to.
+/// The static null-sink that used to back this name is gone, and nothing replaces
+/// it, deliberately. Its job was to be there when the chain died so nothing could
+/// leak; the watchdog does that job instead, and better: measured, stopping the
+/// instance with playback on this sink sent no stream to the speakers and the
+/// chain was back in about four seconds. Left installed it was a second
+/// EPOS-looking output in the device list that played nothing, which is the one
+/// thing a user cannot tell apart from the real output.
 pub const EQ_SINK_NAME: &str = "epos-eq-processed";
 
 /// What the device list calls it.

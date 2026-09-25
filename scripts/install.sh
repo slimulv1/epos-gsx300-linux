@@ -93,8 +93,16 @@ _install_pw_epos() {
     install -m 0644 "$ROOT/systemd/$EPOS_PW_SERVICE" "$SERVICE_DIR/$EPOS_PW_SERVICE"
     ok "instance template -> $SERVICE_DIR/$EPOS_PW_SERVICE"
 
-    install -m 0644 "$ROOT/systemd/$EQ_NULL_SINK_CONF" "$PW_CONF_DIR/$EQ_NULL_SINK_CONF"
-    ok "MAIN fail-closed null-sink anchor -> $PW_CONF_DIR/$EQ_NULL_SINK_CONF"
+    # The static fail-closed null-sink is no longer installed. It existed to be
+    # the sink the EQ chain recorded the monitor of, and the chain is now its own
+    # sink, so nothing points at it. Left in place it is worse than useless: it
+    # appears in the device list as a second EPOS-looking output that plays
+    # nothing, which is exactly the thing a user cannot tell from the real one.
+    # Its fail-closed job is done by the watchdog instead - measured: stopping the
+    # EQ instance with playback on the chain's sink moved no stream to the
+    # speakers, and the chain was back in about four seconds.
+    rm -f "$PW_CONF_DIR/$EQ_NULL_SINK_CONF"
+    ok "removed any leftover EQ null-sink anchor from an older install"
 
     # No WirePlumber routing rule is installed. Output routing is owned by the
     # daemon (AudioPipeline::route_output): it moves the PipeWire default sink
@@ -117,7 +125,7 @@ _post_install_main_restart_note() {
     printf '        systemctl --user restart pipewire wireplumber\n'
     printf '        systemctl --user start  pipewire-epos@eq pipewire-epos@voice pipewire-epos@sidetone\n'
     printf '\n'
-    printf '  - Loads %s (the fail-closed EQ null-sink anchor).\n' "$EQ_NULL_SINK_CONF"
+    printf '  - Removes any leftover %s from an older install.\n' "$EQ_NULL_SINK_CONF"
     printf '  - Drops the OLD daemon DSP chains (if any) from the running main instance.\n'
     printf '  - Starts EQ/voice/sidetone DSP instances (Option B, 3i).\n'
     printf '  - After this, DSP changes only restart pipewire-epos@* instances — never main.\n'
