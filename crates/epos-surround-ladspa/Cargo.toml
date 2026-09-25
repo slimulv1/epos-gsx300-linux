@@ -1,0 +1,24 @@
+[package]
+name = "epos-surround-ladspa"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "7.1 to binaural stereo renderer for the EPOS EQ chain, via LADSPA"
+
+# A LADSPA plugin is loaded with dlopen by PipeWire, so it must be a C dynamic
+# library. `crate-type` is therefore fixed, and the descriptor is exported under
+# the name the LADSPA spec requires rather than through a Rust-visible symbol.
+[lib]
+crate-type = ["cdylib"]
+
+# No dependencies, deliberately. This runs in a real-time audio thread: every
+# crate added here is code that has to be audited for allocation on the audio
+# path. The HRIRs are baked into the binary and the convolution is a direct-form
+# FIR, so there is nothing left that could surprise us mid-callback.
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
+codegen-units = 1

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/epos-shared",
+  "crates/epos-surround-ladspa",
     "crates/epos-gsx300d",
     "crates/epos-gsx300-gui/src-tauri",
 ]
