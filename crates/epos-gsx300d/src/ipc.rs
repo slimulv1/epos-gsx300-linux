@@ -244,6 +244,19 @@ pub struct IpcState {
     /// a target change be reported as exactly that, instead of being mistaken for
     /// somebody adjusting the volume externally.
     pub last_volume_sink: std::sync::Mutex<String>,
+    /// The level this daemon last set on each sink it has controlled.
+    ///
+    /// `device.volume` is one number, so whichever device was playing last owned
+    /// it. Measured on this machine: playback on the speakers at 20%, then the
+    /// headset — the EPOS sink was found sitting at 24%, adopted, written back
+    /// to `device.volume` by the save worker, and restored there on the next
+    /// boot. The headset stayed at -37 dB across sessions while the daemon
+    /// reported it as a working level, and the user had to push an external
+    /// control past 100% to hear anything.
+    ///
+    /// This is the memory that makes the level belong to the sink rather than to
+    /// whichever device happened to be last.
+    pub volume_by_sink: std::sync::Mutex<std::collections::BTreeMap<String, i32>>,
     /// The microphone signal watchdog's own state.
     ///
     /// It lives here rather than inside `AudioPipeline` so the hotplug loop can

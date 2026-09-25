@@ -173,6 +173,7 @@ async fn main() -> Result<()> {
         device: None,
         pipewire_nodes: None,
         last_volume_sink: std::sync::Mutex::new(String::new()),
+        volume_by_sink: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         mic_watch: std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
         last_written: std::sync::Mutex::new(config_bytes_on_disk),
         volume_save_notify: Arc::new(Notify::new()),
@@ -659,7 +660,16 @@ async fn apply_volume(state: &Arc<RwLock<IpcState>>, percent: i32) {
         debug!("Volume write skipped: no sink is currently carrying audio");
         return;
     }
-    let pct = format!("{}%", percent.clamp(0, 100));
+    let level = percent.clamp(0, 100);
+    let pct = format!("{level}%");
+    // Remember it as this sink's own level before the write is attempted. The
+    // watcher only re-applies a level it has been told about, and the dial is
+    // one of the two ways the user sets a level, so a dial turn that was not
+    // remembered would be lost the next time playback moved away and back.
+    {
+        let st = state.read().await;
+        lock(&st.volume_by_sink).insert(sink.clone(), level);
+    }
     // Capped like every other external command: a wedged `pactl` must not
     // leave the knob handler waiting forever. The dial's tracked value is
     // written after this returns either way, and the watcher corrects it
@@ -670,7 +680,42 @@ async fn apply_volume(state: &Arc<RwLock<IpcState>>, percent: i32) {
     }
 }
 
-/// Read a sink's volume (0-100) straight from PipeWire/PulseAudio.
+/// Is the EQ chain the thing the user is listening to right now?
+///
+/// Decided by what the daemon follows for volume, because that is already the
+/// answer to "which sink is carrying audio" and asking a second question would
+/// be asking the graph twice for one answer. The anchor is the EQ sink, so
+/// playback sitting on either the anchor or the raw EPOS hardware means the
+/// chain is in use and the anchor's volume is a stage the signal passes through.
+async fn st_chain_in_use(state: &Arc<RwLock<IpcState>>) -> bool {
+    let followed = volume_sink(state).await;
+    if followed.is_empty() {
+        return false;
+    }
+    if followed == crate::audio::EQ_SINK_NAME {
+        return true;
+    }
+    // The followed sink is the hardware end of the chain, so the chain is in
+    // use exactly when the sink is one of ours. The node name comes from the
+    // state's own cache, the same source `volume_sink` used a line above.
+    let epos = {
+        let st = state.read().await;
+        st.pipewire_nodes
+            .as_ref()
+            .map(|(sink, _)| sink.clone())
+            .unwrap_or_default()
+    };
+    crate::audio::is_epos_sink(&followed, &epos)
+}
+
+/// Read a sink's volume straight from PipeWire/PulseAudio.
+///
+/// Returns the level **unclamped**. It used to clamp here, and that is exactly
+/// why the 100% cap could not be enforced: by the time the watcher saw a value,
+/// 150% and 100% were the same number, so there was nothing left to notice and
+/// nothing left to correct. The ceiling is applied by [`cap_sink_volume`], where
+/// the fact that the sink was over it is still available.
+///
 /// Returns None if the sink is gone or the query fails.
 async fn read_sink_volume(sink: &str) -> Option<i32> {
     if sink.is_empty() {
@@ -683,14 +728,12 @@ async fn read_sink_volume(sink: &str) -> Option<i32> {
         .ok()?;
     // "Volume: front-left: 19660 / 30% / -31.37 dB,   front-right: ... / 30% / ..."
     // Take the first "/ N%" token — works for mono and stereo sinks.
-    let pct = text
-        .split('/')
+    text.split('/')
         .nth(1)?
         .trim()
         .trim_end_matches('%')
         .parse::<i32>()
-        .ok()?;
-    Some(pct.clamp(0, 100))
+        .ok()
 }
 
 /// Background task: keep the daemon's tracked volume in sync with the *actual*
@@ -718,15 +761,67 @@ async fn volume_watch_loop(state: Arc<RwLock<IpcState>>) {
         if sink.is_empty() {
             continue;
         }
-        let actual = match read_sink_volume(&sink).await {
+        let raw = match read_sink_volume(&sink).await {
             Some(v) => v,
             None => continue,
         };
+
+        // The anchor is held at unity before anything else, and independently of
+        // which sink the watcher follows. It is a volume stage of its own in the
+        // middle of the chain, the user has no control over it, and left alone it
+        // was found at 26% - 35 dB - which is the difference between a chain that
+        // is loud and one that is not.
+        //
+        // Only while the chain is actually in use: the anchor is a sink the
+        // daemon publishes, and a volume write to it on every tick of a system
+        // with the headset switched off is a pactl call per second for nothing.
+        if st_chain_in_use(&state).await {
+            if let Some(now) = read_sink_volume(crate::audio::EQ_SINK_NAME).await {
+                if let Some(want) = anchor_level_to_apply(now) {
+                    debug!("EQ anchor is at {now}%, holding it at {want}%");
+                    if let Err(detail) = run_status(
+                        "pactl",
+                        &["set-sink-volume", crate::audio::EQ_SINK_NAME, &format!("{want}%")],
+                        COMMAND_BUDGET,
+                    )
+                    .await
+                    {
+                        warn!("could not hold the EQ anchor at {want}%: {detail}");
+                    }
+                }
+            }
+        }
+
         let st = state.write().await;
+
+        // The ceiling is applied before anything else, and it writes. A sink
+        // pushed past 100% by pavucontrol, the DE applet or `wpctl` has to come
+        // back, and the only place that can see it is here: `apply_volume`
+        // clamps what the daemon writes, and the read used to clamp on the way
+        // in, so outside callers had no path back.
+        let capped = cap_sink_volume(raw);
+        if let Some(level) = capped.write {
+            info!("sink {sink} is at {raw}%, above the 100% ceiling — pulling it back");
+            if let Err(detail) =
+                run_status("pactl", &["set-sink-volume", &sink, &format!("{level}%")], COMMAND_BUDGET)
+                    .await
+            {
+                warn!("could not pull {sink} back to {level}%: {detail}");
+            }
+            st.last_volume_target
+                .store(level, std::sync::atomic::Ordering::Relaxed);
+        }
+        let actual = capped.report;
 
         // A different sink means the tracked number belonged to another device
         // entirely, so this is not somebody adjusting the volume: it is playback
-        // moving. Say which, and adopt the new sink's real level.
+        // moving.
+        //
+        // What the new sink should then BE is not the same question as what the
+        // old one was. A sink this daemon has set before gets its own level
+        // back; a sink heard for the first time is adopted. Adopting
+        // unconditionally is what kept the EPOS at 24% — a level the speakers
+        // had left lying around — across every session.
         let target_changed = {
             let mut last = lock(&st.last_volume_sink);
             let changed = !last.is_empty() && last.as_str() != sink.as_str();
@@ -734,14 +829,26 @@ async fn volume_watch_loop(state: Arc<RwLock<IpcState>>) {
             changed
         };
         if target_changed {
+            let remembered = lock(&st.volume_by_sink).get(&sink).copied();
+            let verdict = volume_on_target_change(remembered, actual);
+            if let Some(level) = verdict.write {
+                info!("restoring {sink} to its own level, {level}% (found at {actual}%)");
+                if let Err(detail) =
+                    run_status("pactl", &["set-sink-volume", &sink, &format!("{level}%")], COMMAND_BUDGET)
+                        .await
+                {
+                    warn!("could not restore {sink} to {level}%: {detail}");
+                }
+            }
             st.volume
-                .store(actual, std::sync::atomic::Ordering::Relaxed);
+                .store(verdict.report, std::sync::atomic::Ordering::Relaxed);
             st.last_volume_target
-                .store(actual, std::sync::atomic::Ordering::Relaxed);
+                .store(verdict.report, std::sync::atomic::Ordering::Relaxed);
+            lock(&st.volume_by_sink).insert(sink.clone(), verdict.report);
             tracing::info!(
                 "Volume now follows {} — showing its level, {}%",
                 sink,
-                actual
+                verdict.report
             );
             continue;
         }
@@ -760,11 +867,13 @@ async fn volume_watch_loop(state: Arc<RwLock<IpcState>>) {
             continue;
         }
         // Genuine external change — adopt it so the dial + next dial turn stay
-        // continuous with reality.
+        // continuous with reality, and remember it as this sink's level so the
+        // next time playback comes back here it is restored rather than found.
         st.volume
             .store(actual, std::sync::atomic::Ordering::Relaxed);
         st.last_volume_target
             .store(actual, std::sync::atomic::Ordering::Relaxed);
+        lock(&st.volume_by_sink).insert(sink.clone(), actual);
         // Notify the shared debounced volume-save worker instead of spawning a
         // per-event save task (audit F5).
         st.volume_save_notify.notify_one();
@@ -1076,6 +1185,104 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
 /// names with a config that had never been applied, and nothing said so.
 fn first_connect_owes_pipeline(pipeline_has_device: bool) -> bool {
     !pipeline_has_device
+}
+
+/// What the volume watcher should do about a sink it has just started following.
+///
+/// Two decisions that used to be one guess. Separated because they answer
+/// different questions and the answers conflict: "what should this sink read" is
+/// about the ceiling, "what should this sink be set to" is about whose level
+/// applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeVerdict {
+    /// The level the daemon should report and track.
+    pub report: i32,
+    /// The level to write back, or `None` to leave the sink alone.
+    pub write: Option<i32>,
+}
+
+/// Keep a sink at or below 100%.
+///
+/// PipeWire allows a sink to 150% and pavucontrol, DE applet and `wpctl` all
+/// offer it, so a cap inside `apply_volume` alone is not a cap: it only bounds
+/// what the daemon writes. The sink can still be pushed past 100% from outside
+/// and stay there, which is the state the user had to reach before the EPOS was
+/// audible at all.
+///
+/// The write is unconditional rather than "only if it changed", because the
+/// value arriving here has already lost the information that it was over - the
+/// old read clamped on the way in, so 150% and 100% were indistinguishable and
+/// the cap could not be enforced at all.
+pub fn cap_sink_volume(raw: i32) -> VolumeVerdict {
+    if raw > 100 {
+        VolumeVerdict {
+            report: 100,
+            write: Some(100),
+        }
+    } else {
+        VolumeVerdict {
+            report: raw.max(0),
+            write: None,
+        }
+    }
+}
+
+/// What to do when playback moves to a different sink.
+///
+/// `remembered` is the level this daemon last set on the sink being moved to,
+/// and `on_disk` is what the sink is sitting at right now.
+///
+/// The old behaviour adopted `on_disk` unconditionally. That is right for a
+/// device being heard for the first time and wrong for one heard before: the
+/// level sitting on a sink between sessions is whatever was left there, and the
+/// EPOS sink was found at 24% - 37 dB - session after session, adopted each
+/// time, and then written back to `device.volume` by the save worker. The value
+/// the user actually chose for the headset was overwritten by the level of a
+/// speaker that had been playing moments earlier, and the headset stayed quiet.
+///
+/// So a sink we have set before gets its own level back. A sink we have not is
+/// still adopted, because nothing else knows what a newly plugged device wants.
+pub fn volume_on_target_change(remembered: Option<i32>, on_disk: i32) -> VolumeVerdict {
+    match remembered {
+        Some(level) => {
+            let capped = level.clamp(0, 100);
+            VolumeVerdict {
+                report: capped,
+                // Only write when the sink is actually somewhere else, or this
+                // fires a pactl call every second for every sink it follows.
+                write: if on_disk == capped { None } else { Some(capped) },
+            }
+        }
+        None => VolumeVerdict {
+            report: on_disk.clamp(0, 100),
+            write: None,
+        },
+    }
+}
+
+/// The level the EQ anchor must be held at, or `None` to leave it alone.
+///
+/// The chain has two volume-controlled stages and the user can only see one:
+/// `epos-eq-processed` is a real filter-chain sink with its own volume, and it
+/// sits *before* the hardware sink the daemon writes to. Nothing held the first
+/// one, and PipeWire restored it at 26% — -35 dB — across restarts, so a chain
+/// whose hardware end was at 100% still arrived at the ear a third of full
+/// scale.
+///
+/// The note on `volume_target_sink` says the anchor's volume is a no-op. That
+/// was measured when the anchor was a null-sink feeding the chain through its
+/// monitor; `c18edd7` replaced it with the chain's own sink, and the measurement
+/// did not come with it. The user confirms it directly: both stages at 100% was
+/// "đủ lớn", and the same chain with the anchor at 26% is quiet again.
+///
+/// Unity is the only defensible value. Anything else would be a second control
+/// the user cannot reach, which is the fault being removed.
+pub fn anchor_level_to_apply(current: i32) -> Option<i32> {
+    if current == 100 {
+        None
+    } else {
+        Some(100)
+    }
 }
 
 /// Decide whether a hand-edited `device.volume` should be put on the sink.
@@ -1602,6 +1809,119 @@ mod tests {
     // real sink, adopted that level over the edit, and the next save wrote it
     // back — so editing the volume in the file did nothing, and the log said
     // only "non-audio settings updated".
+
+    // ─── The sink itself, and whose level applies to it ──────────
+    //
+    // Two things the old watcher got wrong, and they are separate:
+    //
+    //   - the cap. `apply_volume` clamps what it writes, but the sink can be
+    //     pushed past 100% from outside and the read clamped on the way in, so
+    //     150% and 100% looked identical and nothing ever pulled it back;
+    //   - ownership. `device.volume` is one number, and whichever device was
+    //     playing last owned it. Moving from speakers at 20% onto the headset
+    //     handed the headset the speakers' level, and the save worker wrote it
+    //     back, so the next boot began "Volume restored to 20% at boot".
+
+    /// The EQ anchor is held at unity, and only when it is not already there.
+    ///
+    /// The watcher runs every second, so writing unconditionally would be a
+    /// `pactl` call per second for the life of the daemon.
+    #[test]
+    fn the_eq_anchor_is_held_at_unity() {
+        assert_eq!(
+            anchor_level_to_apply(26),
+            Some(100),
+            "the anchor was found at 26% -35 dB - with nothing holding it, the \
+             chain was a third of full scale before the user's own control"
+        );
+        assert_eq!(anchor_level_to_apply(0), Some(100));
+        assert_eq!(anchor_level_to_apply(150), Some(100));
+        assert_eq!(
+            anchor_level_to_apply(100),
+            None,
+            "already at unity: no write"
+        );
+    }
+
+    /// A sink above 100% is pulled back, and the daemon says 100.
+    ///
+    /// This is the cap the user asked for, and it is not the one `apply_volume`
+    /// already had. That clamp bounds what the daemon writes; this bounds the
+    /// sink. The difference is everything outside the daemon — pavucontrol, the
+    /// DE volume applet, `wpctl set-volume`, media keys — and the sink was
+    /// measured sitting above 100% more than once while the daemon believed it
+    /// was at 100.
+    #[test]
+    fn a_sink_past_one_hundred_percent_is_pulled_back_to_it() {
+        assert_eq!(
+            cap_sink_volume(150),
+            VolumeVerdict { report: 100, write: Some(100) },
+            "150% must be written back as 100, not merely reported as 100"
+        );
+        // 100 exactly is the ceiling, not a value to correct.
+        assert_eq!(
+            cap_sink_volume(100),
+            VolumeVerdict { report: 100, write: None }
+        );
+        // Below the ceiling nothing is written: the watcher runs every second
+        // and a write per tick on an untouched sink is a pactl call per second.
+        assert_eq!(
+            cap_sink_volume(68),
+            VolumeVerdict { report: 68, write: None }
+        );
+        // A negative reading is a parsing artefact, not a level.
+        assert_eq!(
+            cap_sink_volume(-3),
+            VolumeVerdict { report: 0, write: None }
+        );
+    }
+
+    /// A sink the daemon has set before gets its own level back, not whatever
+    /// level the previous device left lying around.
+    ///
+    /// This is the bug as it was measured. Playback on the speakers at 20%, then
+    /// the headset: the EPOS sink was found at 24%, adopted, saved into
+    /// `device.volume`, and restored there on the next boot, so the headset
+    /// stayed at -37 dB whatever the user asked for.
+    #[test]
+    fn moving_to_a_sink_we_have_set_restores_that_sinks_own_level() {
+        // The remembered EPOS level was 100; the EPOS sink was found at 24.
+        assert_eq!(
+            volume_on_target_change(Some(100), 24),
+            VolumeVerdict { report: 100, write: Some(100) },
+            "the headset must get its own level back, not the one it was found at"
+        );
+        // Already there: adopt, and do not write every second.
+        assert_eq!(
+            volume_on_target_change(Some(100), 100),
+            VolumeVerdict { report: 100, write: None }
+        );
+        // A sink heard for the first time is still adopted, because nothing else
+        // knows what a newly plugged device wants.
+        assert_eq!(
+            volume_on_target_change(None, 20),
+            VolumeVerdict { report: 20, write: None }
+        );
+        // A remembered level over the ceiling comes back capped, not at 150.
+        assert_eq!(
+            volume_on_target_change(Some(150), 40),
+            VolumeVerdict { report: 100, write: Some(100) }
+        );
+    }
+
+    /// A remembered level is capped on the way back out, so a value that got
+    /// past the old read cannot be stored and re-applied on a later session.
+    #[test]
+    fn a_remembered_level_is_capped_before_it_can_be_written_back() {
+        for (remembered, expected) in [(150, 100), (250, 100), (-5, 0), (68, 68)] {
+            let v = volume_on_target_change(Some(remembered), 10);
+            assert_eq!(
+                v.write,
+                Some(expected),
+                "remembered {remembered}% must be written as {expected}%"
+            );
+        }
+    }
 
     /// An edited volume is applied, and clamped rather than trusted.
     #[test]
