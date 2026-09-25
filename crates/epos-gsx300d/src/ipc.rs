@@ -412,11 +412,180 @@ pub async fn run_server(state: Arc<RwLock<IpcState>>) -> Result<()> {
     }
 }
 
-async fn handle_client(stream: UnixStream, state: Arc<RwLock<IpcState>>) -> Result<()> {
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+/// How long a client may go quiet between two lines.
+///
+/// The HTTP path has had a deadline since it was written, because a client that
+/// opened a connection and said nothing used to pin the task and its file
+/// descriptor for good. The Unix socket had none, and the reason it is a
+/// parameter rather than a constant read inline is that the test has to hand in
+/// a small budget and watch the deadline actually fire.
+const CLIENT_QUIET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-    while let Some(line) = lines.next_line().await? {
+/// What one read from a client produced.
+#[derive(Debug)]
+enum LineRead {
+    /// A whole line, without its terminator and without a trailing CR.
+    Line(String),
+    /// More than the cap arrived with no newline in sight.
+    TooLong,
+    /// Nothing arrived for longer than the budget.
+    Stalled,
+    /// The client closed the connection cleanly.
+    Eof,
+}
+
+/// One line from `reader`, bounded in size and in time.
+///
+/// `lines()` is bounded in neither. It grows a single `String` until it sees a
+/// newline, so a client that never sends one makes the daemon's resident set
+/// follow whatever it sends: measured, 8 MB sent with no newline took the RSS
+/// from 12.5 MB to 20.8 MB — one byte of memory per byte sent, before a single
+/// byte had been parsed. The HTTP path never had this, it rejects over-length
+/// bodies with a 413, so this cap is `MAX_BODY` for the same reason.
+///
+/// The bound is on the *accumulation*, not on the finished line. Checking
+/// `line.len()` after `next_line()` returns would look like a fix and change
+/// nothing, because by then the buffer is already as large as the client asked
+/// for. That is why this reads through `fill_buf` itself: the length is known
+/// before the copy, so the copy can be refused instead of performed.
+///
+/// `fill_buf` does not consume, so what it returns stays valid across the copy
+/// and the leftover after a newline in the middle of the buffer belongs to the
+/// next line. Consuming exactly `at + 1` is what keeps a pipelined client
+/// working, and a test pins it.
+async fn read_line_capped(
+    reader: &mut BufReader<impl tokio::io::AsyncRead + Unpin>,
+    max_line: usize,
+    timeout: std::time::Duration,
+) -> Result<LineRead> {
+    enum Step {
+        /// Consume `n` bytes, then read more.
+        More(usize),
+        /// Consume `n` bytes; the line is complete.
+        Done(usize),
+        /// The cap is reached. Stop reading from this client entirely.
+        Over,
+    }
+
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        let step = {
+            let buf = match tokio::time::timeout(timeout, reader.fill_buf()).await {
+                Ok(Ok(buf)) => buf,
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => return Ok(LineRead::Stalled),
+            };
+            if buf.is_empty() {
+                // A trailing line with no newline is still a line. `lines()`
+                // hands it back, and so does a client that writes a request and
+                // closes without a terminator.
+                return Ok(if line.is_empty() {
+                    LineRead::Eof
+                } else {
+                    LineRead::Line(trim_cr(line))
+                });
+            }
+            match buf.iter().position(|&b| b == b'\n') {
+                Some(at) if line.len() + at <= max_line => {
+                    line.extend_from_slice(&buf[..at]);
+                    Step::Done(at + 1)
+                }
+                Some(_) => Step::Over,
+                None if line.len() + buf.len() <= max_line => {
+                    line.extend_from_slice(buf);
+                    Step::More(buf.len())
+                }
+                None => Step::Over,
+            }
+        };
+        match step {
+            Step::Done(n) => {
+                reader.consume(n);
+                return Ok(LineRead::Line(trim_cr(line)));
+            }
+            Step::More(n) => reader.consume(n),
+            Step::Over => return Ok(LineRead::TooLong),
+        }
+    }
+}
+
+/// `lines()` strips the CR of a CRLF pair, so this does too. serde_json would
+/// tolerate a trailing `\r` as whitespace, which is exactly why a regression
+/// here would be invisible in testing against this daemon alone.
+fn trim_cr(mut line: Vec<u8>) -> String {
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    String::from_utf8_lossy(&line).into_owned()
+}
+
+/// The elapsed-timeout case of `tokio::time::timeout`, as data.
+/// Why a connection ended, if it did.
+#[derive(Debug, PartialEq, Eq)]
+enum ClientStop {
+    /// The client closed cleanly.
+    End,
+    /// The client sent more than the cap without a newline.
+    RejectTooLong(usize),
+    /// The client went quiet past the budget.
+    DropQuietly,
+}
+
+/// Whether this read ends the connection, and how — or `None` to carry on.
+///
+/// Split out from the loop so the decision can be tested without an `IpcState`,
+/// which takes fifteen fields of real configuration and would have to be
+/// duplicated into the test, breaking every time a field is added.
+///
+/// The case this exists to pin is `TooLong`. It must end the connection, never
+/// `continue`: continuing means reading the same over-long line again, which is
+/// the unbounded buffering this whole change is about.
+fn client_stop(read: &LineRead, max_line: usize) -> Option<ClientStop> {
+    match read {
+        LineRead::Line(_) => None,
+        LineRead::Eof => Some(ClientStop::End),
+        LineRead::TooLong => Some(ClientStop::RejectTooLong(max_line)),
+        LineRead::Stalled => Some(ClientStop::DropQuietly),
+    }
+}
+
+async fn handle_client(stream: UnixStream, state: Arc<RwLock<IpcState>>) -> Result<()> {
+    handle_client_bounded(stream, state, MAX_BODY, CLIENT_QUIET_TIMEOUT).await
+}
+
+async fn handle_client_bounded(
+    stream: UnixStream,
+    state: Arc<RwLock<IpcState>>,
+    max_line: usize,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+
+    loop {
+        let read = read_line_capped(&mut reader, max_line, timeout).await?;
+        let line = match client_stop(&read, max_line) {
+            None => match read {
+                LineRead::Line(line) => line,
+                // `client_stop` said "carry on" and this says otherwise, so one
+                // of the two is wrong. Treat it as the end rather than looping.
+                _ => return Ok(()),
+            },
+            Some(ClientStop::End) => return Ok(()),
+            Some(ClientStop::DropQuietly) => {
+                // Nothing to answer: the client is not there to read it. This
+                // is what the HTTP path does when a head times out.
+                debug!("IPC client went quiet for {timeout:?} — dropping the connection");
+                return Ok(());
+            }
+            Some(ClientStop::RejectTooLong(cap)) => {
+                let resp = Response::Error {
+                    message: format!("Request too long (max {cap} bytes)"),
+                };
+                let _ = send_response(&mut writer, &resp).await;
+                return Ok(());
+            }
+        };
         let request: Request = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
@@ -448,8 +617,8 @@ async fn handle_client(stream: UnixStream, state: Arc<RwLock<IpcState>>) -> Resu
 
         send_response(&mut writer, &response).await?;
     }
-
-    Ok(())
+    // No `Ok(())` after the loop: every exit returns from inside it, and a
+    // trailing one would be unreachable code.
 }
 
 async fn send_response(writer: &mut (impl AsyncWriteExt + Unpin), resp: &Response) -> Result<()> {
@@ -524,9 +693,12 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
                 // (mode state, LED shift pair, EQ indices, encoder positions).
                 // Best-effort: a timeout leaves fields None, never fails the
                 // whole response. Pure read — bit6 (EEPROM write) never set.
-                // Runs WITHOUT the IPC lock held.
+                // Runs WITHOUT the IPC lock held, and on a blocking thread: eight
+                // registers at a two-second budget each, so a device that has
+                // stopped answering would otherwise hold a tokio worker for
+                // about twenty seconds. Healthy it is 40 ms.
                 if let Some(path) = d.hidraw.clone() {
-                    let snap = hwinfo::snapshot(&path);
+                    let snap = hwinfo::snapshot_off_runtime(path).await;
                     d.hw_snapshot = if snap.is_empty() { None } else { Some(snap) };
                 }
             }
@@ -1304,6 +1476,252 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
     use epos_shared::config::{EqBand, VoiceEnhancerConfig, VoiceMode};
+
+    // ─── Reading a request line: bounded in size and in time ─────────
+
+    /// Every read maps to exactly one decision, and only a line carries on.
+    ///
+    /// The case that matters is `TooLong`. It has to end the connection: a
+    /// `continue` there would read the same over-long line again, which is the
+    /// unbounded buffering this change exists to remove, wearing a different
+    /// hat. That is why the decision is its own function — the loop that acts
+    /// on it needs an `IpcState`, and an `IpcState` is fifteen fields of real
+    /// configuration that a test would have to duplicate.
+    #[test]
+    fn only_a_line_carries_the_connection_on() {
+        assert_eq!(
+            client_stop(&LineRead::Line("{\"type\":\"GetStatus\"}".into()), 64),
+            None,
+            "a whole line is the one thing that continues"
+        );
+        assert_eq!(client_stop(&LineRead::Eof, 64), Some(ClientStop::End));
+        assert_eq!(client_stop(&LineRead::Stalled, 64), Some(ClientStop::DropQuietly));
+        // The cap travels with the refusal, so the message cannot quote a
+        // different number than the one that was enforced.
+        assert_eq!(
+            client_stop(&LineRead::TooLong, 64),
+            Some(ClientStop::RejectTooLong(64)),
+            "a refusal must carry the cap it was measured against"
+        );
+        assert_ne!(
+            client_stop(&LineRead::TooLong, 64),
+            client_stop(&LineRead::TooLong, 128),
+            "the cap in the refusal is the one enforced, not a constant"
+        );
+    }
+
+    /// Generous, so a slow machine does not make the deadline tests flaky. They
+    /// assert that a quiet client is dropped, not that it is dropped quickly.
+    const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// A connected pair of real Unix sockets, so this exercises the actual
+    /// `BufReader` over an actual fd rather than a stand-in.
+    async fn socket_pair() -> (UnixStream, UnixStream) {
+        UnixStream::pair().expect("socket pair")
+    }
+
+    /// The ordinary case: one request line arrives whole.
+    ///
+    /// This is the anti-vacuity test. Every other test here asserts that
+    /// something is *refused*, and a `read_line_capped` that refused everything
+    /// would pass all of them.
+    #[tokio::test]
+    async fn an_ordinary_request_line_comes_back_whole() {
+        let (mut client, server) = socket_pair().await;
+        client.write_all(b"{\"type\":\"GetStatus\"}\n").await.unwrap();
+        let mut reader = BufReader::new(server);
+        match read_line_capped(&mut reader, 64 * 1024, TEST_BUDGET).await.unwrap() {
+            LineRead::Line(line) => assert_eq!(line, "{\"type\":\"GetStatus\"}"),
+            other => panic!("a well-formed line must come back as a line, got {other:?}"),
+        }
+    }
+
+    /// A client that pipelines must not lose the second request.
+    ///
+    /// This is the fidelity test for reading through `fill_buf` instead of
+    /// `lines()`. When the newline sits in the middle of the buffer, everything
+    /// after it belongs to the *next* line, so the consume has to be exactly
+    /// `at + 1`. Consuming the whole buffer instead would silently answer only
+    /// the first of two requests and then hang, which no test of a single line
+    /// would ever notice.
+    #[tokio::test]
+    async fn a_pipelined_second_request_is_not_lost() {
+        let (mut client, server) = socket_pair().await;
+        client
+            .write_all(b"{\"type\":\"GetStatus\"}\n{\"type\":\"GetStatus\"}\n")
+            .await
+            .unwrap();
+        let mut reader = BufReader::new(server);
+        for turn in 1..=2 {
+            match read_line_capped(&mut reader, 64 * 1024, TEST_BUDGET).await.unwrap() {
+                LineRead::Line(line) => {
+                    assert_eq!(line, "{\"type\":\"GetStatus\"}", "request {turn} was lost")
+                }
+                other => panic!("request {turn} must come back as a line, got {other:?}"),
+            }
+        }
+    }
+
+    /// A CRLF client is answered, not rejected.
+    ///
+    /// `lines()` strips the CR, and this has to as well. serde_json would treat
+    /// a trailing `\r` as whitespace and parse fine, so a regression here passes
+    /// every test in this file and would only ever show up against a client
+    /// that is stricter than us about the terminator.
+    #[tokio::test]
+    async fn a_crlf_terminated_line_loses_its_carriage_return() {
+        let (mut client, server) = socket_pair().await;
+        client.write_all(b"{\"type\":\"GetStatus\"}\r\n").await.unwrap();
+        let mut reader = BufReader::new(server);
+        match read_line_capped(&mut reader, 64 * 1024, TEST_BUDGET).await.unwrap() {
+            LineRead::Line(line) => {
+                assert_eq!(line, "{\"type\":\"GetStatus\"}", "the CR must be stripped")
+            }
+            other => panic!("CRLF must still be a line, got {other:?}"),
+        }
+    }
+
+    /// The cap is on what has been *taken*, not on what has arrived.
+    ///
+    /// The defect was that `lines()` grows one `String` until it sees a
+    /// newline, so resident memory follows whatever a client sends. Measured on
+    /// the running daemon: 8 MB with no newline took RSS from 12.5 MB to
+    /// 20.8 MB, one byte per byte, before anything was parsed.
+    ///
+    /// `TooLong` on its own proves nothing, because a cap that buffered the
+    /// whole line and *then* complained produces the same answer and still
+    /// costs all the memory. What has to hold is that the daemon stopped
+    /// reading: the data is still sitting in the socket.
+    ///
+    /// The payload is 1 MB because the socket buffer is 208 KB (measured, not
+    /// assumed) — anything under that gets absorbed by the kernel and
+    /// `fill_buf` can drain it without this test noticing a thing. And the
+    /// write runs in its own task for the same reason: once the daemon stops
+    /// reading, a 1 MB write has nowhere to go and would block the test
+    /// forever. That the writer is still stuck at the end is the finding.
+    #[tokio::test]
+    async fn an_over_long_line_is_refused_before_it_is_buffered() {
+        let (client, server) = socket_pair().await;
+        // The read half is kept alive on purpose: dropping it would take the
+        // socket with it and the writer would fail with EPIPE, which would look
+        // like progress it never made.
+        let (_client_read, mut client_write) = client.into_split();
+        let payload = vec![b'A'; 1024 * 1024];
+        let expected = payload.len();
+        let mut writer = tokio::spawn(async move {
+            client_write.write_all(&payload).await.is_ok()
+        });
+
+        // No newline anywhere in it, so nothing can end the line early.
+        let mut reader = BufReader::new(server);
+        match read_line_capped(&mut reader, 8 * 1024, TEST_BUDGET).await.unwrap() {
+            LineRead::TooLong => {}
+            other => panic!("1 MB with no newline must be refused, got {other:?}"),
+        }
+
+        // The daemon has stopped reading, so {expected} bytes cannot have
+        // landed anywhere: 208 KB of socket buffer plus what was refused is
+        // nowhere near 1 MB, and the writer is still stuck. Note that the
+        // unread data is *not* readable from the client end — it sits in the
+        // server's receive queue — so the writer's own progress is the only
+        // thing that shows whether the daemon drained.
+        let drained =
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut writer).await;
+        assert!(
+            drained.is_err(),
+            "the writer finished, so the daemon consumed all {expected} bytes before \
+             complaining: the cap was applied after the buffering, not before it"
+        );
+    }
+
+    /// The cap is exact: the last byte that fits is accepted, the next is not.
+    ///
+    /// Off-by-one either way is a bug in opposite directions — reject one byte
+    /// early and a legitimate request fails; accept one byte late and the cap is
+    /// a lie. The cap here is 16, so 16 is admissible and 17 is not. (The first
+    /// version of this test built the line as `vec![b'A'; cap]`, which asks
+    /// whether a 15-byte line fits a 15-byte cap, and asserted that it must
+    /// not. The test was wrong and the code was right, which is the best kind
+    /// of thing a boundary test can tell you.)
+    #[tokio::test]
+    async fn the_cap_admits_exactly_its_own_length() {
+        const CAP: usize = 16;
+        for (line_len, admissible) in [(CAP, true), (CAP + 1, false)] {
+            let (mut client, server) = socket_pair().await;
+            let mut payload = vec![b'A'; line_len];
+            payload.push(b'\n');
+            client.write_all(&payload).await.unwrap();
+            let mut reader = BufReader::new(server);
+            let got = read_line_capped(&mut reader, CAP, TEST_BUDGET).await.unwrap();
+            if admissible {
+                assert!(
+                    matches!(&got, LineRead::Line(l) if l.len() == line_len),
+                    "a {line_len}-byte line must fit a {CAP}-byte cap, got {got:?}"
+                );
+            } else {
+                assert!(
+                    matches!(got, LineRead::TooLong),
+                    "a {line_len}-byte line must not fit a {CAP}-byte cap, got {got:?}"
+                );
+            }
+        }
+    }
+
+    /// A client that connects and says nothing is dropped at the budget.
+    ///
+    /// Measured alongside the other fix: fifty idle connections cost 532 kB of
+    /// RSS and did not slow a real request down, because these are async tasks
+    /// and not blocked workers. So this is not about starving the runtime — it
+    /// is about not accumulating a task, and a file descriptor, for every peer
+    /// that wanders in. The HTTP path has had this deadline from the start; the
+    /// Unix socket had none.
+    #[tokio::test]
+    async fn a_client_that_never_speaks_is_dropped_at_its_budget() {
+        let (_client, server) = socket_pair().await;
+        let mut reader = BufReader::new(server);
+        let started = std::time::Instant::now();
+        match read_line_capped(&mut reader, 64 * 1024, std::time::Duration::from_millis(80)).await
+            .unwrap()
+        {
+            LineRead::Stalled => {}
+            other => panic!("a silent client must be reported as stalled, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(60),
+            "the budget must actually be waited out, gave up after {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A clean close is an end, not a stall — and a half-written request is
+    /// still a line, because `lines()` treats it as one.
+    #[tokio::test]
+    async fn closing_the_connection_ends_it_and_keeps_the_half_written_line() {
+        let (mut silent, server) = socket_pair().await;
+        let (mut half, half_server) = socket_pair().await;
+
+        drop(silent);
+        let mut reader = BufReader::new(server);
+        assert!(
+            matches!(
+                read_line_capped(&mut reader, 64 * 1024, TEST_BUDGET).await.unwrap(),
+                LineRead::Eof
+            ),
+            "a client that closed without sending must read as a clean end, not a stall"
+        );
+
+        half.write_all(b"{\"type\":\"GetStatus\"}").await.unwrap();
+        drop(half);
+        let mut reader = BufReader::new(half_server);
+        match read_line_capped(&mut reader, 64 * 1024, TEST_BUDGET).await.unwrap() {
+            LineRead::Line(line) => {
+                assert_eq!(line, "{\"type\":\"GetStatus\"}", "a trailing line is still a line")
+            }
+            other => {
+                panic!("a request without a trailing newline must still arrive, got {other:?}")
+            }
+        }
+    }
 
     fn profile(name: &str, mic_gain: u32) -> epos_shared::Profile {
         let mut audio = AudioConfig::default();

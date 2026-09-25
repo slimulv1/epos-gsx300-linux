@@ -105,6 +105,89 @@ pub struct HwInfo {
     pub dac_patch: Option<String>,
 }
 
+/// [`probe`] on a blocking thread, awaited.
+///
+/// `probe` is a blocking read with a hard floor on its cost. It opens
+/// `/dev/hidrawN` with ten retries 400 ms apart, then reads four registers,
+/// each with its own two-second budget. A device that opens but has stopped
+/// answering therefore costs about twelve seconds, and one that cannot even be
+/// opened costs four.
+///
+/// Called straight from an `async fn` that is a twelve-second stall of a *tokio
+/// worker*, which is a different and much worse thing than a slow call: the
+/// worker is one of the twenty the runtime has, and nothing else runs on it
+/// meanwhile. `devices::detect_with_nodes` is already spawned off for exactly
+/// this reason; this is the last blocking read left on an async path.
+///
+/// The join handle is not cancellable, so a wedged device still costs a
+/// blocking-pool thread for its full budget. That is the trade: the blocking
+/// pool is sized for this, the workers are not.
+pub async fn probe_off_runtime(hidraw: PathBuf) -> HwInfo {
+    tokio::task::spawn_blocking(move || probe(&hidraw))
+        .await
+        .unwrap_or_default()
+}
+
+/// [`snapshot`] on a blocking thread, awaited. See [`probe_off_runtime`].
+///
+/// Eight registers at two seconds each, so up to about sixteen seconds, plus the
+/// same four seconds of open retries. Measured on a healthy device the whole
+/// snapshot is 40 ms, so this only matters when the hardware has stopped
+/// answering — which is exactly when it must not be holding a worker.
+pub async fn snapshot_off_runtime(hidraw: PathBuf) -> HwSnapshot {
+    tokio::task::spawn_blocking(move || snapshot(&hidraw))
+        .await
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Nothing on an async path may call the blocking reads directly.
+    ///
+    /// The compiler cannot see this: a blocking call inside an `async fn`
+    /// compiles, passes every test, and behaves perfectly on a healthy device —
+    /// where these reads cost 40 ms. It only shows up when the hardware stops
+    /// answering, and then it takes a tokio worker down for up to twenty
+    /// seconds, which is a runtime-wide slowdown rather than a slow request.
+    ///
+    /// So the invariant is pinned textually, across every source file in the
+    /// daemon rather than the two call sites that exist today: a new caller in
+    /// `led.rs` or `streams.rs` would otherwise reintroduce it silently. The
+    /// wrappers themselves are the only sanctioned route, and this is what makes
+    /// "use the wrapper" a rule rather than a suggestion.
+    ///
+    /// The three test files this does *not* scan are the ones whose blocking
+    /// reads are the subject: `hwinfo.rs` holds the wrappers, and the other two
+    /// hold no async hardware reads.
+    #[test]
+    fn the_blocking_hardware_reads_are_only_reached_through_the_wrapper() {
+        for file in [
+            include_str!("main.rs"),
+            include_str!("ipc.rs"),
+            include_str!("audio.rs"),
+            include_str!("devices.rs"),
+            include_str!("streams.rs"),
+            include_str!("led.rs"),
+        ] {
+            // Match the call, not the name. The first version of this test
+            // looked for "hwinfo::probe" and "hwinfo::snapshot", which are
+            // substrings of the wrapper names — so it failed on the very code it
+            // was written to bless. The parenthesis is what separates a call
+            // from the async wrapper of the same stem.
+            for blocking in ["hwinfo::probe(", "hwinfo::snapshot("] {
+                assert!(
+                    !file.contains(blocking),
+                    "found a direct `{blocking}` call. Wrap it: `probe_off_runtime` \
+                     and `snapshot_off_runtime` exist so a blocking HID read never \
+                     runs on a tokio worker."
+                );
+            }
+        }
+    }
+}
+
 /// Probe the GSX 300 memory bus once at startup. Best-effort: any failure
 /// (device absent, permission denied, timeout) returns [`HwInfo::default`]
 /// and the daemon continues normally — hardware info is a nicety.

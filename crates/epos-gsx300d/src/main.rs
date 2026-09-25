@@ -68,11 +68,10 @@ async fn main() -> Result<()> {
     // Probe firmware version + chip ID over the read-only memory bus
     // (best-effort — the daemon runs fine without it). Pure read: report
     // 0x04 with bit6 (EEPROM write) clear; never touches the flash protocol.
-    let hw_info = device
-        .as_ref()
-        .and_then(|d| d.hidraw.as_ref())
-        .map(hwinfo::probe)
-        .unwrap_or_default();
+    let hw_info = match device.as_ref().and_then(|d| d.hidraw.clone()) {
+        Some(hidraw) => hwinfo::probe_off_runtime(hidraw).await,
+        None => Default::default(),
+    };
     if let Some(ref v) = hw_info.firmware_version {
         info!("Firmware version: {}", v);
     }
@@ -1006,15 +1005,18 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
             } else {
                 info!("EPOS GSX 300 connected — applying config");
             }
-            // Re-probe hardware info BEFORE taking the write lock: hwinfo::probe
-            // does a blocking HID read (~tens of ms) and the lock guards all IPC,
-            // so doing it inside would stall GetStatus/GetDevice for the whole
-            // probe (audit F4). `device` is owned by this loop, not the lock.
-            let hw = device
-                .as_ref()
-                .and_then(|d| d.hidraw.as_ref())
-                .map(hwinfo::probe)
-                .unwrap_or_default();
+            // Re-probe hardware info BEFORE taking the write lock: the read is a
+            // blocking HID transaction (~tens of ms healthy, and up to twelve
+            // seconds on a device that has stopped answering) and the lock
+            // guards all IPC, so doing it inside would stall GetStatus/GetDevice
+            // for the whole probe (audit F4). `device` is owned by this loop, not
+            // the lock. It also runs on a blocking thread rather than a tokio
+            // worker, so a wedged device costs a blocking-pool thread instead of
+            // one of the twenty the runtime has.
+            let hw = match device.as_ref().and_then(|d| d.hidraw.clone()) {
+                Some(hidraw) => hwinfo::probe_off_runtime(hidraw).await,
+                None => Default::default(),
+            };
             let vol = state.read().await.volume.load(std::sync::atomic::Ordering::Relaxed);
             let mut st = state.write().await;
             // Names come from the fresh scan above (cache was empty when we
