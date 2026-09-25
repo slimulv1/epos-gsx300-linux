@@ -1286,10 +1286,10 @@ impl AudioPipeline {
                 }
                 return None;
             }
-            // Fresh listing, so this is also where dead indices are dropped.
-            ledger.prune(&present);
+            // The fresh listing is also the cleanup: anything no longer parked on
+            // raw is already home or is the user's, and is forgotten here.
             streams::capped(
-                ledger.plan_return(&present, raw_index),
+                ledger.retain_parked(&present, raw_index),
                 streams::MAX_STREAM_MOVES,
             )
         };
@@ -1301,6 +1301,13 @@ impl AudioPipeline {
             );
         }
         if indices.is_empty() {
+            // Nothing left parked. This is the completion, and it is the only place
+            // it can be reported: measured, the first live outage ended with every
+            // stream back on the anchor and no completion line, because the last
+            // few had followed the default sink home without a command from us.
+            if self.returning_streams.swap(false, Ordering::Relaxed) {
+                info!("All rescued streams are back in the EQ audio path");
+            }
             return None;
         }
         if !self.returning_streams.swap(true, Ordering::Relaxed) {

@@ -317,15 +317,27 @@ impl StreamLedger {
         }
     }
 
-    /// The streams to bring back, given what is actually on the graph now.
-    pub fn plan_return(&self, present: &[StreamOnSink], raw_index: u32) -> Vec<u32> {
-        streams_to_return(&self.rescued, present, raw_index)
-    }
-
-    /// Drop indices whose streams are gone, so the set cannot grow forever.
-    pub fn prune(&mut self, present: &[StreamOnSink]) {
-        let live: BTreeSet<u32> = present.iter().map(|s| s.index).collect();
-        self.rescued.retain(|i| live.contains(i));
+    /// Keep only the streams still parked on `raw_index`, and return them.
+    ///
+    /// This is the plan and the cleanup at once, and the cleanup is the point. A
+    /// recorded stream that is no longer on raw has either come home by itself —
+    /// changing the default sink does drag the streams that follow it, which is
+    /// how most of them returned in the measured outage — or been moved by the
+    /// user. Both mean it is not ours to move.
+    ///
+    /// Forgetting only the streams that had *vanished* left the ledger
+    /// permanently non-empty after an outage: it kept the route decision waiting
+    /// for a return that could never be planned again, because the streams it was
+    /// waiting for were already home. That was found by measurement, not by
+    /// reading: the first live outage ended with every stream back on the anchor
+    /// and no completion line ever printed, because the last few had followed
+    /// the default home on their own.
+    pub fn retain_parked(&mut self, present: &[StreamOnSink], raw_index: u32) -> Vec<u32> {
+        let keep: BTreeSet<u32> = streams_to_return(&self.rescued, present, raw_index)
+            .into_iter()
+            .collect();
+        self.rescued.retain(|i| keep.contains(i));
+        self.rescued.iter().copied().collect()
     }
 
     /// Forget a stream the daemon has successfully brought back.
@@ -627,16 +639,15 @@ mod tests {
         ledger.note_rescued(&[1], Some("first"));
         ledger.note_rescued(&[2], Some("second"));
         assert_eq!(ledger.len(), 1);
-        assert!(
-            ledger
-                .plan_return(
-                    &[StreamOnSink {
-                        index: 2,
-                        sink_index: 74,
-                    }],
-                    74
-                )
-                .contains(&2)
+        assert_eq!(
+            ledger.retain_parked(
+                &[StreamOnSink {
+                    index: 2,
+                    sink_index: 74,
+                }],
+                74
+            ),
+            vec![2]
         );
     }
 
@@ -648,14 +659,31 @@ mod tests {
         assert_eq!(ledger.len(), 4);
     }
 
-    /// Streams that have gone are dropped, so the set tracks the graph.
+    /// The measured case: of the streams rescued, the ones still parked on raw
+    /// are the ones to move, and the rest are forgotten because they are already
+    /// somewhere they belong.
     #[test]
-    fn pruning_drops_streams_that_are_gone() {
+    fn only_the_still_parked_survive_a_return_pass() {
         let mut ledger = StreamLedger::new(64);
-        ledger.note_rescued(&[38, 9999], Some("c"));
-        ledger.prune(&listing());
-        assert_eq!(ledger.len(), 1);
-        assert_eq!(ledger.plan_return(&listing(), 74), vec![38]);
+        // 38 is still on raw 74; 168 is on the EPOS 71; 9999 is gone entirely.
+        ledger.note_rescued(&[38, 168, 9999], Some("c"));
+        assert_eq!(ledger.retain_parked(&listing(), 74), vec![38]);
+        assert_eq!(
+            ledger.len(),
+            1,
+            "a stream that came home on its own must be forgotten, or the ledger \
+             never empties and no completion is ever reported"
+        );
+    }
+
+    /// A stream the user moved to their own speakers is forgotten too. Dragging it
+    /// back later would overrule a choice made after ours.
+    #[test]
+    fn a_stream_moved_somewhere_else_is_forgotten_not_returned() {
+        let mut ledger = StreamLedger::new(64);
+        ledger.note_rescued(&[168], Some("c"));
+        assert!(ledger.retain_parked(&listing(), 74).is_empty());
+        assert!(ledger.is_empty());
     }
 
     /// A stream that came home is forgotten, so it is not moved twice.
@@ -665,7 +693,7 @@ mod tests {
         ledger.note_rescued(&[38], Some("c"));
         ledger.note_returned(&[38]);
         assert!(ledger.is_empty());
-        assert!(ledger.plan_return(&listing(), 74).is_empty());
+        assert!(ledger.retain_parked(&listing(), 74).is_empty());
     }
 
     /// The end-to-end shape: park, the chain dies and recovers, the stream comes
@@ -679,7 +707,7 @@ mod tests {
             sink_index: 74,
         }];
 
-        let first = ledger.plan_return(&parked, 74);
+        let first = ledger.retain_parked(&parked, 74);
         assert_eq!(first, vec![38]);
         ledger.note_returned(&first);
 
@@ -688,6 +716,7 @@ mod tests {
             index: 38,
             sink_index: 33,
         }];
-        assert!(ledger.plan_return(&home, 74).is_empty());
+        assert!(ledger.retain_parked(&home, 74).is_empty());
+        assert!(ledger.is_empty());
     }
 }
