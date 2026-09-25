@@ -87,8 +87,15 @@ pub fn load_from(path: &Path) -> Result<Config> {
     let data = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read config from {}", path.display()))?;
 
-    let config: Config = serde_json::from_str(&data)
+    let mut config: Config = serde_json::from_str(&data)
         .with_context(|| format!("Failed to parse config from {}", path.display()))?;
+
+    // A hand-edited config.json is the one input that can carry any number at
+    // all, and this is the one place a config enters the process — `load` and
+    // `load_existing` both come through here. So the bound goes here, rather
+    // than in each caller: two call sites in `main.rs` was two chances to miss
+    // one, and the first version of this did exactly that.
+    crate::audio::sanitize_audio_config(&mut config.audio);
 
     Ok(config)
 }
@@ -160,6 +167,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create scratch dir");
         dir
+    }
+
+    /// A hand-edited config cannot enter the process carrying a number that
+    /// nothing else would produce.
+    ///
+    /// The bound lives in `load_from` rather than in `main.rs` because that is
+    /// the one function both `load` and `load_existing` come through, and
+    /// `load_existing` is the runtime `Reload` path. With the call in each caller
+    /// instead, one of them was missed — the mutation that removed it from
+    /// `main.rs` failed no test at all, because every other test reached the rule
+    /// directly rather than through this door.
+    #[test]
+    fn a_config_read_off_disk_is_bounded_on_the_way_in() {
+        let dir = scratch("bounded-load");
+        let path = dir.join("config.json");
+        // A hand edit: every number here is outside what the pipeline can express.
+        let mut config = Config::default();
+        config.audio.mic_gain = 900_000;
+        config.audio.sidetone.level = 4.0;
+        config.audio.noise_gate.threshold_db = 25.0;
+        config.audio.eq.bands = vec![
+            epos_shared::config::EqBand { freq: 0, gain_db: 900.0, q: 1.0 },
+        ];
+        std::fs::write(&path, serde_json::to_string(&config).expect("serialise")).expect("write");
+
+        let loaded = load_from(&path).expect("the file is well formed");
+        assert_eq!(loaded.audio.mic_gain, 100);
+        assert_eq!(loaded.audio.sidetone.level, 1.0);
+        assert_eq!(loaded.audio.noise_gate.threshold_db, 0.0);
+        assert!(
+            loaded.audio.eq.bands.is_empty(),
+            "a band at 0 Hz cannot be expressed, so it must not survive the load: {:?}",
+            loaded.audio.eq.bands
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The destructive case. `Reload` used to call the same `load()` that

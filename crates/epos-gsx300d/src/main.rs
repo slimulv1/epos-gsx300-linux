@@ -41,8 +41,12 @@ async fn main() -> Result<()> {
 
     info!("epos-gsx300d v{} starting...", env!("CARGO_PKG_VERSION"));
 
-    // Load config
+    // Load config — `config::load_from` applies the numeric bound, so a
+    // hand-edited config cannot enter the process carrying a number that nothing
+    // else would have produced. Both this and the runtime `Reload` come through
+    // that one function, which is why the bound is there and not here.
     let config = config::load()?;
+
     // Seed the daemon's belief about the file with what it actually contains,
     // before anything can save. Without this the first save would find no
     // belief to contradict and would overwrite an edit made between the load
@@ -1689,6 +1693,7 @@ async fn config_watch_loop(state: Arc<RwLock<IpcState>>) {
                 continue;
             }
         };
+        audio::sanitize_audio_config(&mut new_config.audio);
 
         // Settled: this external edit is now in memory.
         last_mtime = mtime;
@@ -1730,6 +1735,10 @@ async fn config_watch_loop(state: Arc<RwLock<IpcState>>) {
                 .find(|p| p.name.eq_ignore_ascii_case(&new_config.active_profile))
             {
                 new_config.audio = p.audio.clone();
+                // The bound at :1700 ran before this, so an edited profile's audio
+                // would land here unbounded. A profile is just as hand-editable as
+                // the top level.
+                audio::sanitize_audio_config(&mut new_config.audio);
             }
         }
 

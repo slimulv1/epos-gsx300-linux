@@ -188,6 +188,15 @@ pub(crate) fn sync_active_profile(state: &mut IpcState) {
 /// of truth; non-custom modes are left alone.
 fn apply_eq_to_audio(audio: &mut AudioConfig, eq: epos_shared::config::EqConfig) {
     audio.eq = eq;
+    // The bound goes here rather than at the call sites, because this function is
+    // the one place the EQ enters an AudioConfig and it has four callers. Two of
+    // them write `state.config.audio` directly, one works on a local that is
+    // copied in later, and only one of the four was found by grepping for a field
+    // assignment — the other three go through this signature. Measured: with the
+    // clamp at the SetEq call site only, `freq: 0, gain: 999, q: -3` still came
+    // back out of `GetEq` untouched, because the smart-button path reaches the
+    // same function by a name no field-assignment grep would show.
+    crate::audio::sanitize_audio_config(audio);
     if audio.voice_enhancer.mode == epos_shared::config::VoiceMode::Custom {
         audio.voice_enhancer.custom_bands = Some(audio.eq.bands.clone());
     }
@@ -748,6 +757,10 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
             let mut state = state.write().await;
             state.config.audio.sidetone.enabled = enabled;
             state.config.audio.sidetone.level = level;
+            // Bound before anything reads it back. `state.config` is what gets
+            // persisted and what `GetEq` answers with, so an unbounded float
+            // here is a value the daemon reports and the hardware never got.
+            crate::audio::sanitize_audio_config(&mut state.config.audio);
             sync_active_profile(&mut state);
             let audio_cfg = state.config.audio.clone();
             state.audio.update_config(&audio_cfg);
@@ -767,6 +780,8 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
             let mut state = state.write().await;
             state.config.audio.noise_gate.enabled = enabled;
             state.config.audio.noise_gate.threshold_db = threshold_db;
+            // Same reason as SetSidetone: this is the copy that is reported.
+            crate::audio::sanitize_audio_config(&mut state.config.audio);
             sync_active_profile(&mut state);
             let audio_cfg = state.config.audio.clone();
             state.audio.update_config(&audio_cfg);
@@ -815,6 +830,8 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
                 Some(state.config.audio.eq.bands.clone())
             } else {
                 // Non-custom modes carry no bands; storing stale ones only
+            // A custom band list arrives over the same public IPC boundary.
+            crate::audio::sanitize_audio_config(&mut state.config.audio);
                 // invited confusion when switching back.
                 None
             };
@@ -846,6 +863,8 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
             // straight to `amixer` as e.g. "5000%".
             let gain = gain.min(100);
             state.config.audio.mic_gain = gain;
+            // Kept so this path and the ones above go through one bound.
+            crate::audio::sanitize_audio_config(&mut state.config.audio);
             sync_active_profile(&mut state);
             // Sync into the pipeline's config copy — apply_mic_gain reads
             // self.config.mic_gain, and without this the handler applied the
@@ -920,6 +939,9 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
                 // the same profile.
                 let canonical_name = profile.name.clone();
                 state.config.audio = profile_audio;
+                // A profile came out of config.json, which is a file the user
+                // edits by hand, so it can carry any number at all.
+                crate::audio::sanitize_audio_config(&mut state.config.audio);
                 state.config.active_profile = canonical_name;
                 // A profile also carries the audio mode (7.1 for MOVIE/MUSIC,
                 // stereo for FLAT/ESPORT). The smart-button path already
@@ -1012,6 +1034,8 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
                         };
                     };
                     state.config.audio = profile.audio.clone();
+                    // Same bound as the GUI's profile switch above.
+                    crate::audio::sanitize_audio_config(&mut state.config.audio);
                     // A profile carries a mode as well as audio. Only the audio was
                     // applied before, so deleting an active 7.1 profile left `mode`
                     // at Surround71 and the ring red while the daemon reported the
@@ -1474,6 +1498,38 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+
+    /// `apply_eq_to_audio` is where the EQ enters an AudioConfig, and it has
+    /// four callers — two of which write `state.config.audio` directly.
+    ///
+    /// It is tested here rather than through the rule it calls, because the
+    /// mutation that removed the call from this function passed every other test
+    /// in the crate. Both earlier production failures were of exactly this shape:
+    /// the rule was tested, the wiring was not, and only running it showed up.
+    /// `apply_eq_to_audio` is a pure function over `&mut AudioConfig`, so the
+    /// wiring is directly reachable — no `IpcState` and no daemon required.
+    #[test]
+    fn the_eq_enters_an_audio_config_already_bounded() {
+        let mut audio = AudioConfig::default();
+        let hostile = epos_shared::config::EqConfig {
+            enabled: true,
+            bands: vec![
+                // Unrepresentable: the graph can never receive this one.
+                epos_shared::config::EqBand { freq: 0, gain_db: 3.0, q: 1.0 },
+                // Extreme but expressible: clamped, and kept.
+                epos_shared::config::EqBand { freq: 1000, gain_db: 900.0, q: 1.0 },
+            ],
+        };
+        apply_eq_to_audio(&mut audio, hostile);
+        assert_eq!(
+            audio.eq.bands.len(), 1,
+            "the 0 Hz band cannot be expressed and must not be stored: {:?}",
+            audio.eq.bands
+        );
+        assert_eq!(audio.eq.bands[0].freq, 1000);
+        assert!(audio.eq.bands[0].gain_db < 900.0, "900 dB comes back as the limit");
+    }
+
     use super::*;
     use epos_shared::config::{EqBand, VoiceEnhancerConfig, VoiceMode};
 

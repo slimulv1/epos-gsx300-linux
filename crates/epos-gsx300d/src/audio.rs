@@ -649,6 +649,38 @@ pub fn effective_eq_band_count(eq: &EqConfig) -> usize {
 /// - gain and Q are clamped into safe ranges rather than dropped
 /// - flat bands and bands past `MAX_EQ_BANDS` are dropped
 pub fn sanitize_bands(bands: &[epos_shared::config::EqBand]) -> Vec<(u32, f32, f32)> {
+    keep_representable_bands(bands)
+        .into_iter()
+        // A filter with no gain is a no-op, so the conf writer leaves it out.
+        // This is the one rule that belongs to the graph and *not* to the stored
+        // config: see `keep_representable_bands`.
+        .filter(|b| b.gain_db.abs() >= BAND_GAIN_EPSILON_DB)
+        .map(|b| (b.freq, b.gain_db, b.q))
+        .collect()
+}
+
+/// The bands the config may hold, in its own shape.
+///
+/// A band is dropped only when it could not be expressed at all: a non-finite
+/// number, or a frequency the graph cannot produce. Everything else is clamped
+/// and kept.
+///
+/// A **flat** band — 0 dB — is kept on purpose. The conf writer omits those,
+/// because a filter with no gain does nothing, and that is the right call for a
+/// graph. It is the wrong call for `config.json`: 0 dB is a legitimate point on
+/// a curve and a user keeps one as a handle to drag upward later. An earlier
+/// version of this used the writer's rule for both, and the difference showed up
+/// as the config file quietly losing two of the user's nine bands.
+///
+/// The agreement this exists to establish is narrower than "stored == applied":
+/// it is that a band the graph could **never** receive is not still sitting in
+/// `config.json` being reported by `GetEq` as a setting the user chose. Measured:
+/// `freq: 0, gain: 999, q: -3` went in and came straight back out, while that
+/// band never reached the graph — a user reading that sees a band and hears
+/// nothing.
+pub fn keep_representable_bands(
+    bands: &[epos_shared::config::EqBand],
+) -> Vec<epos_shared::config::EqBand> {
     let mut out = Vec::with_capacity(bands.len().min(MAX_EQ_BANDS));
     for b in bands.iter().take(MAX_EQ_BANDS) {
         if !b.gain_db.is_finite() || !b.q.is_finite() {
@@ -658,12 +690,11 @@ pub fn sanitize_bands(bands: &[epos_shared::config::EqBand]) -> Vec<(u32, f32, f
         if freq < BAND_FREQ_MIN_HZ || freq > BAND_FREQ_MAX_HZ {
             continue;
         }
-        let gain = b.gain_db.clamp(-BAND_GAIN_LIMIT_DB, BAND_GAIN_LIMIT_DB);
-        if gain.abs() < BAND_GAIN_EPSILON_DB {
-            continue;
-        }
-        let q = b.q.clamp(BAND_Q_MIN, BAND_Q_MAX);
-        out.push((b.freq, gain, q));
+        out.push(epos_shared::config::EqBand {
+            freq: b.freq,
+            gain_db: b.gain_db.clamp(-BAND_GAIN_LIMIT_DB, BAND_GAIN_LIMIT_DB),
+            q: b.q.clamp(BAND_Q_MIN, BAND_Q_MAX),
+        });
     }
     out
 }
@@ -677,6 +708,91 @@ pub fn sanitize_bands(bands: &[epos_shared::config::EqBand]) -> Vec<(u32, f32, f
 /// `config.json`, and `Reload` — not just the IPC edge.
 fn sanitize_mic_gain(gain: u32) -> u32 {
     gain.min(100)
+}
+
+/// `sidetone.level` is a fraction of the captured signal, 0..=1.
+const SIDETONE_LEVEL_MIN: f32 = 0.0;
+const SIDETONE_LEVEL_MAX: f32 = 1.0;
+
+/// `noise_gate.threshold_db` runs from -60 dB up to 0 dB, and the sign is the
+/// whole point.
+///
+/// `write_voice_conf` reads `(-threshold_db).clamp(0.0, 60.0)`, which is the
+/// same set written backwards, and the GUI's slider is `min="-60" max="0"` to
+/// match. Bounding it as 0..=60 would accept a config the writer then reads as
+/// silence, and the mistake stays invisible because both ends of the range
+/// produce a plausible number.
+const NOISE_GATE_DB_MIN: f32 = -60.0;
+const NOISE_GATE_DB_MAX: f32 = 0.0;
+
+/// Clamp into `min..=max`, and replace a non-finite value rather than pass it.
+///
+/// `f32::clamp` hands NaN straight back, so a clamp on its own is not a bound:
+/// it would store something that compares false against every threshold
+/// downstream, and `GetEq` would then serialise it as JSON. JSON cannot carry
+/// NaN or Infinity, so this is unreachable from a config file or from IPC; it is
+/// reachable from anything computed from a reading, and the point of a funnel is
+/// not to care where a number came from.
+fn finite_clamp(value: f32, min: f32, max: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        // 0.0 is in range for both callers and is what the GUI shows for an
+        // unset value, so it is the least surprising replacement.
+        0.0
+    }
+}
+
+/// Bound the sidetone level to the fraction the conf writer expects.
+fn sanitize_sidetone_level(level: f32) -> f32 {
+    finite_clamp(level, SIDETONE_LEVEL_MIN, SIDETONE_LEVEL_MAX)
+}
+
+/// Bound the noise gate threshold to the dB range the voice conf can express.
+fn sanitize_noise_gate_db(db: f32) -> f32 {
+    finite_clamp(db, NOISE_GATE_DB_MIN, NOISE_GATE_DB_MAX)
+}
+
+/// Every number an [`AudioConfig`] may hold, bounded in place.
+///
+/// This lives on the value rather than inside [`AudioPipeline::update_config`]
+/// because `update_config` only ever saw the pipeline's *copy*. The copy the
+/// daemon persists to `config.json` and hands back through `GetEq` is
+/// `IpcState::config`, and the first version of this fix put the clamps in the
+/// pipeline: its unit test passed, and a live `SetSidetone` with `level: 2.5`
+/// still came back as `2.5` from `GetEq` and still landed in the file. The test
+/// was asserting on the copy that had been fixed rather than the one that is
+/// read back.
+///
+/// Six places write `state.config.audio`, and one of them replaces the whole
+/// struct from a stored profile — which came out of a hand-edited file and can
+/// carry anything. So every one of them calls this.
+pub fn sanitize_audio_config(config: &mut AudioConfig) {
+    config.mic_gain = sanitize_mic_gain(config.mic_gain);
+    config.sidetone.level = sanitize_sidetone_level(config.sidetone.level);
+    config.noise_gate.threshold_db = sanitize_noise_gate_db(config.noise_gate.threshold_db);
+    // Both band lists, because both are stored and both are reported by `GetEq`,
+    // and the conf writer applies `keep_usable_bands` to whichever one the mode
+    // selects. A band dropped there but kept here is a band the user can see and
+    // not hear.
+    let kept = keep_representable_bands(&config.eq.bands);
+    if kept.len() != config.eq.bands.len() {
+        debug!(
+            "Dropped {} EQ band(s) that fall outside the usable range",
+            config.eq.bands.len() - kept.len()
+        );
+    }
+    config.eq.bands = kept;
+    if let Some(bands) = config.voice_enhancer.custom_bands.as_mut() {
+        let kept = keep_representable_bands(bands);
+        if kept.len() != bands.len() {
+            debug!(
+                "Dropped {} custom voice band(s) that fall outside the usable range",
+                bands.len() - kept.len()
+            );
+        }
+        *bands = kept;
+    }
 }
 
 /// The ALSA card index to hand to `amixer`, or an error when it is not known.
@@ -1092,7 +1208,9 @@ impl AudioPipeline {
         let mut config = config.clone();
         // Single funnel for every config source, so a profile or an edited
         // config.json cannot smuggle an out-of-range gain past the IPC clamp.
-        config.mic_gain = sanitize_mic_gain(config.mic_gain);
+        // The bound itself lives in `sanitize_audio_config` because the copy that
+        // gets persisted and reported is the state's, not this one.
+        sanitize_audio_config(&mut config);
         self.config = config;
     }
 
@@ -2354,7 +2472,17 @@ impl AudioPipeline {
             )
         };
         let vad_threshold = if noise_gate {
-            50.0 + ((-self.config.noise_gate.threshold_db).clamp(0.0, 60.0) / 60.0) * 50.0
+            // Clamp in the config's own orientation, then flip. The old form
+            // clamped `-threshold_db`, which is the same set written backwards
+            // and reads as though the range were 0..=60. Same result for every
+            // in-range value, and the orientation now matches the constant, the
+            // slider, and what `GetEq` reports.
+            let db = self
+                .config
+                .noise_gate
+                .threshold_db
+                .clamp(NOISE_GATE_DB_MIN, NOISE_GATE_DB_MAX);
+            50.0 + ((-db) / 60.0) * 50.0
         } else {
             0.0
         };
@@ -2391,7 +2519,11 @@ impl AudioPipeline {
             return self.write_instance_conf("sidetone", &conf);
         }
         let (sink, source) = self.node_names();
-        let level = self.config.sidetone.level.clamp(0.0, 1.0);
+        let level = self
+            .config
+            .sidetone
+            .level
+            .clamp(SIDETONE_LEVEL_MIN, SIDETONE_LEVEL_MAX);
         let module = format!(
             r#"
     {{ name = libpipewire-module-loopback
@@ -3709,6 +3841,253 @@ impl Drop for AudioPipeline {
 
 #[cfg(test)]
 mod tests {
+    /// The funnel bounds *every* number it is handed, not just the mic gain.
+    ///
+    /// `update_config` is the only place `self.config` is assigned, so anything
+    /// not bounded here is a value the daemon stores, writes into
+    /// `config.json`, and hands back through `GetEq` — while applying something
+    /// different to the hardware. The two float bounds used to live at the use
+    /// sites, which is one step too late: by then the stored value had already
+    /// diverged from the applied one, and it is the stored one that is reported.
+    ///
+    /// The mic gain has been in the funnel all along, with a comment saying the
+    /// funnel exists precisely so a hand-edited config cannot smuggle a value
+    /// past the IPC clamp. Two numbers sat outside that argument.
+    #[test]
+    fn the_config_funnel_bounds_every_number_it_is_handed() {
+        let mut pipeline = AudioPipeline::new(&AudioConfig::default());
+
+        // Each one separately: a single hostile config that trips all three
+        // would still pass if the funnel only fixed the first.
+        let mut gain = AudioConfig::default();
+        gain.mic_gain = 4_000_000_000;
+        pipeline.update_config(&gain);
+        assert_eq!(
+            pipeline.config.mic_gain, 100,
+            "an unbounded mic gain pins the hardware at maximum and lies about \
+             the request"
+        );
+
+        let mut loud = AudioConfig::default();
+        loud.sidetone.level = 2.5;
+        pipeline.update_config(&loud);
+        assert_eq!(
+            pipeline.config.sidetone.level, 1.0,
+            "a level above 1.0 is never applied, so storing it means GetEq \
+             reports a number the sidetone does not use"
+        );
+
+        let mut quiet = AudioConfig::default();
+        quiet.sidetone.level = -0.5;
+        pipeline.update_config(&quiet);
+        assert_eq!(pipeline.config.sidetone.level, 0.0, "a negative fraction is out of range");
+
+        // The sign is the whole point of this one. `write_voice_conf` reads
+        // `-threshold_db`, so the accepted set is -60..=0 and the GUI's slider
+        // is `min="-60" max="0"`. Bounding it as 0..=60 would accept a config
+        // the writer then reads as silence, and the mistake is invisible in the
+        // result because both ends clamp to something plausible.
+        let mut gate = AudioConfig::default();
+        gate.noise_gate.threshold_db = -25.0;
+        pipeline.update_config(&gate);
+        assert_eq!(
+            pipeline.config.noise_gate.threshold_db, -25.0,
+            "a threshold inside -60..=0 must survive untouched"
+        );
+
+        let mut too_quiet = AudioConfig::default();
+        too_quiet.noise_gate.threshold_db = -90.0;
+        pipeline.update_config(&too_quiet);
+        assert_eq!(
+            pipeline.config.noise_gate.threshold_db, -60.0,
+            "below -60 the voice conf clamps anyway; the stored value must match \
+             what is applied"
+        );
+
+        let mut positive = AudioConfig::default();
+        positive.noise_gate.threshold_db = 30.0;
+        pipeline.update_config(&positive);
+        assert_eq!(
+            pipeline.config.noise_gate.threshold_db, 0.0,
+            "a positive threshold is not a threshold this pipeline can express"
+        );
+    }
+
+    /// The bound is a property of the value, so it can be applied by whoever
+    /// holds the copy that gets read back.
+    ///
+    /// This is the shape the fix ended up in, and the shape matters: putting the
+    /// clamps inside `update_config` left `IpcState::config` unbounded, so the
+    /// unit tests passed while a live `SetSidetone` of `2.5` was still stored,
+    /// still persisted, and still answered by `GetEq`. Only running it found
+    /// that. The function is therefore public to the crate and every writer
+    /// calls it — there are six, and one of them replaces the whole struct from
+    /// a profile read out of the user's own file.
+    #[test]
+    fn the_value_bound_does_not_depend_on_which_copy_is_held() {
+        let mut cfg = AudioConfig::default();
+        cfg.mic_gain = 9_999;
+        cfg.sidetone.level = 3.0;
+        cfg.sidetone.enabled = true;
+        cfg.noise_gate.threshold_db = 12.0;
+        cfg.noise_gate.enabled = true;
+        sanitize_audio_config(&mut cfg);
+        assert_eq!(cfg.mic_gain, 100);
+        assert_eq!(cfg.sidetone.level, 1.0);
+        assert_eq!(cfg.noise_gate.threshold_db, 0.0);
+        // Bounding a number must not switch the feature off: a caller that asked
+        // for the sidetone on and got 1.0 back should still have it on.
+        assert!(cfg.sidetone.enabled && cfg.noise_gate.enabled);
+    }
+
+    /// A band the graph could never receive must not be left in the stored
+    /// config.
+    ///
+    /// `GetEq` answers from the stored config, so a band the graph never
+    /// receives is a band the user can see and not hear. Measured before this
+    /// fix: `freq: 0, gain: 999, q: -3` went in and came straight back out of
+    /// `GetEq`, while the band was dropped from the generated conf.
+    ///
+    /// Both band lists are covered, because the audio mode decides which one the
+    /// writer reads and `GetEq` reports both.
+    #[test]
+    fn a_band_the_graph_could_never_receive_is_not_left_in_the_config() {
+        use epos_shared::config::EqBand;
+
+        let mut cfg = AudioConfig::default();
+        cfg.eq.bands = vec![
+            EqBand { freq: 1000, gain_db: 3.0, q: 1.0 },
+            // Out-of-range frequency: the writer drops this one.
+            EqBand { freq: 0, gain_db: 3.0, q: 1.0 },
+        ];
+        cfg.voice_enhancer.custom_bands = Some(vec![
+            EqBand { freq: 2000, gain_db: -2.0, q: 1.0 },
+            // Out of range, and non-finite: both are reasons to drop.
+            EqBand { freq: 40000, gain_db: 2.0, q: 1.0 },
+            EqBand { freq: 500, gain_db: f32::NAN, q: 1.0 },
+        ]);
+        sanitize_audio_config(&mut cfg);
+
+        assert_eq!(
+            cfg.eq.bands,
+            vec![EqBand { freq: 1000, gain_db: 3.0, q: 1.0 }],
+            "only the band the graph can use may remain"
+        );
+        assert_eq!(
+            cfg.voice_enhancer.custom_bands.as_deref(),
+            Some(&[EqBand { freq: 2000, gain_db: -2.0, q: 1.0 }][..]),
+            "the custom list is the one the voice mode reads, and it gets the same rule"
+        );
+    }
+
+    /// A flat band belongs to the user even though it does not belong to the
+    /// graph.
+    ///
+    /// This is the rule the two above used to get wrong in the other direction.
+    /// The conf writer omits a 0 dB filter because it would do nothing, and
+    /// applying that rule to `config.json` quietly deleted two of the user's nine
+    /// bands — caught by diffing the config against a backup after a test run,
+    /// not by any assertion. A flat band is a point on a curve and often a
+    /// handle the user keeps in order to drag it up later.
+    ///
+    /// So: kept in the config, absent from the conf. Both halves are asserted,
+    /// because keeping it in both would mean a no-op filter in the graph, and
+    /// dropping it from both is the bug.
+    #[test]
+    fn a_flat_band_is_kept_in_the_config_and_left_out_of_the_conf() {
+        use epos_shared::config::EqBand;
+
+        let flat = EqBand { freq: 1000, gain_db: 0.0, q: 1.0 };
+        let real = EqBand { freq: 2000, gain_db: 4.0, q: 1.0 };
+        let bands = vec![flat, real];
+
+        let mut cfg = AudioConfig::default();
+        cfg.eq.bands = bands.clone();
+        sanitize_audio_config(&mut cfg);
+        assert_eq!(
+            cfg.eq.bands, bands,
+            "a 0 dB band is the user's to keep; it is a point on the curve"
+        );
+
+        assert_eq!(
+            sanitize_bands(&bands),
+            vec![(2000, 4.0, 1.0)],
+            "but a filter with no gain does nothing, so the writer leaves it out"
+        );
+    }
+
+    /// An over-ambitious band is clamped, not deleted.
+    ///
+    /// The other half of the rule above. Dropping on every out-of-range value
+    /// would make a typo silently erase a setting the user can hear; only a
+    /// frequency the graph cannot express, or a number that is not a number, is
+    /// worth losing.
+    #[test]
+    fn a_band_that_is_merely_too_extreme_survives_as_a_clamped_one() {
+        use epos_shared::config::EqBand;
+
+        let mut cfg = AudioConfig::default();
+        cfg.eq.bands = vec![EqBand { freq: 1000, gain_db: 999.0, q: -3.0 }];
+        sanitize_audio_config(&mut cfg);
+
+        assert_eq!(cfg.eq.bands.len(), 1, "an extreme gain is not a reason to delete");
+        let kept = cfg.eq.bands[0];
+        assert_eq!(kept.freq, 1000, "a usable frequency is untouched");
+        assert!(
+            kept.gain_db < 999.0 && kept.gain_db > 0.0,
+            "999 dB must come back as the limit, not as 999: {}",
+            kept.gain_db
+        );
+        assert!(kept.q > -3.0, "a negative Q comes back as the minimum: {}", kept.q);
+    }
+
+    /// A non-finite number is not a number this pipeline can use.
+    ///
+    /// `f32::clamp` returns NaN when handed NaN, so clamping is not by itself a
+    /// bound — it would store a value that compares false against every
+    /// threshold downstream, and `GetEq` would then serialise it. JSON cannot
+    /// carry NaN or Infinity, so this is not reachable from a config file or
+    /// from IPC; it is reachable from anything computed from a reading, and the
+    /// point of a funnel is not to care where a number came from.
+    #[test]
+    fn a_non_finite_number_is_replaced_rather_than_clamped() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut pipeline = AudioPipeline::new(&AudioConfig::default());
+            let mut cfg = AudioConfig::default();
+            cfg.sidetone.level = bad;
+            cfg.noise_gate.threshold_db = bad;
+            pipeline.update_config(&cfg);
+            assert!(
+                pipeline.config.sidetone.level.is_finite(),
+                "sidetone level stayed non-finite: {}",
+                pipeline.config.sidetone.level
+            );
+            assert!(
+                pipeline.config.noise_gate.threshold_db.is_finite(),
+                "noise gate threshold stayed non-finite: {}",
+                pipeline.config.noise_gate.threshold_db
+            );
+        }
+    }
+
+    /// A config nobody touched comes out the other side unchanged.
+    ///
+    /// The anti-vacuity test for the two above. A funnel that flattened every
+    /// value to 0.0 would satisfy both of them, and the sidetone and noise gate
+    /// would be permanently off.
+    #[test]
+    fn an_untouched_config_passes_through_the_funnel_unchanged() {
+        let mut pipeline = AudioPipeline::new(&AudioConfig::default());
+        let mut cfg = AudioConfig::default();
+        cfg.mic_gain = 55;
+        cfg.sidetone.level = 0.4;
+        cfg.noise_gate.threshold_db = -35.0;
+        pipeline.update_config(&cfg);
+        assert_eq!(pipeline.config.mic_gain, 55);
+        assert_eq!(pipeline.config.sidetone.level, 0.4);
+        assert_eq!(pipeline.config.noise_gate.threshold_db, -35.0);
+    }
+
     /// A probe that answered hands its listing back; one that did not says why.
     ///
     /// Six call sites shared this rule by re-typing it, and one of them had
