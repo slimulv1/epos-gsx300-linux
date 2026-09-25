@@ -51,6 +51,16 @@ const REQUEST_LEN: usize = 38;
 /// Total packet length = report id + request payload.
 const PACKET_LEN: usize = 39;
 
+/// The two lengths are related, and nothing in the type system knows it.
+///
+/// `read_mem` builds a `REQUEST_LEN` payload and then does
+/// `packet[1..].copy_from_slice(&payload)` into a `PACKET_LEN` buffer. Both are
+/// `usize`, so changing one of them compiles cleanly and turns into a panic on
+/// the first hardware read, with a device plugged in - the one moment nobody has
+/// a test fixture ready. Asserted here so the mistake is a build failure
+/// instead: change `REQUEST_LEN` and this stops compiling, naming the reason.
+const _: () = assert!(PACKET_LEN - 1 == REQUEST_LEN);
+
 /// Flags: RAM access. bit6 (0x40) write-enable is NEVER set in this module.
 const FLAG_RAM: u8 = 0x00;
 /// Flags: EEPROM access (passive read; see eeprom_dump.py).
