@@ -350,6 +350,67 @@ fn capped_dump(program: &str, budget: Duration) -> Option<String> {
     rx.recv_timeout(budget).ok().flatten()
 }
 
+/// The value of `key` in a sysfs `uevent`, if the line is there.
+///
+/// `strip_prefix` on the whole `key` including its `=`, so `HID_ID=` does not
+/// match a hypothetical `HID_ID_EXTRA=` and a key with no `=` cannot match at
+/// all. uevent files are one `KEY=value` per line.
+fn uevent_field<'a>(uevent: &'a str, key: &str) -> Option<&'a str> {
+    uevent.lines().find_map(|line| line.strip_prefix(key))
+}
+
+/// (vendor, product) from a **hidraw** `uevent`.
+///
+/// The real file on this machine, read off it rather than assumed:
+///
+/// ```text
+/// DRIVER=hid-generic
+/// HID_ID=0003:00001395:00000098
+/// HID_NAME=Sennheiser EPOS GSX 300
+/// HID_PHYS=usb-0000:00:14.0-7/input3
+/// HID_UNIQ=A003200202602692
+/// MODALIAS=hid:b0003g0001v00001395p00000098
+/// ```
+///
+/// bus, then vendor, then product, each hex, the first four digits and the
+/// other two eight. Exactly three parts or it is not this format.
+fn hid_id_from_uevent(uevent: &str) -> Option<(u16, u16)> {
+    let parts: Vec<&str> = uevent_field(uevent, "HID_ID=")?.split(':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    Some((
+        u16::from_str_radix(parts[1], 16).ok()?,
+        u16::from_str_radix(parts[2], 16).ok()?,
+    ))
+}
+
+/// (vendor, product) from an **input** `uevent`.
+///
+/// A different file, and the two were being matched the same way:
+///
+/// ```text
+/// PRODUCT=3/1395/98/111
+/// NAME="Sennheiser EPOS GSX 300"
+/// MODALIAS=input:b0003v1395p0098e0111-e0,1,4,k72,73,246,ram4,lsfw
+/// ```
+///
+/// bus/vendor/product/version, and note the product is written `98`, not
+/// `0098`. A padded `{:04X}` needle therefore does not match this line at all -
+/// the old substring check only found it because the eight-digit `p0098` in
+/// `MODALIAS` happened to contain those four characters. One field of one
+/// format standing in for another field of a different format.
+fn product_from_input_uevent(uevent: &str) -> Option<(u16, u16)> {
+    let parts: Vec<&str> = uevent_field(uevent, "PRODUCT=")?.split('/').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    Some((
+        u16::from_str_radix(parts[1], 16).ok()?,
+        u16::from_str_radix(parts[2], 16).ok()?,
+    ))
+}
+
 fn find_hidraw(vid: u16, pid: u16) -> Option<std::path::PathBuf> {
     let hidraw_dir = std::path::PathBuf::from("/dev");
     for i in 0..16 {
@@ -358,9 +419,7 @@ fn find_hidraw(vid: u16, pid: u16) -> Option<std::path::PathBuf> {
             // Check if it matches our device by reading sysfs
             let sysfs = std::path::PathBuf::from(format!("/sys/class/hidraw/hidraw{}/device", i));
             if let Ok(uevent) = std::fs::read_to_string(sysfs.join("uevent")) {
-                if uevent.contains(&format!("{:04X}", vid))
-                    && uevent.contains(&format!("{:04X}", pid))
-                {
+                if hid_id_from_uevent(&uevent) == Some((vid, pid)) {
                     return Some(path);
                 }
             }
@@ -378,9 +437,7 @@ fn find_input_event(vid: u16, pid: u16) -> Option<std::path::PathBuf> {
             let sysfs =
                 std::path::PathBuf::from(format!("/sys/class/input/event{}/device/uevent", i));
             if let Ok(uevent) = std::fs::read_to_string(&sysfs) {
-                if uevent.contains(&format!("{:04X}", vid))
-                    && uevent.contains(&format!("{:04X}", pid))
-                {
+                if product_from_input_uevent(&uevent) == Some((vid, pid)) {
                     return Some(path);
                 }
             }
@@ -392,6 +449,146 @@ fn find_input_event(vid: u16, pid: u16) -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Telling our device apart from a stranger ──────────────────────────
+    //
+    // Every string below was read off this machine's own sysfs, not written
+    // from memory, because the whole point is that the two uevent formats are
+    // not interchangeable and a plausible-looking fixture would have hidden
+    // that. On the box this was captured from, 35 uevent files exist and three
+    // of them belong to the GSX 300.
+
+    const EPOS: (u16, u16) = (0x1395, 0x0098);
+
+    /// The substring approach is gone from this file, not just unused.
+    ///
+    /// The parser tests above would still pass if somebody added a fallback at
+    /// the call site — `parsed == Some(..) || uevent.contains(..)` — and that
+    /// is precisely where the defect was. So the rule is pinned where it can
+    /// drift back to, by text, over the production half of the file only: the
+    /// test lives in this same file and quotes the pattern, so scanning the
+    /// whole thing would make it match itself. That has bitten this crate three
+    /// times now, so the exclusion is visible here on purpose.
+    #[test]
+    fn no_uevent_is_matched_by_asking_whether_its_text_contains_an_id() {
+        let source = include_str!("devices.rs");
+        let production = match source.split_once("#[cfg(test)]") {
+            Some((before, _tests)) => before,
+            None => panic!("the test module anchor moved; update this test"),
+        };
+        assert!(
+            !production.contains("uevent.contains("),
+            "a uevent is matched by its parsed HID_ID or PRODUCT field, not by \
+             whether its text happens to contain four hex characters — that \
+             reads a serial number as a device id"
+        );
+    }
+
+    /// `/sys/class/hidraw/hidraw11/device/uevent` — the EPOS.
+    const EPOS_HIDRAW: &str = "\
+DRIVER=hid-generic
+HID_ID=0003:00001395:00000098
+HID_NAME=Sennheiser EPOS GSX 300
+HID_PHYS=usb-0000:00:14.0-7/input3
+HID_UNIQ=A003200202602692
+MODALIAS=hid:b0003g0001v00001395p00000098";
+
+    /// `/sys/class/input/event4/device/uevent` — the same device, other format.
+    const EPOS_INPUT: &str = "\
+PRODUCT=3/1395/98/111
+NAME=\"Sennheiser EPOS GSX 300 Consumer Control\"
+PHYS=\"usb-0000:00:14.0-7/input3\"
+UNIQ=\"A003200202602692\"
+PROP=0
+EV=13
+MODALIAS=input:b0003v1395p0098e0111-e0,1,4,k72,73,246,ram4,lsfw";
+
+    /// The EPOS is found in both formats, each from its own field.
+    #[test]
+    fn the_real_device_is_recognised_in_both_uevent_formats() {
+        assert_eq!(hid_id_from_uevent(EPOS_HIDRAW), Some(EPOS));
+        assert_eq!(product_from_input_uevent(EPOS_INPUT), Some(EPOS));
+    }
+
+    /// A device that merely *mentions* our ids is not our device.
+    ///
+    /// This is the case the substring check got wrong, and it is constructed
+    /// rather than observed — nothing on this machine trips it, which is worth
+    /// saying plainly, because "no false positives today" is not the same as
+    /// "cannot misidentify".
+    ///
+    /// Below is the real `hidraw0` uevent (an Asus AURA LED controller) with a
+    /// serial number that happens to spell our vendor and product. The old check
+    /// asked whether the text contained "1395" and "0098" and would have said
+    /// yes, handing the daemon a stranger's hidraw node to write LED reports to.
+    /// `HID_UNIQ` is a free-form serial, so a device whose serial contains those
+    /// four characters is not a far-fetched thing to meet.
+    #[test]
+    fn a_device_whose_text_mentions_our_ids_is_not_our_device() {
+        let lookalike = "\
+DRIVER=hid-generic
+HID_ID=0003:00000B05:00001A16
+HID_NAME=Generic USB Audio
+HID_PHYS=usb-0000:00:14.0-2/input7
+HID_UNIQ=13950098
+MODALIAS=hid:b0003g0001v00000B05p00001A16";
+        // Precondition: the text really does contain both needles, so this test
+        // is about the ids and not about the wording.
+        assert!(lookalike.contains("1395") && lookalike.contains("0098"));
+        assert_ne!(
+            hid_id_from_uevent(lookalike),
+            Some(EPOS),
+            "the HID_ID is a different device; a serial that spells ours changes nothing"
+        );
+    }
+
+    /// Every other real device on this machine is not the GSX 300.
+    #[test]
+    fn the_other_devices_connected_are_not_confused_with_ours() {
+        // (name, HID_ID) read from /sys/class/hidraw/*/device/uevent.
+        for (name, id) in [
+            ("Generic USB Audio", "0003:00000B05:00001A16"),
+            ("AsusTek AURA LED", "0003:00000B05:000019AF"),
+            ("Audioengine 2+", "0003:00000A12:00001243"),
+            ("Compx 2.4G receiver", "0003:0000260D:00001026"),
+            ("hidraw6", "0003:000025A7:00002420"),
+            ("hidraw8", "0003:0000342D:0000E407"),
+            ("LianLi fan controller", "0003:00000CF2:0000A100"),
+        ] {
+            let uevent = format!("DRIVER=hid-generic\nHID_ID={id}\nHID_NAME={name}\n");
+            assert_ne!(
+                hid_id_from_uevent(&uevent),
+                Some(EPOS),
+                "{name} ({id}) is not the GSX 300"
+            );
+        }
+    }
+
+    /// A uevent that is not the format we expect yields nothing.
+    ///
+    /// Guessing here is how a wrong device gets picked: every fallback here is a
+    /// guess, and each one is a guess about a file this code does not control.
+    #[test]
+    fn a_malformed_uevent_yields_nothing_rather_than_a_guess() {
+        // No such field.
+        assert_eq!(hid_id_from_uevent("DRIVER=hid-generic\n"), None);
+        assert_eq!(product_from_input_uevent("NAME=\"something\"\n"), None);
+        // Right key, wrong shape: two and four parts, not three.
+        assert_eq!(hid_id_from_uevent("HID_ID=00001395\n"), None);
+        assert_eq!(hid_id_from_uevent("HID_ID=0003:00001395:00000098:extra\n"), None);
+        assert_eq!(product_from_input_uevent("PRODUCT=3/1395\n"), None);
+        assert_eq!(product_from_input_uevent("PRODUCT=3/1395/98/111/x\n"), None);
+        // Right shape, not hex.
+        assert_eq!(hid_id_from_uevent("HID_ID=0003:zzzz:00000098\n"), None);
+        assert_eq!(product_from_input_uevent("PRODUCT=3/1395/zz/111\n"), None);
+        // The two formats are not interchangeable, in either direction.
+        assert_eq!(hid_id_from_uevent(EPOS_INPUT), None);
+        assert_eq!(product_from_input_uevent(EPOS_HIDRAW), None);
+        // A key must match the whole `KEY=`, not a longer name starting with it.
+        assert_eq!(hid_id_from_uevent("HID_ID_EXTRA=0003:00001395:00000098\n"), None);
+        // Empty file.
+        assert_eq!(hid_id_from_uevent(""), None);
+    }
 
     /// A program that never exits, written to disk so it can stand in for
     /// `pw-dump`. On disk rather than on PATH because the tests in this binary
