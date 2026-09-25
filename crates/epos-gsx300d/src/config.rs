@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use epos_shared::Config;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use tracing::info;
+use std::sync::{Mutex, OnceLock};
+use tracing::{info, warn};
 
 /// Returns the config directory path (~/.config/epos-gsx300/)
 pub fn config_dir() -> PathBuf {
@@ -63,6 +65,52 @@ pub fn load_existing() -> Result<Config> {
     load_from(&config_path())
 }
 
+/// Keys already named to the user, so a typo is reported once and not on
+/// every reload.
+///
+/// The reload watcher fires on any mtime change, and the daemon saves on
+/// ordinary setting changes, so a config carrying one bad key would otherwise
+/// produce the same line over and over.
+fn already_reported() -> &'static Mutex<BTreeSet<String>> {
+    static KEYS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    KEYS.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+/// Name any key this build does not recognise, once per key.
+///
+/// Preserving an unknown key is only half of it. Preserved, the key still does
+/// nothing, so a user who typed `mic_gian` instead of `mic_gain` watches their
+/// setting not take effect with nothing anywhere to suggest why. The name is
+/// what turns a silent no-op into something they can act on — and it is the
+/// only place they would ever find out, since the value is not in any response.
+fn keys_not_yet_reported<'a>(
+    extra: &'a BTreeMap<String, serde_json::Value>,
+    seen: &BTreeSet<String>,
+) -> Vec<&'a str> {
+    extra
+        .keys()
+        .filter(|key| !seen.contains(*key))
+        .map(String::as_str)
+        .collect()
+}
+
+/// Name them. The decision of *which* keys is [`keys_not_yet_reported`], split
+/// out so it can be tested: asserting on the warning itself would mean standing
+/// up a tracing subscriber to capture log output, and a mutation that removed
+/// this call from `load_from` passed every test in the crate for exactly that
+/// reason — the rule was right and nothing could see it being applied.
+fn report_unrecognised_keys(extra: &BTreeMap<String, serde_json::Value>) {
+    let mut seen = crate::sync::lock(already_reported());
+    for key in keys_not_yet_reported(extra, &seen) {
+        warn!(
+            "config.json has a key this build does not recognise: {key:?}. \
+             It is being kept as-is, so nothing is lost, but it has no effect. \
+             If you meant to change a setting, check the spelling."
+        );
+        seen.insert(key.to_string());
+    }
+}
+
 /// Load the config at `path`, creating a default file if it is absent.
 ///
 /// Bootstrap only. At runtime an absent file means something removed it, and
@@ -96,6 +144,7 @@ pub fn load_from(path: &Path) -> Result<Config> {
     // than in each caller: two call sites in `main.rs` was two chances to miss
     // one, and the first version of this did exactly that.
     crate::audio::sanitize_audio_config(&mut config.audio);
+    report_unrecognised_keys(&config.extra);
 
     Ok(config)
 }
@@ -167,6 +216,142 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create scratch dir");
         dir
+    }
+
+    /// A key this build does not recognise survives a save.
+    ///
+    /// The whole point of the `extra` map on `Config`. Before it, a typo was
+    /// destroyed without a word: `load_from` parsed straight past the unknown
+    /// key, `save` serialised the struct — which has no such field — and the
+    /// edit was gone. The user changes a setting, the GUI keeps showing the old
+    /// value, and nothing says why.
+    ///
+    /// The file is read, written and read back through the real functions, so
+    /// this is the actual round trip and not a serde detail.
+    #[test]
+    fn an_unrecognised_key_survives_a_save() {
+        let dir = scratch("unknown-key");
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{
+            "version": 1,
+            "device": {"auto_detect": true, "usb_vid": "1395", "usb_pid": "0098"},
+            "audio": {
+                "eq": {"enabled": false, "bands": []},
+                "sidetone": {"enabled": false, "level": 0.0},
+                "noise_gate": {"enabled": false, "threshold_db": -30.0},
+                "voice_enhancer": {"mode": "off", "custom_bands": null},
+                "mic_gain": 50
+            },
+            "profiles": [],
+            "active_profile": "FLAT",
+            "smart_button": {"action": "toggle_mode"},
+            "mic_gian": 42
+        }"#)
+        .expect("write");
+
+        let loaded = load_from(&path).expect("an unknown key is not a parse error");
+        assert_eq!(
+            loaded.extra.get("mic_gian"),
+            Some(&serde_json::json!(42)),
+            "the key is kept so it can be handed back"
+        );
+
+        save_to(&path, &loaded).expect("save");
+        let reread = load_from(&path).expect("re-read");
+        assert_eq!(
+            reread.extra.get("mic_gian"),
+            Some(&serde_json::json!(42)),
+            "and it is still there after a save: this is what used to be lost"
+        );
+        // And the fields that *are* recognised are untouched by the mechanism.
+        assert_eq!(reread.audio.mic_gain, 50);
+        assert!(reread.extra.len() == 1, "only the one key is unknown");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Saving a config nobody edited adds no key of its own.
+    ///
+    /// The first version of this asserted that `skip_serializing_if` was
+    /// load-bearing, and a mutation removing it passed — so the assertion was
+    /// checking an attribute that does nothing. With `flatten` the map's entries
+    /// are inlined as siblings of the real fields, so an empty map adds nothing
+    /// either way, and there is no stray key to check for.
+    ///
+    /// What is worth checking is the thing that would actually be wrong: a
+    /// `save` that introduced a key of its own would change the file's bytes,
+    /// and the daemon compares those bytes against what it last wrote to decide
+    /// whether a change on disk was its own. So the top-level key set is pinned
+    /// exactly.
+    #[test]
+    fn saving_an_untouched_config_introduces_no_key_of_its_own() {
+        let dir = scratch("no-extra-key");
+        let path = dir.join("config.json");
+        save_to(&path, &Config::default()).expect("save");
+        let text = std::fs::read_to_string(&path).expect("read back");
+        let keys: std::collections::BTreeSet<String> =
+            serde_json::from_str::<serde_json::Value>(&text)
+                .expect("valid json")
+                .as_object()
+                .expect("an object")
+                .keys()
+                .cloned()
+                .collect();
+        let expected: std::collections::BTreeSet<String> = [
+            "active_profile",
+            "audio",
+            "device",
+            "led_probe",
+            "mode",
+            "profiles",
+            "smart_button",
+            "version",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(keys, expected, "the saved key set must be exactly the known one");
+        // And it round-trips to an empty map rather than to a missing field.
+        assert!(load_from(&path).expect("re-read").extra.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A key is named once, not on every reload.
+    ///
+    /// The daemon reloads on any mtime change and saves on ordinary setting
+    /// changes, so a config carrying one bad key would otherwise print the same
+    /// line over and over until the user got bored of the log.
+    ///
+    /// Asserted on the decision rather than on the log line: capturing a
+    /// `warn!` means standing up a tracing subscriber inside a test, and a
+    /// mutation that dropped the call from `load_from` passed everything else
+    /// for that reason.
+    #[test]
+    fn an_unrecognised_key_is_named_once_and_not_repeated() {
+        let extra: BTreeMap<String, serde_json::Value> = [
+            ("mic_gian".to_string(), serde_json::json!(42)),
+            ("typo_two".to_string(), serde_json::json!(1)),
+        ]
+        .into_iter()
+        .collect();
+
+        // Nothing reported yet: both are named.
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        assert_eq!(
+            keys_not_yet_reported(&extra, &seen),
+            vec!["mic_gian", "typo_two"],
+            "both are new"
+        );
+
+        // One has been named; the other still has not.
+        seen.insert("mic_gian".to_string());
+        assert_eq!(
+            keys_not_yet_reported(&extra, &seen),
+            vec!["typo_two"],
+            "a key already named must not be named again on the next reload"
+        );
+
+        // And an empty map asks for nothing, so a clean config is silent.
+        assert!(keys_not_yet_reported(&BTreeMap::new(), &seen).is_empty());
     }
 
     /// A hand-edited config cannot enter the process carrying a number that

@@ -46,6 +46,30 @@ pub struct Config {
     pub profiles: Vec<Profile>,
     pub active_profile: String,
     pub smart_button: SmartButtonConfig,
+    /// Keys this build does not recognise, kept so a save can hand them back.
+    ///
+    /// This file is documented as one the user edits by hand, and without this a
+    /// typo is destroyed silently: `load_from` parses past an unknown key
+    /// without complaint, `save` then serialises the struct — which has no such
+    /// field — and the edit is gone. The user changes a setting, the GUI shows
+    /// the old value, and nothing anywhere said why.
+    ///
+    /// `flatten` rather than `deny_unknown_fields` on purpose: rejecting the
+    /// whole file over one unknown key would turn a typo into a daemon that
+    /// cannot start, which is a worse failure than the one being fixed. Keeping
+    /// them also means a config written by a *newer* build survives a round trip
+    /// through an older one instead of being flattened away.
+    ///
+    /// `Config` never crosses the IPC boundary — only `AudioConfig` does — so
+    /// this is a property of the file and nowhere else.
+    ///
+    /// No `skip_serializing_if`: with `flatten` the map's entries are inlined as
+    /// siblings of the other fields, so an empty map contributes nothing and the
+    /// attribute would only be a promise about behaviour that does not exist.
+    /// Checked by printing a default config, and the first version of that test
+    /// asserted `skip_serializing_if` was load-bearing — it is not.
+    #[serde(flatten, default)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,6 +228,9 @@ impl Default for Config {
                 action: SmartButtonAction::ToggleMode,
                 notify_enabled: true,
             },
+            // Unknown keys are only ever filled in by a load, and a default
+            // config has none by definition.
+            extra: std::collections::BTreeMap::new(),
         }
     }
 }
