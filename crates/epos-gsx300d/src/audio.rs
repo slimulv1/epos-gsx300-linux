@@ -137,10 +137,37 @@ impl Default for RestartBus {
     }
 }
 
-/// Static fail-closed null-sink in the MAIN graph, installed once by
-/// `40-epos-eq-virtualsink.conf`. The `pipewire-epos@eq` instance captures
-/// its monitor and plays the EQ'd result to the raw hardware sink.
-pub const EQ_SINK_NAME: &str = "epos-eq-input";
+/// The sink playback goes through when the EQ is on.
+///
+/// This used to be the static null-sink from `40-epos-eq-virtualsink.conf`, with
+/// the `pipewire-epos@eq` instance capturing that sink's *monitor* and playing
+/// the result to the hardware. That cannot work, and the reason is not subtle:
+/// **a PipeWire monitor is not a node.** It is a virtual source that only exists
+/// once a client connects, so `target.object = "epos-eq-input.monitor"` has
+/// nothing to match. Measured here: the chain published, found no target, and
+/// attached itself to whatever source was floating - `epos-voice-output`, the
+/// voice chain's microphone output. App audio went into the anchor and nowhere
+/// else, and every profile except FLAT, which bypasses the chain entirely, was
+/// silent.
+///
+/// So the chain provides the sink itself, which is the shape PipeWire's own
+/// filter-chain documentation uses for a virtual sink: `media.class = Audio/Sink`
+/// on the capture side, no target. Apps play into the chain's own node and the
+/// filtered result leaves through the playback stream. Measured after the
+/// change: app streams -> this sink -> `epos-eq-output` -> the EPOS hardware
+/// sink, with no monitor anywhere in the path.
+///
+/// The static null-sink is deliberately left installed. If this instance dies,
+/// the sink below disappears with it, and anything still pointed at the vanished
+/// name has nowhere to leak to.
+pub const EQ_SINK_NAME: &str = "epos-eq-processed";
+
+/// What the device list calls it.
+///
+/// While the EQ is on, the application's output genuinely is a virtual node, so
+/// it cannot be the hardware sink and honestly claim to be. What it can be is
+/// legible: this is the EPOS, with the EQ in the path.
+pub const EQ_SINK_DESCRIPTION: &str = "EPOS GSX 300 Analog Stereo (EQ)";
 
 /// Which sink new playback streams should attach to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1985,7 +2012,11 @@ impl AudioPipeline {
         match Self::main_node_list().await {
             None => ChainProbe::Unknown,
             Some(list) => {
-                let capture = node_list_has_node(&list, EQ_CAPTURE_NAME);
+                // The chain's own sink, not a node called `epos-eq-capture`: that
+                // name belonged to the capture *stream* of the old design, where
+                // the chain recorded a monitor. The chain is the sink now, so its
+                // presence is the thing to look for.
+                let capture = node_list_has_node(&list, EQ_SINK_NAME);
                 let output = node_list_has_node(&list, EQ_OUTPUT_NAME);
                 match (capture, output) {
                     (true, true) => ChainProbe::Present,
@@ -2119,7 +2150,7 @@ impl AudioPipeline {
         let chain_present = match chain_present {
             Some(v) => v,
             None if self.config.eq.enabled => {
-                Self::main_graph_probe(EQ_CAPTURE_NAME).await == ChainProbe::Present
+                Self::main_graph_probe(EQ_SINK_NAME).await == ChainProbe::Present
             }
             None => false,
         };
@@ -2523,8 +2554,11 @@ fn generate_eq_instance_conf(bands: &[epos_shared::config::EqBand], sink: &str) 
         audio.channels = 2
         audio.position = [ FL FR ]
         capture.props = {{
-            node.name = "epos-eq-capture"
-            target.object = "epos-eq-input.monitor"
+            node.name = "{sink_name}"
+            node.description = "{sink_description}"
+            media.class = Audio/Sink
+            audio.channels = 2
+            audio.position = [ FL FR ]
             remote.name = "pipewire-0"
         }}
         playback.props = {{
@@ -2536,6 +2570,8 @@ fn generate_eq_instance_conf(bands: &[epos_shared::config::EqBand], sink: &str) 
       }} }}
 "#,
         sink = sink,
+        sink_name = EQ_SINK_NAME,
+        sink_description = EQ_SINK_DESCRIPTION,
         nodes = nodes,
         links = links,
     );
@@ -3102,7 +3138,7 @@ fn dump_has_node(dump: &str, node: &str) -> bool {
 /// so writing no filter is right — but it is not a node any instance publishes.
 fn eq_expected_node(conf: &str) -> Option<&'static str> {
     if conf.contains("eq_band_") {
-        Some(EQ_CAPTURE_NAME)
+        Some(EQ_SINK_NAME)
     } else {
         None
     }
@@ -3114,7 +3150,6 @@ fn eq_expected_node(conf: &str) -> Option<&'static str> {
 /// healthy — the capture node can stay listed while the playback side fails to
 /// resolve its target, in which case the anchor is drained by nothing and
 /// routed playback is silent.
-const EQ_CAPTURE_NAME: &str = "epos-eq-capture";
 const EQ_OUTPUT_NAME: &str = "epos-eq-output";
 
 /// Consecutive healthy polls required before a previous failure is forgotten.
@@ -3734,7 +3769,7 @@ mod tests {
     /// 40-epos-eq-virtualsink.conf, otherwise routing points at nothing.
     #[test]
     fn processed_route_uses_the_installed_anchor_name() {
-        assert_eq!(EQ_SINK_NAME, "epos-eq-input");
+        assert_eq!(EQ_SINK_NAME, "epos-eq-processed");
     }
 
     /// Custom bands are stored verbatim in the config, and the sanitiser is
@@ -4040,7 +4075,7 @@ mod tests {
             "sink",
         );
         assert!(conf.contains("eq_band_"), "sanity: the band must reach the graph");
-        assert_eq!(eq_expected_node(&conf), Some(EQ_CAPTURE_NAME));
+        assert_eq!(eq_expected_node(&conf), Some(EQ_SINK_NAME));
     }
 
     /// An unknown role expects nothing rather than panicking. The restart bus
@@ -4437,7 +4472,7 @@ mod tests {
         );
         assert_eq!(
             eq_expected_node(&with_bands),
-            Some(EQ_CAPTURE_NAME),
+            Some(EQ_SINK_NAME),
             "with bands in the graph, the chain node is what must be published"
         );
         let passthrough = generate_eq_instance_conf(&[], "sink");
@@ -4638,7 +4673,7 @@ mod tests {
     /// resolved first — a bug an earlier version of this had.
     #[test]
     fn sink_input_rescue_matches_the_anchor_by_index() {
-        let sinks = "33\tepos-eq-input\tPipeWire\tfloat32le 2ch 48000Hz\n\
+        let sinks = "33\tepos-eq-processed\tPipeWire\tfloat32le 2ch 48000Hz\n\
                       4786\talsa_output.usb-EPOS-00.analog-stereo\tPipeWire\ts24le 2ch 48000Hz\n";
         assert_eq!(sink_index_of(sinks, EQ_SINK_NAME), Some(33));
         assert_eq!(sink_index_of(sinks, "nope"), None);
