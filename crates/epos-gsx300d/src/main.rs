@@ -1894,6 +1894,124 @@ fn emit_smart_notify(st: &IpcState) {
 mod tests {
     use super::*;
 
+    // ─── House rules, checked rather than remembered ─────────
+
+    /// Every `.rs` file under `dir`, skipping build output and VCS metadata.
+    ///
+    /// `target` and `node_modules` are skipped by name because walking into
+    /// them is the difference between a test that runs in a millisecond and one
+    /// that walks a few hundred thousand files. The GUI crate has a
+    /// `src-tauri/target` of its own, so this is not hypothetical.
+    fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if matches!(name.as_ref(), "target" | ".git" | "node_modules") {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// The workspace root, found by shape rather than by counting `..` segments.
+    ///
+    /// A relative hop count is a thing that breaks when the tree is rearranged,
+    /// and the symptom would be a house-rule test that silently scans an empty
+    /// directory and passes. Looking for the directory that has both a manifest
+    /// and a `crates` says what is meant instead.
+    fn workspace_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .find(|dir| dir.join("Cargo.toml").is_file() && dir.join("crates").is_dir())
+            .expect("some ancestor holds the workspace manifest and the crates dir")
+            .to_path_buf()
+    }
+
+    /// Nothing silences `dead_code` or `unused` with an `allow`.
+    ///
+    /// This codebase carried three `#[allow(dead_code)]` functions and about
+    /// fifty lines of genuinely unreachable code, and the allow attributes are
+    /// why none of it ever showed up as a warning. In a binary crate the
+    /// attribute is almost never "this is fine as is" - it is either "only the
+    /// tests reach this", which means the shipped daemon carries code nothing
+    /// calls, or "I meant to delete this and did not". Both are decisions, and
+    /// the attribute is a way of taking them silently.
+    ///
+    /// That is the argument for checking the whole workspace rather than just
+    /// the crate: `epos-shared` is a library, where the attribute means a third
+    /// thing - public API kept for a caller that does not exist yet - and it is
+    /// still worth having to say so out loud.
+    #[test]
+    fn no_source_file_silences_dead_code_or_unused_with_an_allow() {
+        let root = workspace_root();
+        let mut files = Vec::new();
+        rust_sources(&root, &mut files);
+        files.sort();
+
+        // First: make sure the walk found anything. A test that scans nothing
+        // and finds nothing is indistinguishable from a clean tree, and the
+        // earlier version of the probe test in `audio.rs` failed for exactly
+        // this reason - it counted its own text. Named files, not a count, so
+        // adding a module does not break this.
+        for expected in ["crates/epos-shared/src/lib.rs", "crates/epos-gsx300d/src/main.rs"] {
+            assert!(
+                files.iter().any(|f| f.ends_with(expected)),
+                "the walk missed {expected}, so the rule below is vacuous"
+            );
+        }
+
+        let mut offenders = Vec::new();
+        let mut scanned_lines = 0usize;
+        for file in &files {
+            let text = std::fs::read_to_string(file).unwrap_or_default();
+            // Only the part above the first `#[cfg(test)]`. This is not tidiness:
+            // without it the scan reads this test's own doc comment, which quotes
+            // the attribute in order to explain it, and its own pattern string,
+            // and then fails on the two. That is the third time in this crate
+            // that a text-matching test has caught itself - the first two are
+            // `audio.rs`'s probe test and its doc-pairing test - so the rule is
+            // now: if the check is textual, the check has to exclude its own
+            // text, and that exclusion has to be visible here.
+            let production = match text.split_once("#[cfg(test)]") {
+                Some((before, _tests)) => {
+                    assert!(
+                        before.len() < text.len(),
+                        "split_once gave back the whole file; the marker moved"
+                    );
+                    before
+                }
+                None => text.as_str(),
+            };
+            scanned_lines += production.lines().count();
+            for (n, line) in production.lines().enumerate() {
+                let squished: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+                if squished.contains("allow(dead_code") || squished.contains("allow(unused") {
+                    offenders.push(format!("{}:{}: {}", file.display(), n + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            scanned_lines > 1000,
+            "only {scanned_lines} production line(s) were read; the walk or the \
+             split is not finding the sources"
+        );
+        assert!(
+            offenders.is_empty(),
+            "{} line(s) silence a lint with an allow. Delete the code, call it \
+             from where it is used, or argue for it here:\n  {}",
+            offenders.len(),
+            offenders.join("\n  ")
+        );
+    }
+
     // ─── Whether a save may go ahead ─────────────────────────
     //
     // The daemon keeps the authoritative config in memory and rewrites the whole
