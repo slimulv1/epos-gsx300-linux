@@ -22,3 +22,23 @@ anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Release profile. The workspace root is the only place Cargo reads profile keys
+# from; in a member crate it warns "unused manifest key" and builds as if the key
+# were not there.
+#
+# There is deliberately no `target-cpu` here. It looks like a profile key and is
+# not one - Cargo's documented profile settings do not include it, and putting it
+# in a manifest produces a warning and no effect. It has to go through
+# `.cargo/config.toml` or RUSTFLAGS, which is a decision this repository has not
+# made: the plugin is built for this machine, but the daemon binary is the kind of
+# thing that gets packaged, and `native` is by definition not portable.
+#
+# What it would buy, measured as the minimum of twelve runs of the surround
+# convolution: 0.0535 s to 0.0509 s per second of audio, about 5% of the loop,
+# and therefore about 0.3 of the 7.3% of a core the renderer costs. Small enough
+# that portability is worth more.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

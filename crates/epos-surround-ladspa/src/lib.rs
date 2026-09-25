@@ -552,6 +552,22 @@ unsafe extern "C" fn connect_port(h: *mut LsadspHandle, port: c_int, data: *mut 
 
 unsafe extern "C" fn activate(h: *mut LsadspHandle) -> c_int {
     let p = &mut *(h as *mut Plugin);
+    // Clear the filter history. The LADSPA header requires it:
+    //
+    // > the plugin instance must reset all state information dependent on the
+    // > history of the plugin instance except for any data locations provided by
+    // > connect_port() and any gain set by set_run_adding_gain().
+    //
+    // `pos` goes with it: the ring's write index is history-dependent state, and
+    // leaving it where it was while zeroing the samples is not a reset, it is a
+    // discontinuity.
+    //
+    // The gain and the widening controls are deliberately untouched. They are set
+    // by `connect_port`, and the spec says to leave them alone - and PipeWire
+    // reconnects ports after a graph rebuild, so resetting them here would undo
+    // whatever the host just configured.
+    p.hist.fill(0.0);
+    p.pos = 0;
     p.active = true;
     0 // LADSPA_SUCCESS
 }
@@ -569,10 +585,39 @@ unsafe extern "C" fn cleanup(h: *mut LsadspHandle) {
 /// One buffer. No allocation, no locks, no syscalls, no panics: everything the
 /// audio path can reach is sized in `instantiate`.
 ///
+/// `adding` selects the LADSPA output convention. `run` **writes** the output
+/// buffer and `run_adding` adds to it, and the distinction is not cosmetic
+/// here, because the host does not always start the buffer at zero.
+///
+/// PipeWire, `spa/plugins/filter-graph/filter-graph.c`:
+///
+/// ```c
+/// for (i = 0; i < graph->n_outputs; i++) {
+///         if (out[i] == NULL) continue;
+///         port = &graph->output[i];
+///         if (port->desc)
+///                 port->desc->connect_port(*port->hndl, port->port, out[i]);
+///         else
+///                 memset(out[i], 0, n_samples * sizeof(float));
+/// }
+/// ```
+///
+/// The buffer is cleared only when the graph's output port is *not* connected to
+/// a node. This filter is the last node in the chain and the graph's output port
+/// is its own output port, so the port is connected, so nothing is cleared.
+///
+/// Adding to that buffer means adding to whatever the previous period left in
+/// it: measured with `tools/output_mode.c`, a silent input came out at exactly
+/// the value the buffer was pre-filled with, and the same signal produced
+/// different output depending on the buffer's prior contents. A harness that
+/// `calloc`s its output buffers cannot see this, which is why it survived the
+/// unit tests, the DSP measurements, and a session of real listening-shaped
+/// checks.
+///
 /// The stereo pair is first spread into the 7.1 speaker set, each speaker is
 /// convolved with its own pair of HRIRs, and the two ears are summed. The
 /// upmix is inside the filter because the host only offers it two channels.
-unsafe fn process(p: &mut Plugin, n: usize) {
+unsafe fn process(p: &mut Plugin, n: usize, adding: bool) {
     let gain = p.gain;
     let spread = p.spread;
     let front_w = p.front_width;
@@ -635,12 +680,10 @@ unsafe fn process(p: &mut Plugin, n: usize) {
             // The history is circular. The first version shifted all 256 cells
             // every sample - 1792 moves per sample across seven speakers, which
             // is as much memory traffic as the 3584 multiplies the convolution
-            // itself does, so half the work was moving data to read it from a
-            // moving offset. Writing the newest sample at a rolling index and
-            // reading backwards through it removes the shift entirely: 7 writes
-            // per sample instead of 1792, and the multiply loop becomes
-            // sequential in both operands, which is what lets the compiler
-            /// vectorise it.
+            // itself does, so half the work was moving data in order to read it
+            // from a moving offset. Writing the newest sample at a rolling index
+            // removes the shift entirely: 7 writes per sample instead of 1792.
+            //
             // The ring: the newest sample sits at `pos` and the convolution
             // reads backwards from there, so history index `w` and filter index
             // `f` run in opposite directions - stepping `w` back is stepping `f`
@@ -682,27 +725,27 @@ unsafe fn process(p: &mut Plugin, n: usize) {
             let mut acc_left = 0.0f32;
             let pos = p.pos;
             {
-                // Newest sample down to index 0: TAPS - pos taps.
-                let mut w = pos;
-                let mut f = 0usize;
-                for _ in 0..=pos {
-                    let h = p.hist[base + w];
-                    acc_right += h * hrir[f];
-                    acc_left += h * hrir[TAPS + f];
-                    w -= 1;
-                    f += 1;
+                // Newest sample down to index 0: pos+1 taps.
+                //
+                // The index is computed as `pos - k` rather than decremented. A
+                // decrement underflows on the last iteration, because the loop
+                // runs once more than the number of decrements - and that is
+                // only invisible because the release profile has overflow checks
+                // off. With them on, and in every test build, it panics; and this
+                // is the audio thread, where a panic is a hard stop.
+                for k in 0..=pos {
+                    let h = p.hist[base + pos - k];
+                    acc_right += h * hrir[k];
+                    acc_left += h * hrir[TAPS + k];
                 }
             }
             {
-                // Index TAPS-1 down to pos+1: the rest.
-                let mut w = TAPS - 1;
-                let mut f = pos + 1;
-                for _ in pos + 1..TAPS {
-                    let h = p.hist[base + w];
-                    acc_right += h * hrir[f];
-                    acc_left += h * hrir[TAPS + f];
-                    w -= 1;
-                    f += 1;
+                // Index TAPS-1 down to pos+1: the rest. Same indexing as above,
+                // so this half cannot underflow either.
+                for k in pos + 1..TAPS {
+                    let h = p.hist[base + (TAPS - 1) - (k - pos - 1)];
+                    acc_right += h * hrir[k];
+                    acc_left += h * hrir[TAPS + k];
                 }
             }
             left += acc_left;
@@ -719,10 +762,18 @@ unsafe fn process(p: &mut Plugin, n: usize) {
         p.pos = if p.pos + 1 == TAPS { 0 } else { p.pos + 1 };
 
         if !p.out[0].is_null() {
-            *p.out[0].add(s) += left * gain;
+            if adding {
+                *p.out[0].add(s) += left * gain;
+            } else {
+                *p.out[0].add(s) = left * gain;
+            }
         }
         if !p.out[1].is_null() {
-            *p.out[1].add(s) += right * gain;
+            if adding {
+                *p.out[1].add(s) += right * gain;
+            } else {
+                *p.out[1].add(s) = right * gain;
+            }
         }
     }
 }
@@ -732,7 +783,9 @@ unsafe extern "C" fn run(h: *mut LsadspHandle, n: c_int) {
     if !p.active {
         return;
     }
-    process(p, n as usize);
+    // Writes the output buffer rather than adding to it. See `process` for why
+    // that matters with this host in particular.
+    process(p, n as usize, false);
 }
 
 /// `run_adding` is the accumulating variant of `run`, so it must add rather than
@@ -744,7 +797,10 @@ unsafe extern "C" fn run_adding(h: *mut LsadspHandle, n: c_int) {
     if !p.active {
         return;
     }
-    process(p, n as usize);
+    // run_adding() is the accumulating variant, so it adds. set_run_adding_gain
+    // is null, which is how a LADSPA host is told the gain is 1.0 and therefore
+    // that a bare `+=` is the right thing to do here.
+    process(p, n as usize, true);
 }
 
 #[cfg(test)]
@@ -979,6 +1035,81 @@ mod tests {
             WIDE * 0.7 < 8.0,
             "the maximum widening must stay a few dB above unity, not a dozen"
         );
+    }
+
+    /// `activate` must clear the filter history.
+    ///
+    /// The LADSPA header is explicit:
+    ///
+    /// > This is separated from instantiate() to aid real-time support and so
+    /// > that hosts can reinitialise a plugin instance by calling deactivate()
+    /// > and then activate(). In this case the plugin instance must reset all
+    /// > state information dependent on the history of the plugin instance
+    /// > except for any data locations provided by connect_port() and any gain
+    /// > set by set_run_adding_gain().
+    ///
+    /// It matters here more than for most plugins: the history is 256 samples
+    /// per speaker, and without the reset a host that deactivates and
+    /// reactivates - which is how a graph is rebuilt after a port is
+    /// reconnected - rings the last 256 samples of the previous stream into the
+    /// new one. On a toggle that is an audible click burst at the start of
+    /// playback, and it is the kind of thing a listener blames on the music.
+    ///
+    /// The gain and the widening controls are *not* reset: `connect_port` owns
+    /// those, and the spec says to leave them alone.
+    #[test]
+    fn activate_clears_the_history_and_keeps_the_controls() {
+        const N: usize = 512;
+        let mut in_l = [0.0f32; N];
+        let mut in_r = [0.0f32; N];
+        let mut out_l = [0.0f32; N];
+        let mut out_r = [0.0f32; N];
+        // A control value that activate() must not touch.
+        let mut gain = [0.5f32];
+
+        let inst = unsafe { instantiate(std::ptr::null(), HRTF_RATE as c_ulong) };
+        assert!(!inst.is_null());
+        unsafe {
+            (*(inst as *mut Plugin)).active = true;
+            connect_port(inst, P_OUT_L as c_int, out_l.as_mut_ptr());
+            connect_port(inst, P_OUT_R as c_int, out_r.as_mut_ptr());
+            connect_port(inst, P_IN_L as c_int, in_l.as_mut_ptr());
+            connect_port(inst, P_IN_R as c_int, in_r.as_mut_ptr());
+            connect_port(inst, P_GAIN as c_int, gain.as_mut_ptr());
+        }
+
+        // Fill the history with something loud.
+        for i in 0..N { in_l[i] = 1.0; in_r[i] = 1.0; }
+        unsafe { run(inst, N as c_int) };
+        let hot: f32 = out_l.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(hot > 0.01, "sanity: the filter must have run at all");
+
+        // Silence in, deactivate, activate, run again. The output must be the
+        // response to silence, not the tail of the loud signal above.
+        for i in 0..N { in_l[i] = 0.0; in_r[i] = 0.0; out_l[i] = 0.0; out_r[i] = 0.0; }
+        unsafe {
+            deactivate(inst);
+            activate(inst);
+            run(inst, N as c_int);
+        }
+        let tail: f32 = out_l.iter().fold(0.0f32, |m, v| m.max(v.abs()))
+            .max(out_r.iter().fold(0.0f32, |m, v| m.max(v.abs())));
+        assert!(
+            tail < 1e-9,
+            "a silent input after deactivate/activate produced {} of output: \
+             activate() must reset the filter history, and this one did not",
+            tail
+        );
+
+        // The controls belong to connect_port and must survive.
+        let p = unsafe { &*(inst as *mut Plugin) };
+        assert!(
+            (p.gain - 0.5).abs() < 1e-6,
+            "activate() reset a control port's value to {}; the spec says only \
+             history-dependent state may be reset",
+            p.gain
+        );
+        unsafe { cleanup(inst) };
     }
 
     /// `cleanup` must free exactly what `instantiate` allocated, and every host

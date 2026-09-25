@@ -69,3 +69,45 @@ committed so the build needs neither the SOFA file nor libmysofa. The SOFA is
 What showed the angles were good all the way round, after an earlier suspicion
 that the rear ones were missing turned out to be a flaw in the peak-picking
 rather than in the data.
+
+## output_mode.c — does `run` write its output, or add to it?
+
+    cc -O2 -o output_mode output_mode.c -ldl -lm
+    ./output_mode ~/.local/lib/ladspa/epos-surround.so
+
+The harness allocates its output buffers with `calloc`, so the question never
+arises there. It arises with the real host. PipeWire,
+`spa/plugins/filter-graph/filter-graph.c`:
+
+```c
+if (port->desc)
+        port->desc->connect_port(*port->hndl, port->port, out[i]);
+else
+        memset(out[i], 0, n_samples * sizeof(float));
+```
+
+The buffer is cleared only when the graph's output port is *not* connected to a
+node. This filter is the last node in its chain and the graph's output port is
+its own output port, so the port is connected, so nothing clears it.
+
+Adding to that buffer means adding to whatever the previous period left in it.
+Measured: a silent input came out at exactly the value the buffer had been
+pre-filled with, and the same signal produced different output depending on the
+buffer's prior contents. A harness that zeroes its buffers cannot see this.
+
+## reference.py — an independent implementation of the same DSP
+
+    python3 reference.py ../src/hrir.bin ~/.local/lib/ladspa/epos-surround.so
+
+A second reading of the written specification, in a different language, sharing
+no code with the plugin. It exists because everything else here agrees with the
+plugin because the same person wrote both. If the two agree sample-for-sample,
+the agreement means something.
+
+It also caught its own author: the first version reversed the filter index,
+which convolves with the time-reversed filter. The output had the right
+magnitudes and the wrong sign, so a peak comparison would have missed it. Worth
+remembering about this tool, and about peak comparisons generally.
+
+It is verified to fail: four deliberate mutations of the plugin - swapped ears,
+a stray factor, a wrong rear gain, an off-by-one tap - all make it disagree.

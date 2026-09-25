@@ -300,6 +300,18 @@ async fn main() -> Result<()> {
                                 },
                             };
                             st.config.mode = new_mode;
+                            // Rebuild the eq instance. The mode is not only an LED
+                            // colour: it decides whether the chain ends in the 7.1
+                            // binaural renderer, and that only exists on disk.
+                            // Without this the ring turns red, the config says
+                            // 7.1, and the audio path is byte-for-byte the same as
+                            // 2.0 - a switch that reports success and does nothing.
+                            let audio_cfg = st.config.audio.clone();
+                            st.audio.update_config(&audio_cfg);
+                            let mode = st.config.mode;
+                            if let Err(e) = st.audio.apply_eq(mode).await {
+                                warn!("Failed to apply mode change: {}", e);
+                            }
                             if let Err(e) = save_config(&st) {
                                 warn!("Failed to save config: {}", e);
                             }

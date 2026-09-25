@@ -38,3 +38,6 @@ session-*.md
 # vendored: it has to be the revision the host compiles, and a copy in the tree
 # would drift from it without anybody noticing.
 crates/epos-surround-ladspa/tools/ladspa.h
+
+# Python bytecode from the reference implementation.
+__pycache__/

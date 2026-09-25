@@ -17,21 +17,8 @@ crate-type = ["cdylib"]
 # FIR, so there is nothing left that could surprise us mid-callback.
 [dependencies]
 
-[profile.release]
-opt-level = 3
-lto = true
-panic = "abort"
-codegen-units = 1
-# Native code generation, for the convolution loop.
-#
-# This is a plugin `dlopen`ed by PipeWire on the machine it runs on, not a
-# binary shipped to other machines, so there is no portability reason to hold
-# back: the FMA units the machine has are the ones the filter should use. It is
-# opt-in rather than unconditional because a build for a different machine is
-# still legitimate - a distribution package, a build host - and the fallback
-# still fits in real time, it just leaves some of the machine unused.
-#
-# Measured, not assumed: the inner loop is a multiply-accumulate over 256 taps
-# seven times per sample, and 7.2% of a core with generic codegen is well
-# inside what the hardware can do.
-target-cpu = "native"
+# No [profile.release] table. Cargo ignores profile keys in a member crate's
+# manifest - `unused manifest key`, then it builds as if the key were not there.
+# An earlier version of this file had one, including a `target-cpu` that looked
+# plausible and did nothing, and a measurement taken across the change was written
+# down as its effect. The release settings are at the workspace root.

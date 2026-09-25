@@ -688,6 +688,21 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
             let mut state = state.write().await;
             state.config.mode = mode;
             state.sync_led();
+            // Rebuild the eq instance: the mode decides whether the chain ends in
+            // the 7.1 binaural renderer, which exists only in the generated conf.
+            // Setting the mode without this changed the LED and the config and
+            // left the audio path untouched.
+            let audio_cfg = state.config.audio.clone();
+            state.audio.update_config(&audio_cfg);
+            match state.audio.apply_full(mode).await {
+                Ok(true) => debug!("mode change - eq instance restart enqueued"),
+                Ok(false) => debug!("mode change - eq conf unchanged"),
+                Err(e) => {
+                    return Response::Error {
+                        message: format!("Failed to apply mode: {e}"),
+                    };
+                }
+            }
             info!(
                 "Audio mode changed to {} (LED: {})",
                 mode.display_name(),
@@ -706,7 +721,21 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
             };
             state.config.mode = new_mode;
             // Update LED color
-              state.sync_led();
+            state.sync_led();
+            // Rebuild the eq instance, for the same reason SetMode does: the mode
+            // determines whether the 7.1 renderer is in the chain, and that lives
+            // in the generated conf rather than in memory.
+            let audio_cfg = state.config.audio.clone();
+            state.audio.update_config(&audio_cfg);
+            match state.audio.apply_full(new_mode).await {
+                Ok(true) => debug!("mode toggle - eq instance restart enqueued"),
+                Ok(false) => debug!("mode toggle - eq conf unchanged"),
+                Err(e) => {
+                    return Response::Error {
+                        message: format!("Failed to apply mode: {e}"),
+                    };
+                }
+            }
             info!(
                 "Audio mode toggled to {} (LED: {})",
                 new_mode.display_name(),

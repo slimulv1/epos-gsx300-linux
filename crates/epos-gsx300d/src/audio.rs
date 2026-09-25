@@ -2595,6 +2595,12 @@ fn generate_eq_instance_conf(
 
     if active == 0 {
         // Passthrough — EQ off / all flat: keep the path flowing.
+        //
+        // Written in the same multi-line shape as the biquads rather than on one
+        // line. The single-line form worked, but it meant the node was the only
+        // one in the file a line-oriented reader could not find, and that is
+        // exactly the kind of thing that makes the next check harder than it
+        // needs to be.
         for ear in ears {
             let name = if ear.is_empty() {
                 "passthrough".to_string()
@@ -2603,7 +2609,11 @@ fn generate_eq_instance_conf(
             };
             nodes.push_str(&format!(
                 r#"
-                    {{ type = builtin name = "{name}" label = copy }}"#,
+                    {{
+                        type  = builtin
+                        name  = "{name}"
+                        label = copy
+                    }}"#,
                 name = name
             ));
         }
@@ -2618,6 +2628,16 @@ fn generate_eq_instance_conf(
     // fed one channel at a time has no stereo image to place.
     let (graph_inputs, graph_outputs) = if surround {
         let last = active.saturating_sub(1);
+        // The entry port has to name whichever node the graph actually built.
+        // Hardcoding the band case gave a graph whose `inputs` referred to
+        // `eq_l_0:In` while the nodes were `passthrough_l` and `passthrough_r`,
+        // and filter-chain reports that once and carries on with no graph:
+        //
+        //   spa.filter-graph: input port eq_l_0:In not found
+        //   pw.stream: error (-2) can't start graph: No such file or directory
+        //
+        // The instance stays active, the sink stays published, and audio goes
+        // nowhere. A 7.1 profile with its EQ off is an ordinary combination.
         let (in_l, out_l) = if active == 0 {
             ("passthrough_l:Out".to_string(), "surround:input_left".to_string())
         } else {
@@ -2627,6 +2647,16 @@ fn generate_eq_instance_conf(
             ("passthrough_r:Out".to_string(), "surround:input_right".to_string())
         } else {
             (format!("eq_r_{last}:Out"), "surround:input_right".to_string())
+        };
+        let entry_l = if active == 0 {
+            "passthrough_l:In"
+        } else {
+            "eq_l_0:In"
+        };
+        let entry_r = if active == 0 {
+            "passthrough_r:In"
+        } else {
+            "eq_r_0:In"
         };
         links.push_str(&format!(
             r#"
@@ -2643,7 +2673,7 @@ fn generate_eq_instance_conf(
                     }"#,
         );
         (
-            "inputs  = [ \"eq_l_0:In\" \"eq_r_0:In\" ]".to_string(),
+            format!("inputs  = [ \"{entry_l}\" \"{entry_r}\" ]"),
             "outputs = [ \"surround:output_left\" \"surround:output_right\" ]".to_string(),
         )
     } else {
@@ -4620,6 +4650,154 @@ mod tests {
             let path = format!("/tmp/epos-eq-{name}.conf");
             std::fs::write(&path, conf).expect("write conf");
             println!("  wrote {path}");
+        }
+    }
+
+    /// The `filter.graph` block out of a generated conf, and the node names it
+    /// declares.
+    ///
+    /// Scoped deliberately. A first version of the port check scanned the whole
+    /// file and picked up `{ name = libpipewire-module-rt }` from
+    /// `context.modules`, so it counted the PipeWire modules as graph nodes and
+    /// then complained that a one-filter graph had four. A checker that reads
+    /// more than the thing it is checking will disagree with you about what the
+    /// thing is.
+    fn graph_of(conf: &str) -> &str {
+        let start = conf
+            .find("filter.graph = {")
+            .expect("generated conf always has a filter.graph");
+        let rest = &conf[start..];
+        let end = rest
+            .find("audio.channels")
+            .expect("filter.graph is followed by audio.channels");
+        &rest[..end]
+    }
+
+    /// Node names declared inside the graph, in either quoting style.
+    ///
+    /// The conf is not consistent about quoting: biquads write `name  = "eq_l_0"`
+    /// and the LADSPA node writes `name   = surround` bare, the same way
+    /// `label = bq_peaking` is bare.
+    fn graph_nodes(graph: &str) -> std::collections::BTreeSet<String> {
+        graph
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                let rest = l.strip_prefix("name")?;
+                let rest = rest.trim_start().strip_prefix('=')?.trim_start();
+                Some(
+                    rest.trim_matches('"')
+                        .split_whitespace()
+                        .next()?
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// Every port the graph mentions, from its links and its entry/exit arrays.
+    ///
+    /// The keys are searched for anywhere in the line rather than matched at its
+    /// start: a link is written `{ output = "a:Out" input = "b:In" }`, so
+    /// `output` is never the first thing on the line. An earlier version matched
+    /// at the start and silently found no links at all, which would have made
+    /// this check pass on a graph full of dangling references.
+    fn graph_port_refs(graph: &str) -> Vec<String> {
+        let mut refs = Vec::new();
+        for line in graph.lines() {
+            let l = line.trim();
+            for key in ["output", "input"] {
+                let mut from = 0;
+                while let Some(at) = l[from..].find(&format!("{key} = \"")).or_else(|| {
+                    l[from..].find(&format!("{key}  = \""))
+                }) {
+                    let start = from + at;
+                    let after = start + l[start..].find('"').unwrap() + 1;
+                    if let Some(end) = l[after..].find('"') {
+                        refs.push(l[after..after + end].to_string());
+                    }
+                    from = after;
+                }
+            }
+            for key in ["inputs", "outputs"] {
+                if l.starts_with(&format!("{key} ")) {
+                    for tok in l.split('"').skip(1).step_by(2) {
+                        refs.push(tok.to_string());
+                    }
+                }
+            }
+        }
+        refs
+    }
+
+    /// Every port the graph mentions must belong to a node the graph declares.
+    ///
+    /// This is the invariant a 7.1 chain with the EQ switched off broke. With no
+    /// active bands the graph builds `passthrough_l` / `passthrough_r`, while
+    /// the `inputs` array still named `eq_l_0:In` and `eq_r_0:In` from the band
+    /// case. filter-chain reports that once and carries on:
+    ///
+    /// > spa.filter-graph: input port eq_l_0:In not found
+    /// > pw.stream: error (-2) can't start graph: No such file or directory
+    ///
+    /// and the instance stays `active` with `epos-eq-processed` published and
+    /// *no graph inside it*. Nothing routes. The only symptom is that the chain
+    /// costs 0.2% of a core instead of the renderer's share, which reads as "the
+    /// renderer is cheap" rather than "the renderer is not running" - and that is
+    /// how it survived a round of looking.
+    ///
+    /// A 7.1 profile with its EQ off is an ordinary combination, and it silenced
+    /// the headset.
+    #[test]
+    fn every_port_the_graph_mentions_belongs_to_a_node_it_declares() {
+        for bands in [
+            Vec::new(),
+            vec![epos_shared::config::EqBand { freq: 1000, gain_db: 6.0, q: 1.0 }],
+            vec![
+                epos_shared::config::EqBand { freq: 64, gain_db: -1.0, q: 1.0 },
+                epos_shared::config::EqBand { freq: 8000, gain_db: 6.0, q: 1.0 },
+            ],
+        ] {
+            for mode in [
+                epos_shared::config::AudioMode::Stereo,
+                epos_shared::config::AudioMode::Surround71,
+            ] {
+                let conf = generate_eq_instance_conf(
+                    &bands,
+                    crate::devices::EPOS_SINK_FALLBACK,
+                    mode,
+                );
+                let graph = graph_of(&conf);
+                let declared = graph_nodes(graph);
+                assert!(
+                    !declared.is_empty(),
+                    "the graph declares no nodes at all:\n{graph}"
+                );
+
+                let refs = graph_port_refs(graph);
+                // A single-node graph legitimately has no links: "links can be
+                // omitted when the graph has just 1 filter", and stereo with the
+                // EQ off is exactly that.
+                if refs.is_empty() {
+                    assert_eq!(
+                        declared.len(),
+                        1,
+                        "a graph with no links and no declared entry/exit ports \
+                         must have exactly one node:\n{graph}"
+                    );
+                    continue;
+                }
+
+                for r in &refs {
+                    let node = r.split_once(':').map(|(n, _)| n).unwrap_or(r);
+                    assert!(
+                        declared.contains(node),
+                        "{mode:?} with {} active band(s) references port {r}, but \
+                         the graph declares no node called {node}.\nDeclared: {declared:?}",
+                        bands.len(),
+                    );
+                }
+            }
         }
     }
 
