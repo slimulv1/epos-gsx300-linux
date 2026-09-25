@@ -69,21 +69,54 @@ impl QuitHandle {
     }
 }
 
+/// How long `pw-dump` may take before we stop waiting for it.
+const PW_DUMP_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Find the raw EPOS GSX 300 mic source node via pw-dump.
 /// Matches by prefix/suffix (NOT the hardcoded serial) so a device swap
 /// still resolves correctly. Returns Ok(None) when the device is absent.
-fn resolve_epos_source() -> Result<Option<String>, String> {
-    let out = std::process::Command::new("pw-dump")
-        .output()
-        .map_err(|e| format!("pw-dump failed (pipewire installed?): {e}"))?;
+async fn resolve_epos_source() -> Result<Option<String>, String> {
+    resolve_source_with("pw-dump", PW_DUMP_BUDGET).await
+}
+
+/// [`resolve_epos_source`] with the program and the budget as arguments.
+///
+/// The two are parameters so the test can stand in a program that never exits.
+/// That is the case this exists for, and it is the one a real `pw-dump` cannot
+/// be asked to reproduce on demand: it blocks the calling thread until the
+/// process exits, and nothing in this file bounded that. The frontend calls
+/// `mic_meter_start` every 2 s, which returns early while the worker is alive
+/// and so only reaches here on the reconnect path - exactly when PipeWire is
+/// most likely to be the thing that is stuck.
+///
+/// `kill_on_drop` is what makes the budget mean anything: without it, timing
+/// out would drop the future and leave the child running. tokio's
+/// `ChildDropGuard` kills on drop when the flag is set, so the timeout takes
+/// the process with it. Reaping afterwards is tokio's best effort, per its own
+/// documentation, which is why the budget is long enough that this is a rare
+/// path rather than the common one.
+async fn resolve_source_with(
+    program: &str,
+    budget: std::time::Duration,
+) -> Result<Option<String>, String> {
+    let out = match tokio::time::timeout(
+        budget,
+        tokio::process::Command::new(program).kill_on_drop(true).output(),
+    )
+    .await
+    {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => return Err(format!("{program} failed (pipewire installed?): {e}")),
+        Err(_) => return Err(format!("{program} did not answer within {budget:?}")),
+    };
     if !out.status.success() {
         return Ok(None);
     }
-    let data: serde_json::Value =
-        serde_json::from_slice(&out.stdout).map_err(|e| format!("pw-dump parse failed: {e}"))?;
+    let data: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| format!("{program} parse failed: {e}"))?;
     let arr = data
         .as_array()
-        .ok_or("pw-dump: unexpected root (not an array)")?;
+        .ok_or(format!("{program}: unexpected root (not an array)"))?;
     for obj in arr {
         if obj["type"].as_str() != Some("PipeWire:Interface:Node") {
             continue;
@@ -485,7 +518,7 @@ pub async fn mic_meter_start(
         }
     }
 
-    let Some(node) = resolve_epos_source()? else {
+    let Some(node) = resolve_epos_source().await? else {
         return Ok(false);
     };
 
@@ -682,15 +715,239 @@ fn run_meter(app: tauri::AppHandle, stop: Arc<AtomicBool>, node: String) {
 #[tauri::command]
 pub async fn mic_meter_stop(state: tauri::State<'_, MicMeterState>) -> Result<(), String> {
     state.stop.store(true, Ordering::SeqCst);
-    if let Some(h) = state.join.lock().map_err(|e| e.to_string())?.take() {
-        let _ = h.join();
-    }
+    let Some(h) = state.join.lock().map_err(|e| e.to_string())?.take() else {
+        return Ok(());
+    };
+    // `join` blocks until the watchdog notices the flag and quits the loop, so
+    // up to one tick - ~300 ms by the comment above. Waiting on it here would
+    // hold a runtime worker for all of that, so the waiting goes to the
+    // blocking pool. The handle moves in, so the lock is not held across the
+    // wait either.
+    let _ = tokio::task::spawn_blocking(move || h.join()).await;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in program on disk, so a test can make `resolve_source_with`
+    /// run something other than `pw-dump` without touching the environment the
+    /// other tests in this binary share.
+    fn script_program(name: &str, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("epos-gui-{}-{name}", std::process::id()));
+        std::fs::write(&path, body).expect("write script");
+        let mut perms = std::fs::metadata(&path).expect("stat script").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod script");
+        // No cleanup here: the path is the thing the test then runs, so
+        // deleting it on the way out defeats the purpose. Each test removes its
+        // own script when it is done.
+        path.to_str().expect("utf-8 temp path").to_string()
+    }
+
+    /// A program that never exits, which is what a wedged `pw-dump` looks like.
+    ///
+    /// The name is an argument because two tests need one of these and they run
+    /// in parallel: a shared filename means one test rewriting a script the
+    /// other is executing, which fails with `ETXTBSY` — a race that shows up as
+    /// a flaky test rather than as anything to do with the code under test. The
+    /// daemon's equivalent needed retry loops for the same reason; distinct
+    /// names need none.
+    fn never_exits(name: &str) -> String {
+        script_program(name, "#!/bin/sh\nsleep 600\n")
+    }
+
+    /// No process with this path in its command line, as far as `/proc` can see.
+    fn process_alive(marker: &str) -> bool {
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return false;
+        };
+        entries.flatten().any(|entry| {
+            std::fs::read(entry.path().join("cmdline"))
+                .map(|cmdline| String::from_utf8_lossy(&cmdline).contains(marker))
+                .unwrap_or(false)
+        })
+    }
+
+    /// Giving up on the dump takes the process with it.
+    ///
+    /// Without `kill_on_drop`, timing out drops the future and leaves the child
+    /// running — so a wedged `pw-dump` costs a worker for its budget *and*
+    /// leaves a process behind, every 2 s, for as long as it stays wedged. The
+    /// budget test above cannot see this: it only checks that the wait ended.
+    ///
+    /// Read out of `/proc` rather than by running `pgrep`, because a killed
+    /// child stays visible as a zombie until it is reaped, and tokio reaps
+    /// best-effort in the background. Polling for a couple of seconds is what
+    /// makes this about "the child is gone" instead of "the child was killed
+    /// and immediately reaped".
+    #[tokio::test]
+    async fn abandoning_a_dump_also_takes_the_process_with_it() {
+        let program = never_exits("killed");
+        let result =
+            resolve_source_with(&program, std::time::Duration::from_millis(200)).await;
+        assert!(result.is_err(), "the dump never answers, so this must time out");
+
+        let mut still_running = true;
+        for _ in 0..40 {
+            if !process_alive(&program) {
+                still_running = false;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let _ = std::fs::remove_file(&program);
+        assert!(
+            !still_running,
+            "the child outlived the budget; a wedged dump would be leaked every \
+             2 s for as long as it stayed wedged"
+        );
+    }
+
+    /// Waiting for the worker thread must not hold a runtime worker.
+    ///
+    /// `mic_meter_stop` joins the meter thread, which takes up to one watchdog
+    /// tick (~300 ms). Joining it inline held a worker for all of that, and
+    /// `#[tokio::test]` is a current-thread runtime — so if the join blocks,
+    /// nothing else can run.
+    ///
+    /// The measurement is *during* the join, and that is the whole difficulty.
+    /// The first version of this test spawned a fixed 20-tick ticker and
+    /// compared the final count, and it passed with the join inlined — because
+    /// `tokio::spawn` does not poll a task until the current one yields, so an
+    /// inline join ran before the ticker ever started, and the ticker then
+    /// completed its course afterwards either way. A test that passes with the
+    /// bug still in it is worse than no test, so the count is sampled before
+    /// and after, with a yield in between to make sure the ticker is genuinely
+    /// running first.
+    /// `mic_meter_stop` waits off the worker, at the call site and not just in
+    /// the pattern.
+    ///
+    /// The test below proves that `spawn_blocking` around a join does not hold a
+    /// runtime worker. It says nothing about whether `mic_meter_stop` uses it,
+    /// and the original defect lived at the call site - which is exactly where
+    /// the `find_hidraw` substring check lived in the backend, and why that one
+    /// needed a guard test too. Pinned by text over the production half of the
+    /// file only, because this test quotes the very expression it looks for and
+    /// would otherwise match itself.
+    #[test]
+    fn stopping_the_meter_joins_off_the_worker() {
+        let needle = concat!("spawn_blocking(move || h", ".join())");
+        let source = include_str!("mic_meter.rs");
+        let production = match source.split_once("#[cfg(test)]") {
+            Some((before, _tests)) => before,
+            None => panic!("the test module anchor moved; update this test"),
+        };
+        assert!(
+            production.contains(needle),
+            "mic_meter_stop must join the meter thread on the blocking pool: the \
+             wait is up to one watchdog tick, and the test below shows what an \
+             inline join costs a current-thread runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn waiting_for_the_worker_does_not_hold_the_runtime() {
+        let handle =
+            std::thread::spawn(|| std::thread::sleep(std::time::Duration::from_millis(400)));
+        let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&ticks);
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+
+        // Yield, so the ticker is actually running before the interesting part.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let before = ticks.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(before >= 3, "the ticker never got going: {before} ticks");
+
+        // Exactly what `mic_meter_stop` does now.
+        let _ = tokio::task::spawn_blocking(move || handle.join()).await;
+
+        let after = ticks.load(std::sync::atomic::Ordering::Relaxed);
+        ticker.abort();
+        assert!(
+            after >= before + 10,
+            "only {} ticks ran during a 400 ms join ({before} -> {after}), so the \
+             join is holding the only worker",
+            after - before
+        );
+    }
+
+
+    ///
+    /// Before this, the dump was read with `std::process::Command::output()`,
+    /// which waits for the process to exit and has no way to be told otherwise.
+    /// The frontend calls `mic_meter_start` every 2 s, so one hung `pw-dump`
+    /// held a runtime worker for as long as the child lived — unbounded — and
+    /// a second one took another worker with it.
+    ///
+    /// This is the case a real `pw-dump` cannot be asked to reproduce on
+    /// demand, which is why the program and the budget are parameters.
+    #[tokio::test]
+    async fn a_dump_that_never_ends_is_abandoned_at_its_budget() {
+        let program = never_exits("abandoned");
+        let started = std::time::Instant::now();
+        let result =
+            resolve_source_with(&program, std::time::Duration::from_millis(200)).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(&result, Err(why) if why.contains("did not answer within")),
+            "a hung dump must be reported as unanswered, got {result:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "must give up near its budget, took {elapsed:?}"
+        );
+    }
+
+    /// The budget is not a promise to fail: a program that answers is read.
+    ///
+    /// The anti-vacuity test. A `resolve_source_with` that rejected everything
+    /// would satisfy the one above, and the meter would simply never start.
+    #[tokio::test]
+    async fn a_dump_that_answers_is_still_parsed() {
+        let program = script_program(
+            "answer",
+            r#"#!/bin/sh
+cat <<'JSON'
+[
+  {"type":"PipeWire:Interface:Node",
+   "info":{"props":{"node.name":"alsa_input.usb-Sennheiser_EPOS_GSX_300_A003200202602692-00.mono-fallback"}}}
+]
+JSON
+"#,
+        );
+        let found = resolve_source_with(&program, std::time::Duration::from_secs(10))
+            .await
+            .expect("the dump answered")
+            .expect("the node is in there");
+        assert_eq!(
+            found, "alsa_input.usb-Sennheiser_EPOS_GSX_300_A003200202602692-00.mono-fallback"
+        );
+        let _ = std::fs::remove_file(&program);
+    }
+
+    /// A program that exits non-zero means "no device", not "error".
+    ///
+    /// Pinned because the timeout change moved the status check, and a
+    /// non-zero exit is how a missing device shows up rather than an empty
+    /// listing.
+    #[tokio::test]
+    async fn a_dump_that_exits_non_zero_is_an_absent_device_not_a_failure() {
+        let program = script_program("fail", "#!/bin/sh\nexit 1\n");
+        let found = resolve_source_with(&program, std::time::Duration::from_secs(10))
+            .await
+            .expect("a non-zero exit is an answer, not an error");
+        assert!(found.is_none(), "nothing was dumped, so nothing was found");
+        let _ = std::fs::remove_file(&program);
+    }
 
     /// Replay helper: feed raw S16_LE mono 48 kHz samples into the meter's
     /// decision core (classify) one 30 ms window at a time, the same way the
