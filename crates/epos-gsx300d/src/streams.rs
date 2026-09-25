@@ -438,7 +438,11 @@ impl StreamLedger {
         let indices: Vec<u32> = file
             .get("indices")
             .and_then(|i| i.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_u64().and_then(|n| u32::try_from(n).ok()))
+                    .collect()
+            })
             .unwrap_or(empty);
         if indices.is_empty() || Some(cookie) != current_cookie {
             return false;
@@ -679,6 +683,39 @@ mod tests {
         assert!(!ledger.restore(r#"{"cookie":"c"}"#, Some("c")));
         assert!(!ledger.restore(r#"{"cookie":"c","indices":[]}"#, Some("c")));
         assert!(ledger.is_empty());
+    }
+
+    /// An index too large for a `u32` is dropped, not truncated.
+    ///
+    /// The cookie check keeps other sessions' files out, so this is the layer
+    /// that handles a file which carries the *right* cookie and a corrupt index
+    /// — a half-finished write, or a hand edit. `as u32` took the low 32 bits,
+    /// so 2³³ + 5 arrived as 5: a perfectly ordinary-looking index pointing at
+    /// whatever stream happens to own that number, and the rescue would move
+    /// somebody else's audio on the strength of a corrupt file.
+    ///
+    /// Dropping the bad entry must not cost the good ones, so both halves are
+    /// here: an impossible index alone restores nothing, and an impossible index
+    /// beside a real one leaves the real one in place.
+    #[test]
+    fn an_index_too_large_for_u32_is_dropped_rather_than_truncated() {
+        // 2^33 + 5. Under `as u32` this arrives as 5.
+        const IMPOSSIBLE: u64 = 8_589_934_597;
+        let only = format!(r#"{{"cookie":"c","indices":[{IMPOSSIBLE}]}}"#);
+        let mut ledger = StreamLedger::new(64);
+        assert!(
+            !ledger.restore(&only, Some("c")),
+            "the sole index does not fit a u32, so there is nothing to restore"
+        );
+        assert!(ledger.is_empty(), "a truncated 5 must not reach the rescue");
+
+        let mixed = format!(r#"{{"cookie":"c","indices":[4714,{IMPOSSIBLE}]}}"#);
+        let mut partial = StreamLedger::new(64);
+        assert!(
+            partial.restore(&mixed, Some("c")),
+            "one unusable entry must not cost the usable one"
+        );
+        assert_eq!(partial.len(), 1, "only the index that fits is kept");
     }
 
     /// An empty ledger has no file, so leaving no trace is the normal case.
