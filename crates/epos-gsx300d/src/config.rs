@@ -150,7 +150,13 @@ mod tests {
     /// A private directory per test case, so these never touch the real
     /// `~/.config/epos-gsx300/` and never need to mutate the environment
     /// (which the other tests in this binary share).
-    fn scratch(name: &str) -> PathBuf {
+    ///
+    /// The directory is removed when the returned guard is dropped. It used to
+    /// be a bare `PathBuf` and nothing ever cleaned it up: 6,320 of these were
+    /// sitting in /tmp, roughly thirty per run of the suite, which is both a leak
+    /// and a slow accumulation of directories nobody looking at the machine would
+    /// know the provenance of.
+    fn scratch(name: &str) -> (PathBuf, ScratchDir) {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!(
             "epos-config-test-{}-{}-{name}",
@@ -159,7 +165,17 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create scratch dir");
-        dir
+        let guard = ScratchDir(dir.clone());
+        (dir, guard)
+    }
+
+    /// Removes a scratch directory when the test ends, passed or failed.
+    struct ScratchDir(PathBuf);
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     /// The destructive case. `Reload` used to call the same `load()` that
@@ -170,7 +186,7 @@ mod tests {
     /// A reload must read the file or fail, never author one.
     #[test]
     fn a_missing_config_is_an_error_for_a_reload_and_nothing_is_written() {
-        let dir = scratch("missing");
+        let (dir, _guard) = scratch("missing");
         let path = dir.join("config.json");
 
         let outcome = load_from(&path);
@@ -186,7 +202,7 @@ mod tests {
     /// the file is genuinely absent.
     #[test]
     fn a_missing_config_is_created_at_bootstrap() {
-        let dir = scratch("bootstrap");
+        let (dir, _guard) = scratch("bootstrap");
         let path = dir.join("config.json");
 
         let loaded = load_or_create(&path).expect("bootstrap must create a config");
@@ -210,7 +226,7 @@ mod tests {
     /// is recoverable; silently overwriting the user's settings is not.
     #[test]
     fn a_corrupt_config_is_preserved_byte_for_byte() {
-        let dir = scratch("corrupt");
+        let (dir, _guard) = scratch("corrupt");
         let path = dir.join("config.json");
         let garbage = "{ this is not json";
         std::fs::write(&path, garbage).expect("seed corrupt config");
@@ -227,7 +243,7 @@ mod tests {
     /// must read as a failure, not as "no settings, use defaults".
     #[test]
     fn an_empty_config_is_an_error_and_is_left_alone() {
-        let dir = scratch("empty");
+        let (dir, _guard) = scratch("empty");
         let path = dir.join("config.json");
         std::fs::write(&path, "").expect("seed empty config");
 
@@ -243,7 +259,7 @@ mod tests {
     /// still works — and what is saved back is what this build understands.
     #[test]
     fn a_saved_config_round_trips() {
-        let dir = scratch("roundtrip");
+        let (dir, _guard) = scratch("roundtrip");
         let path = dir.join("config.json");
         let mut config = Config::default();
         config.device.volume = Some(37);
@@ -329,7 +345,7 @@ mod tests {
     /// behind for a later run to trip over.
     #[test]
     fn saving_leaves_no_temp_file_behind() {
-        let dir = scratch("notemp");
+        let (dir, _guard) = scratch("notemp");
         let path = dir.join("config.json");
 
         save_to(&path, &Config::default()).expect("save");
@@ -350,7 +366,7 @@ mod tests {
     /// failed outright.
     #[test]
     fn temp_paths_never_collide() {
-        let dir = scratch("tempnames");
+        let (dir, _guard) = scratch("tempnames");
         let path = dir.join("config.json");
 
         let mut seen = std::collections::HashSet::new();
@@ -375,7 +391,7 @@ mod tests {
     /// writer's bytes. Every save must succeed and the result must parse.
     #[test]
     fn concurrent_saves_all_succeed_and_leave_a_readable_config() {
-        let dir = scratch("concurrent");
+        let (dir, _guard) = scratch("concurrent");
         let path = dir.join("config.json");
         save_to(&path, &Config::default()).expect("seed");
 

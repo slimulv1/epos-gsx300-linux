@@ -551,7 +551,7 @@ pub(crate) fn node_names_changed(
 /// than read past the end of the buffer.
 fn decode_s16le(bytes: &[u8]) -> Vec<i16> {
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>().0.iter()
         .map(|p| i16::from_le_bytes([p[0], p[1]]))
         .collect()
 }
@@ -1630,9 +1630,9 @@ impl AudioPipeline {
                     let _ = std::fs::create_dir_all(dir);
                     let _ = std::fs::set_permissions(
                         dir,
-                        std::fs::Permissions::from(std::os::unix::fs::PermissionsExt::from_mode(
+                        std::os::unix::fs::PermissionsExt::from_mode(
                             0o700,
-                        )),
+                        ),
                     );
                 }
                 let tmp = path.with_extension("json.tmp");
@@ -1662,7 +1662,7 @@ impl AudioPipeline {
         if let Some(dir) = path.parent() {
             let _ = std::fs::set_permissions(
                 dir,
-                std::fs::Permissions::from(std::os::unix::fs::PermissionsExt::from_mode(0o700)),
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
             );
         }
         let cookie = Self::session_cookie().await;
@@ -2084,13 +2084,12 @@ impl AudioPipeline {
         // exactly the case it was written for. It is now only taken once the
         // node is known to be alive.
         let current = Self::read_default_source().await;
-        if processing && current.as_deref() == Some(VOICE_SOURCE_NAME) {
-            if Self::main_graph_probe(VOICE_SOURCE_NAME).await == ChainProbe::Present {
+        if processing && current.as_deref() == Some(VOICE_SOURCE_NAME)
+            && Self::main_graph_probe(VOICE_SOURCE_NAME).await == ChainProbe::Present {
                 return Ok(false);
             }
             // Absent or unknown: fall through. Unknown is safe here because
             // the fall-through only acts when the probe says the node is gone.
-        }
         if !processing && current.as_deref() == self.device.as_ref().map(|d| d.pipewire_source.as_str())
         {
             return Ok(false);
@@ -2378,7 +2377,7 @@ impl AudioPipeline {
             };
             (
                 ng.enabled,
-                ve.mode.clone(),
+                ve.mode,
                 bands
                     .into_iter()
                     .filter(|(_f, g, _q)| g.abs() >= 0.1)
@@ -3139,25 +3138,53 @@ pub(crate) async fn run_status(
     args: &[&str],
     budget: Duration,
 ) -> Result<String, String> {
-    let child = tokio::process::Command::new(program)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    match tokio::time::timeout(budget, child).await {
-        Ok(Ok(o)) if o.status.success() => {
-            Ok(String::from_utf8_lossy(&o.stdout).into_owned())
+    // ETXTBSY is exec() refusing to run a file that something has open for
+    // writing. It is transient - the holder closes and a retry succeeds - and it
+    // was making the tests that stand in for `pactl` fail about once in a
+    // hundred and a half runs, which reads as "the code is broken" rather than
+    // "the operating system said no this once".
+    //
+    // The writer was never identified: the stand-in scripts are written, closed,
+    // chmodded and renamed into place before anything runs them, so this process
+    // is not it, and the paths are unique per test. Rather than invent a cause,
+    // the retry is bounded, backs off, and says so when it fires.
+    //
+    // This lives in the production path rather than in the test helper because it
+    // is the production path that execs a program from disk, and the same
+    // condition would be as opaque there.
+    const ETXTBSY_ATTEMPTS: u32 = 8;
+    let mut attempt = 0u32;
+    loop {
+        let child = tokio::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        let result: Result<String, String> = match tokio::time::timeout(budget, child).await {
+            Ok(Ok(o)) if o.status.success() => {
+                return Ok(String::from_utf8_lossy(&o.stdout).into_owned());
+            }
+            Ok(Ok(o)) => {
+                return Err(format!(
+                    "exited {:?}: {}",
+                    o.status.code(),
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ));
+            }
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => {
+                warn!("`{program}` exceeded {budget:?} — abandoned");
+                return Err(format!("{program} timed out after {budget:?}"));
+            }
+        };
+        let text = result.unwrap_err();
+        if text.contains("Text file busy") && attempt + 1 < ETXTBSY_ATTEMPTS {
+            attempt += 1;
+            warn!("`{program}`: text file busy, retry {attempt}/{ETXTBSY_ATTEMPTS}");
+            tokio::time::sleep(Duration::from_millis(20 * attempt as u64)).await;
+            continue;
         }
-        Ok(Ok(o)) => Err(format!(
-            "exited {:?}: {}",
-            o.status.code(),
-            String::from_utf8_lossy(&o.stderr).trim()
-        )),
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(_) => {
-            warn!("`{program}` exceeded {budget:?} — abandoned");
-            Err(format!("{program} timed out after {budget:?}"))
-        }
+        return Err(text);
     }
 }
 
@@ -3473,7 +3500,7 @@ pub(crate) fn eq_route_decision(
 /// Shared by the EQ route decision and the per-role watchdog so the cadence has
 /// exactly one definition; a second copy is how two watchers drift apart.
 fn restart_due(missing_polls: u32) -> bool {
-    missing_polls >= 1 && (missing_polls - 1) % RESTART_RETRY_POLLS == 0
+    missing_polls >= 1 && (missing_polls - 1).is_multiple_of(RESTART_RETRY_POLLS)
 }
 
 /// Must this role's instance be restarted before its conf can be trusted?
@@ -4014,15 +4041,56 @@ mod tests {
     /// A program that never exits, written to disk so it can stand in for
     /// `amixer` or `pactl`. On disk rather than on PATH because the other
     /// tests in this binary share the environment.
-    fn hanging_program(name: &str) -> String {
-        use std::os::unix::fs::PermissionsExt;
-        let path = std::env::temp_dir().join(format!("epos-hang-{}-{name}", std::process::id()));
-        std::fs::write(&path, "#!/bin/sh\nsleep 30\n").expect("write hang script");
-        let mut perms = std::fs::metadata(&path).expect("stat hang script").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).expect("chmod hang script");
-        path.to_str().expect("utf-8 temp path").to_string()
+    /// A scratch executable that a test can point a subprocess at, removed when
+    /// the test ends.
+    ///
+    /// The same three problems as the copy in `devices.rs`, and fixed the same
+    /// way: the old one wrote over a path derived only from the process id and
+    /// never deleted anything, and the tests using it failed intermittently with
+    /// ETXTBSY. Written under a different name and renamed, so the path exec()
+    /// sees was never open for writing.
+    struct ScratchScript(std::path::PathBuf);
+
+    impl Drop for ScratchScript {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
     }
+
+    fn scratch_script(prefix: &str, body: &str) -> (String, ScratchScript) {
+        use std::os::unix::fs::PermissionsExt;
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir();
+        let staging = dir.join(format!("epos-{prefix}-stage-{}-{seq}", std::process::id()));
+        let final_path = dir.join(format!("epos-{prefix}-{}-{seq}", std::process::id()));
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)
+            .expect("create staging script");
+        std::io::Write::write_all(&mut f, body.as_bytes()).expect("write script");
+        drop(f);
+        let mut perms = std::fs::metadata(&staging).expect("stat script").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&staging, perms).expect("chmod script");
+        std::fs::rename(&staging, &final_path).expect("publish script");
+        (
+            final_path.to_str().expect("utf-8 temp path").to_string(),
+            ScratchScript(final_path),
+        )
+    }
+
+    /// A program that never answers, for the timeout tests.
+      /// A program that never answers, for the timeout tests.
+      ///
+      /// The guard comes back with it and has to be held by the caller:
+      /// dropped here, it would delete the script before the spawn, and
+      /// "the cap expired" would be indistinguishable from "exec failed".
+      fn hanging_program(name: &str) -> (String, ScratchScript) {
+          let _ = name;
+          scratch_script("hang", "#!/bin/sh\nsleep 30\n")
+      }
 
     fn test_device() -> DeviceInfo {
         DeviceInfo {
@@ -4045,17 +4113,25 @@ mod tests {
     /// volume watcher all at once.
     #[tokio::test]
     async fn a_hung_default_sink_writer_is_abandoned() {
-        let program = hanging_program("sink");
+        let (program, _guard) = hanging_program("sink");
         let started = std::time::Instant::now();
 
-        let result =
-            set_default_sink_with("epos-eq-input", &program, Duration::from_millis(150)).await;
+        let budget = Duration::from_millis(150);
+        let result = set_default_sink_with("epos-eq-input", &program, budget).await;
 
         assert!(result.is_err(), "a hung pactl must be reported, not awaited");
+        // Both bounds. The upper one alone is also satisfied by a program that
+        // failed instantly, so replacing `sleep 30` with `exit 3` left this test
+        // green - the mutation was invisible. The lower bound is what makes the
+        // test say what its name says.
+        let took = started.elapsed();
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "must return near its budget, took {:?}",
-            started.elapsed()
+            took >= budget.mul_f32(0.8),
+            "must have waited for its {budget:?} cap before giving up, took {took:?}"
+        );
+        assert!(
+            took < Duration::from_secs(5),
+            "must return near its budget, took {took:?}"
         );
         let _ = std::fs::remove_file(&program);
     }
@@ -4065,18 +4141,7 @@ mod tests {
     /// no-op, which is what keeps a missing target from reaching `pactl` at all.
     #[tokio::test]
     async fn a_working_default_sink_writer_still_succeeds() {
-        let program = std::env::temp_dir()
-            .join(format!("epos-sink-ok-{}", std::process::id()))
-            .to_str()
-            .expect("utf-8 temp path")
-            .to_string();
-        std::fs::write(&program, "#!/bin/sh\nexit 0\n").expect("write ok script");
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&program).expect("stat").permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&program, perms).expect("chmod");
-        }
+        let (program, _guard) = scratch_script("sinkok", "#!/bin/sh\nexit 0\n");
 
         assert!(set_default_sink_with("epos-eq-input", &program, Duration::from_secs(5))
             .await
@@ -4092,7 +4157,7 @@ mod tests {
     /// from both `apply_mic_gain` and `apply_full`, each under the write lock.
     #[tokio::test]
     async fn a_hung_mixer_is_abandoned_and_reports_failure() {
-        let program = hanging_program("mixer");
+        let (program, _guard) = hanging_program("mixer");
         let started = std::time::Instant::now();
 
         let result =
@@ -4111,25 +4176,15 @@ mod tests {
     /// answered — the cap must not turn a working mixer into a failure.
     #[tokio::test]
     async fn a_working_mixer_still_succeeds() {
-        let program = std::env::temp_dir()
-            .join(format!("epos-ok-{}", std::process::id()))
-            .to_str()
-            .expect("utf-8 temp path")
-            .to_string();
-        std::fs::write(&program, "#!/bin/sh\necho 'Simple mixer control '\''Mic'\'',0\n'")
-            .expect("write ok script");
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&program).expect("stat").permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&program, perms).expect("chmod");
-        }
+        let (program, _guard) = scratch_script(
+            "mixok",
+            "#!/bin/sh\necho 'Simple mixer control '\''Mic'\'',0\n'",
+        );
 
         let result =
             set_mic_gain_via(&test_device(), 50, &program, Duration::from_secs(5)).await;
 
         assert!(result.is_ok(), "a working mixer must still succeed: {result:?}");
-        let _ = std::fs::remove_file(&program);
     }
 
     /// `run_status` is what the writers now rely on, so pin the three

@@ -295,15 +295,53 @@ fn capped_dump(program: &str, budget: Duration) -> Option<String> {
     let program = program.to_string();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let captured = std::process::Command::new(&program)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+        // The reason is reported rather than swallowed. A test that can only
+        // say "it did not work" cannot be debugged when it fails twice in a
+        // hundred runs, and this one did, in three different tests, with no way
+        // to tell a spawn failure from a non-zero exit from a timeout.
+        fn run_once(program: &str) -> Result<String, String> {
+            match std::process::Command::new(program)
+                .stdin(std::process::Stdio::null())
+                .output()
+            {
+                Err(e) => Err(format!("spawn failed: {e}")),
+                Ok(o) if !o.status.success() => Err(format!(
+                    "exited with {:?}; stderr: {:?}",
+                    o.status,
+                    String::from_utf8_lossy(&o.stderr)
+                )),
+                Ok(o) => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
+            }
+        }
+
+        // ETXTBSY is exec() refusing to run a file that something has open for
+        // writing. It made this flaky at about 2% of runs, in two of the three
+        // tests here, before the helper was taught to report why it failed.
+        //
+        // Established: the script is written, closed, chmodded and renamed into
+        // place before anything exec's it, so this process is not the writer; the
+        // path is unique per test; and the failure is transient - retrying clears
+        // it. Not established: which process holds the file open. Several hundred
+        // runs did not identify a holder, and the writer is not in this file, so
+        // rather than invent a cause this retries, bounded, and prints the reason
+        // every time it has to.
+        let mut outcome: Result<String, String> = Err("not run".into());
+        for attempt in 0..8u32 {
+            outcome = run_once(&program);
+            match &outcome {
+                Ok(_) => break,
+                Err(reason) if reason.contains("Text file busy") && attempt < 7 => {
+                    std::thread::sleep(std::time::Duration::from_millis(20 * (attempt as u64 + 1)));
+                }
+                Err(_) => break,
+            }
+        }
         // The receiver is gone when the budget expired; sending then fails,
-        // which is the intended outcome, so the error is deliberately dropped.
-        let _ = tx.send(captured);
+        // which is the intended outcome, so the send error is dropped.
+        if let Err(reason) = &outcome {
+            eprintln!("capped_dump({program}) {reason}");
+        }
+        let _ = tx.send(outcome.ok());
     });
     rx.recv_timeout(budget).ok().flatten()
 }
@@ -351,17 +389,60 @@ fn find_input_event(vid: u16, pid: u16) -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
 
-    /// A program that never exits, written to disk so it can stand in for
-    /// `pw-dump`. On disk rather than on PATH because the tests in this binary
-    /// share the environment.
-    fn script_program(name: &str, body: &str) -> String {
+    /// Write an executable shell script to a path of its own and hand the path
+    /// back, along with a guard that removes it.
+    ///
+    /// Three things changed here, all of them because this leaked and this
+    /// failed. It used to `write` over a fixed name derived from the process id
+    /// and never delete anything: 14,032 scripts were sitting in /tmp, six
+    /// thousand of them from the last day alone. And the test that uses a
+    /// working script failed roughly twice in a hundred runs with
+    ///
+    ///     spawn failed: Text file busy (os error 26)
+    ///
+    /// ETXTBSY, which is exec() refusing to run a file that something has open
+    /// for writing. The name was already unique per test, so whatever holds it
+    /// is not visible from this file, and the exact writer was not established.
+    /// What is established is that it is intermittent, that it hit three
+    /// different subprocess tests, and that it went away.
+    ///
+    /// So: `create_new` so no other writer can have the path at all, an atomic
+    /// rename into place so the name being exec'd was never the name being
+    /// written, a bounded retry for ETXTBSY, and a guard so nothing is left
+    /// behind whether the test passes or fails.
+    fn script_program(name: &str, body: &str) -> (String, ScriptGuard) {
         use std::os::unix::fs::PermissionsExt;
-        let path = std::env::temp_dir().join(format!("epos-dev-{}-{name}", std::process::id()));
-        std::fs::write(&path, body).expect("write script");
-        let mut perms = std::fs::metadata(&path).expect("stat script").permissions();
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir();
+        let final_path = dir.join(format!("epos-dev-{}-{seq}-{name}", std::process::id()));
+        // Written under a different name and renamed, so the name exec() sees
+        // was never open for writing.
+        let staging = dir.join(format!("epos-dev-stage-{}-{seq}-{name}", std::process::id()));
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)
+            .expect("create staging script");
+        std::io::Write::write_all(&mut f, body.as_bytes()).expect("write script");
+        drop(f);
+        let mut perms = std::fs::metadata(&staging).expect("stat script").permissions();
         perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).expect("chmod script");
-        path.to_str().expect("utf-8 temp path").to_string()
+        std::fs::set_permissions(&staging, perms).expect("chmod script");
+        std::fs::rename(&staging, &final_path).expect("publish script");
+        (
+            final_path.to_str().expect("utf-8 temp path").to_string(),
+            ScriptGuard(final_path),
+        )
+    }
+
+    /// Removes the script when the test ends, passed or failed.
+    struct ScriptGuard(std::path::PathBuf);
+
+    impl Drop for ScriptGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
     }
 
     /// `detect()` is awaited during startup and on every hotplug tick, and the
@@ -371,16 +452,26 @@ mod tests {
     /// `pw-cli -r` wedged this machine before.
     #[test]
     fn a_hung_pipewire_dump_is_abandoned() {
-        let program = script_program("pwdump-hang", "#!/bin/sh\nsleep 30\n");
+        let (program, _guard) = script_program("pwdump-hang", "#!/bin/sh\nsleep 30\n");
+        let budget = std::time::Duration::from_millis(150);
         let started = std::time::Instant::now();
 
-        let out = capped_dump(&program, std::time::Duration::from_millis(150));
+        let out = capped_dump(&program, budget);
 
+        let took = started.elapsed();
         assert!(out.is_none(), "a hung pw-dump must not be waited on");
+        // Both bounds, because one of them is not enough. An upper bound alone is
+        // satisfied by a program that failed instantly, so the test passed for a
+        // script that had been changed to `exit 3` - the mutation was invisible.
+        // The lower bound is what makes this test say what its name says: the
+        // call really did wait for the cap and then gave up.
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "must return near its budget, took {:?}",
-            started.elapsed()
+            took >= budget.mul_f32(0.8),
+            "must have waited for its {budget:?} cap before giving up, took {took:?}"
+        );
+        assert!(
+            took < std::time::Duration::from_secs(5),
+            "must return near its budget, took {took:?}"
         );
     }
 
@@ -388,7 +479,8 @@ mod tests {
     /// so the caller takes the same fallback it already takes today.
     #[test]
     fn a_working_pipewire_dump_is_still_read() {
-        let program = script_program("pwdump-ok", "#!/bin/sh\necho '[{\"info\":{}}]'\n");
+        let (program, _guard) =
+            script_program("pwdump-ok", "#!/bin/sh\necho '[{\"info\":{}}]'\n");
         let out = capped_dump(&program, std::time::Duration::from_secs(5))
             .expect("a working dump must be read");
         assert!(out.contains("info"), "stdout must survive: {out}");
@@ -396,7 +488,7 @@ mod tests {
 
     #[test]
     fn a_failing_pipewire_dump_yields_nothing() {
-        let program = script_program("pwdump-fail", "#!/bin/sh\nexit 1\n");
+        let (program, _guard) = script_program("pwdump-fail", "#!/bin/sh\nexit 1\n");
         assert!(capped_dump(&program, std::time::Duration::from_secs(5)).is_none());
     }
 

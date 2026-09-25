@@ -303,7 +303,7 @@ fn load_hrir() -> Hrir {
     // The extracted delays all measured 0.0, because libmysofa folds them into
     // the filter. They are read and checked so a future set that does not cannot
     // be silently mistaken for one that does.
-    for d in body[..delay_bytes].chunks_exact(4) {
+    for d in body[..delay_bytes].as_chunks::<4>().0 {
         let v = f32::from_le_bytes([d[0], d[1], d[2], d[3]]);
         assert!(v.abs() < 0.5, "a non-zero bulk delay is not handled here");
     }
@@ -313,7 +313,7 @@ fn load_hrir() -> Hrir {
         "hrir blob size mismatch"
     );
     let mut data = Vec::with_capacity(N_SPATIAL * 2 * TAPS);
-    for c in body[delay_bytes..].chunks_exact(4) {
+    for c in body[delay_bytes..].as_chunks::<4>().0 {
         data.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
     }
     let mut h = Hrir { data };
@@ -1024,16 +1024,85 @@ mod tests {
     /// The bank's half of that is fixed; this bounds the rest.
     #[test]
     fn the_widening_does_not_run_away() {
-        // The widest setting should not be dramatically louder than the
-        // narrowest, or the top of the control range is unusable.
-        const NARROW: f32 = 0.0;
-        const WIDE: f32 = 1.0;
-        assert!(WIDE > NARROW);
-        // 0 dB of spread and 0 dB of rear level is the dry reference; the
-        // defaults the profiles actually use are 0.6 and 0.35.
+        // This test was empty. It compared two constants it had declared itself:
+        //
+        //     const NARROW: f32 = 0.0;
+        //     const WIDE: f32 = 1.0;
+        //     assert!(WIDE > NARROW);
+        //     assert!(WIDE * 0.7 < 8.0);
+        //
+        // Both are decided by the compiler before anything runs, and neither
+        // mentions the plugin. Changing the real defaults in `instantiate` - the
+        // spread of 0.6 and the rear level of 0.35 - left it green. It read as
+        // a check on the level, and it checked arithmetic.
+        //
+        // What it should have done is run the filter. The widest setting does
+        // make things louder, because the upmix sums seven speakers' worth of
+        // energy into two ears, and that is a design decision rather than a
+        // defect - the decision is that it is bounded and modest. The bound is
+        // what a test can hold the code to, so this measures it.
+        const N: usize = 8192;
+        let mut seed: u32 = 0x9E37_79B9;
+        let mut noise = [0.0f32; N];
+        for s in noise.iter_mut() {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            *s = ((seed >> 9) & 0xFFFF) as f32 / 32768.0 - 1.0;
+        }
+        let in_rms = (noise.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>() / N as f64).sqrt();
+
+        // Run the real instance through the real run(), with the real widening
+        // code, at each corner of the control range.
+        let measure = |spread: f32, rear: f32| -> f64 {
+            let inst = unsafe { instantiate(std::ptr::null(), HRTF_RATE as c_ulong) };
+            assert!(!inst.is_null());
+            let mut in_l = [0.0f32; N];
+            let mut in_r = [0.0f32; N];
+            let mut out_l = [0.0f32; N];
+            let mut out_r = [0.0f32; N];
+            let mut gain = 1.0f32;
+            let mut c_spread = spread;
+            let mut c_front = 0.0f32;
+            let mut c_rear = rear;
+            in_l.copy_from_slice(&noise);
+            in_r.copy_from_slice(&noise);
+            unsafe {
+                (*(inst as *mut Plugin)).active = true;
+                connect_port(inst, P_OUT_L as c_int, out_l.as_mut_ptr());
+                connect_port(inst, P_OUT_R as c_int, out_r.as_mut_ptr());
+                connect_port(inst, P_IN_L as c_int, in_l.as_mut_ptr());
+                connect_port(inst, P_IN_R as c_int, in_r.as_mut_ptr());
+                connect_port(inst, P_GAIN as c_int, &mut gain);
+                connect_port(inst, P_SPREAD as c_int, &mut c_spread);
+                connect_port(inst, P_FRONT_W as c_int, &mut c_front);
+                connect_port(inst, P_REAR_LVL as c_int, &mut c_rear);
+                run(inst, N as c_int);
+                cleanup(inst);
+            }
+            let e: f64 = out_l.iter().chain(out_r.iter())
+                .map(|x| (*x as f64) * (*x as f64)).sum();
+            (e / (2 * N) as f64).sqrt()
+        };
+
+        let dry = measure(0.0, 0.0) / in_rms;
+        let default = measure(0.6, 0.35) / in_rms;
+        let widest = measure(1.0, 1.0) / in_rms;
+        let db = |r: f64| 20.0 * r.log10();
+
         assert!(
-            WIDE * 0.7 < 8.0,
-            "the maximum widening must stay a few dB above unity, not a dozen"
+            (dry - 1.0).abs() < 0.25,
+            "with every widening control at zero the bank must be unity gain, \
+             measured {dry:.3}x"
+        );
+        assert!(
+            db(widest) < 9.0,
+            "the widest setting must stay under 9 dB of gain, measured {:+.2} dB",
+            db(widest)
+        );
+        assert!(
+            db(default) < db(widest) && db(default) > db(dry) - 0.5,
+            "the default ({}, {}) must sit between dry and widest: \
+             dry {:+.2} dB, default {:+.2} dB, widest {:+.2} dB",
+            0.6, 0.35, db(dry), db(default), db(widest)
         );
     }
 
@@ -1196,7 +1265,7 @@ mod tests {
     fn a_left_speaker_is_louder_in_the_left_ear() {
         let h = load_hrir();
         let l = peak(&h.data[(CH_FL * 2 + 1) * TAPS..(CH_FL * 2 + 2) * TAPS]);
-        let r = peak(&h.data[(CH_FL * 2 + 0) * TAPS..(CH_FL * 2 + 1) * TAPS]);
+        let r = peak(&h.data[(CH_FL * 2) * TAPS..(CH_FL * 2 + 1) * TAPS]);
         assert!(l > r * 1.5, "FL is not louder on the left: L={l} R={r}");
     }
 
@@ -1206,7 +1275,7 @@ mod tests {
     fn a_right_speaker_is_louder_in_the_right_ear() {
         let h = load_hrir();
         let l = peak(&h.data[(CH_FR * 2 + 1) * TAPS..(CH_FR * 2 + 2) * TAPS]);
-        let r = peak(&h.data[(CH_FR * 2 + 0) * TAPS..(CH_FR * 2 + 1) * TAPS]);
+        let r = peak(&h.data[(CH_FR * 2) * TAPS..(CH_FR * 2 + 1) * TAPS]);
         assert!(r > l * 1.5, "FR is not louder on the right: L={l} R={r}");
     }
 
@@ -1216,7 +1285,7 @@ mod tests {
     fn the_centre_hrir_is_symmetric_between_ears() {
         let h = load_hrir();
         let l = peak(&h.data[(CH_FC * 2 + 1) * TAPS..(CH_FC * 2 + 2) * TAPS]);
-        let r = peak(&h.data[(CH_FC * 2 + 0) * TAPS..(CH_FC * 2 + 1) * TAPS]);
+        let r = peak(&h.data[(CH_FC * 2) * TAPS..(CH_FC * 2 + 1) * TAPS]);
         let diff = 20.0 * (l / r).abs().log10();
         assert!(diff < 1.0, "centre differs between ears by {diff:.2} dB");
     }

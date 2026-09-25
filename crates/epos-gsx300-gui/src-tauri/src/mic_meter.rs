@@ -746,7 +746,7 @@ mod tests {
             .join(name);
         let bytes = std::fs::read(path).expect("fixture missing");
         bytes
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect()
     }
@@ -794,7 +794,7 @@ mod tests {
         let a1 = (end_sec * 48000).min(n);
         let amp = 32768.0 * 10f64.powf(rms_dbfs / 20.0) * std::f64::consts::SQRT_2;
         for (k, s) in samples[a0..a1].iter_mut().enumerate() {
-            let t = (a0 as usize + k) as f64 / 48000.0;
+            let t = (a0 + k) as f64 / 48000.0;
             let v = amp
                 * (0.7 * (2.0 * std::f64::consts::PI * 220.0 * t).sin()
                     + 0.3 * (2.0 * std::f64::consts::PI * 1100.0 * t).sin());
@@ -830,7 +830,7 @@ mod tests {
         let noise_sfm = spectral_flatness(norm.iter().copied());
         assert!(noise_sfm > 0.50, "flat noise reads {noise_sfm:.3}");
 
-        let silence = spectral_flatness(std::iter::repeat(0.0_f32).take(CHUNK_SAMPLES as usize));
+        let silence = spectral_flatness(std::iter::repeat_n(0.0_f32, CHUNK_SAMPLES as usize));
         assert_eq!(silence, 1.0);
     }
 
@@ -906,7 +906,7 @@ mod tests {
         // Find the first engagement.
         let first = levels.iter().position(|l| l.active).expect("speech must engage");
         let t_engage = first as f32 / 33.0;
-        assert!(t_engage >= 3.0 && t_engage <= 6.0, "engage at {t_engage}s");
+        assert!((3.0..=6.0).contains(&t_engage), "engage at {t_engage}s");
 
         // Floor should have primed near the hiss center (-38 ± 5 dBFS).
         assert!(core.floor_db > -43.0 && core.floor_db < -33.0, "floor {:?}", core.floor_db);
@@ -938,7 +938,7 @@ mod tests {
         let first = levels.iter().position(|l| l.active).expect("quiet speech must engage");
         let t_engage = first as f32 / 33.0;
         assert!(
-            t_engage >= 5.0 && t_engage <= 8.2,
+            (5.0..=8.2).contains(&t_engage),
             "quiet speech engage {t_engage:.1}s (tone at 6-8s)"
         );
         let peak_rel = levels.iter().map(|l| l.db).fold(0.0_f32, f32::max);
@@ -970,7 +970,7 @@ mod tests {
         let first = levels.iter().position(|l| l.active).expect("loud broadband must engage");
         let t_engage = first as f32 / 33.0;
         assert!(
-            t_engage >= 3.5 && t_engage <= 6.0,
+            (3.5..=6.0).contains(&t_engage),
             "loud burst engage {t_engage:.1}s"
         );
     }
