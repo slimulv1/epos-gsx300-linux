@@ -942,20 +942,49 @@ impl AudioPipeline {
             );
             return (ExitOutcome::NowhereToGo, None);
         };
+        // The plan is built BEFORE the default sink moves, not after. Both orders
+        // leave the audio in the right place, and that is what made this worth
+        // checking: on hardware the daemon logged "1 stream(s) moved off the EPOS"
+        // while three streams had actually left it.
+        //
+        // The reason is the window between the two. Changing the default is
+        // `pactl set-default-sink`, and reading the streams back is two more
+        // subprocesses - a couple of hundred milliseconds in which the graph
+        // manager can move streams off a sink that is no longer the default. Two
+        // of the three were gone before `plan_leave` ever looked, so the plan
+        // found one, the command count was one, and the log said one.
+        //
+        // Under-claiming is the safe direction, but a count that cannot be
+        // trusted is not evidence of anything: the next person to read it has no
+        // way to tell "one stream needed moving" from "two moved themselves and
+        // nobody logged it". Reading first also makes the plan describe the state
+        // the user actually left, rather than a state the daemon created.
+        //
+        // The indices stay valid across the default change - a sink-input index
+        // is an identity, not a position, and setting the default does not
+        // renumber anything.
+        let moves = self.plan_leave(&target).await;
         if let Err(e) = Self::set_default_sink(&target).await {
-            warn!("Could not leave the EPOS for {target}: {e}");
-            return (ExitOutcome::NowhereToGo, None);
+            // The plan is still handed back, and that is deliberate. The instances
+            // are about to stop either way, so a stream left on the EPOS is a
+            // stream playing into a chain that is going away. Moving it to the
+            // target is the better of the two, even with the default still
+            // pointing at the EPOS.
+            //
+            // What this must not do is look like a clean exit: the default is still
+            // on the EPOS, and the warning says so rather than naming a sink it
+            // did not manage to reach.
+            warn!(
+                "Could not move the default off the EPOS to {target}: {e}. \
+                 Existing streams are still being moved; streams opened from now \
+                 on will follow the default, which is still on the EPOS."
+            );
+            return (ExitOutcome::NowhereToGo, moves);
         }
         // The routing poll has not run yet, so the cached "in use" would leave the
         // ring lit and the EQ reported as in the path for up to one poll. Correct it
         // from what just happened, which is an observation and not a guess.
         self.note_default_sink(Some(&target), false);
-        // Changing the default only steers streams opened afterwards. Anything the
-        // rescue pinned to our hardware with `move-sink-input` keeps playing there,
-        // which is how the EPOS went on carrying the user's audio after they left
-        // it. So leaving also decides what has to be moved, and the caller runs it
-        // with no lock held.
-        let moves = self.plan_leave(&target).await;
         (ExitOutcome::Moved(target), moves)
     }
 
