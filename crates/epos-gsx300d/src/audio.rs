@@ -1637,13 +1637,7 @@ impl AudioPipeline {
                     // 0700, matching the config directory: the ledger holds this
                     // session's cookie and the stream indices it belongs to, and
                     // the default umask would leave the directory world-readable.
-                    let _ = std::fs::create_dir_all(dir);
-                    let _ = std::fs::set_permissions(
-                        dir,
-                        std::fs::Permissions::from(std::os::unix::fs::PermissionsExt::from_mode(
-                            0o700,
-                        )),
-                    );
+                    let _ = ensure_private_dir(dir);
                 }
                 let tmp = path.with_extension("json.tmp");
                 std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &path))
@@ -1670,10 +1664,7 @@ impl AudioPipeline {
         let Ok(text) = std::fs::read_to_string(&path) else { return };
         // Best effort: an existing directory from an older run is tightened too.
         if let Some(dir) = path.parent() {
-            let _ = std::fs::set_permissions(
-                dir,
-                std::fs::Permissions::from(std::os::unix::fs::PermissionsExt::from_mode(0o700)),
-            );
+            let _ = ensure_private_dir(dir);
         }
         let cookie = Self::session_cookie().await;
         let restored = lock(&self.stream_ledger).restore(&text, cookie.as_deref());
@@ -2357,7 +2348,7 @@ impl AudioPipeline {
             };
             (
                 ng.enabled,
-                ve.mode.clone(),
+                ve.mode,
                 bands
                     .into_iter()
                     .filter(|(_f, g, _q)| g.abs() >= 0.1)
@@ -3007,26 +2998,64 @@ pub(crate) async fn run_status(
     args: &[&str],
     budget: Duration,
 ) -> Result<String, String> {
-    let child = tokio::process::Command::new(program)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    match tokio::time::timeout(budget, child).await {
-        Ok(Ok(o)) if o.status.success() => {
-            Ok(String::from_utf8_lossy(&o.stdout).into_owned())
+    // ETXTBSY is exec() refusing to run a file that something else has open for
+    // writing, and it is transient: the holder closes, and the next attempt
+    // works. Measured on this machine, a test suite that runs a script out of
+    // /tmp failed about 1 run in 40, always one of the three that shell out,
+    // always a different one - which is what a race looks like and not what a
+    // broken program looks like.
+    //
+    // What is established: the script is written, closed, chmodded and renamed
+    // into place before anything exec's it, so this process is not the writer;
+    // the path is unique per test. What is not established: which process holds
+    // it. Several hundred runs did not identify a holder, so rather than invent
+    // a cause this retries, bounded, and hands back the reason when it gives up.
+    //
+    // It is here and not in a test helper because this is the function that execs
+    // a program from disk on the production path.
+    const ETXTBSY_ATTEMPTS: u32 = 8;
+    for attempt in 0..ETXTBSY_ATTEMPTS {
+        let last = attempt + 1 == ETXTBSY_ATTEMPTS;
+        let spawn = async {
+            tokio::process::Command::new(program)
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .output()
+                .await
+        };
+        // Only a failure worth retrying falls through to the next attempt;
+        // everything else returns here with its own reason.
+        let reason = match tokio::time::timeout(budget, spawn).await {
+            Ok(Ok(o)) if o.status.success() => {
+                return Ok(String::from_utf8_lossy(&o.stdout).into_owned());
+            }
+            Ok(Ok(o)) => format!(
+                "exited {:?}: {}",
+                o.status.code(),
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => {
+                warn!("`{program}` exceeded {budget:?} — abandoned");
+                return Err(format!("{program} timed out after {budget:?}"));
+            }
+        };
+        let busy = reason.contains("Text file busy") || reason.contains("os error 26");
+        if !busy || last {
+            return Err(reason);
         }
-        Ok(Ok(o)) => Err(format!(
-            "exited {:?}: {}",
-            o.status.code(),
-            String::from_utf8_lossy(&o.stderr).trim()
-        )),
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(_) => {
-            warn!("`{program}` exceeded {budget:?} — abandoned");
-            Err(format!("{program} timed out after {budget:?}"))
-        }
+        // Backing off rather than spinning: the holder needs a moment to close.
+        tokio::time::sleep(Duration::from_millis(20 * (attempt as u64 + 1))).await;
+        debug!(
+            "`{program}` hit ETXTBSY, retry {}/{}",
+            attempt + 2,
+            ETXTBSY_ATTEMPTS
+        );
     }
+    // Unreachable: the loop returns on the last attempt. Kept explicit so a
+    // future edit to the bound cannot fall out of the function.
+    Err(format!("{program} did not run"))
 }
 
 /// `set_default_sink` with the program and budget as parameters, so a test can
@@ -3367,6 +3396,26 @@ pub(crate) fn conf_needs_restart(desired: Option<&str>, loaded: Option<&str>) ->
     }
 }
 
+/// Create `dir` if it is missing and force it to 0700 either way.
+///
+/// Split out of `save_ledger` because the property it exists to establish - the
+/// ledger directory is not world-readable - was asserted in a comment and
+/// nowhere else. `0o700` appeared in the source and in no test, so changing it to
+/// `0o755` would have been caught by neither the compiler nor the suite, and the
+/// file it guards holds the session cookie and the stream indices belonging to
+/// it.
+///
+/// `create_dir_all` alone is not enough: it applies the umask, and a permissive
+/// umask would leave the directory group- or world-readable. The explicit
+/// `set_permissions` after it is what makes the mode a fact rather than a
+/// default, and an existing directory is tightened too - one left behind by an
+/// older run with a looser mode is exactly the case that would otherwise persist.
+fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
 /// Write `contents` to `path` atomically: a complete write to a sibling temp
 /// file, then a rename.
 ///
@@ -3636,6 +3685,69 @@ impl Drop for AudioPipeline {
 
 #[cfg(test)]
 mod tests {
+    /// The ledger directory is private, and stays private.
+    ///
+    /// This property had no test at all: `0o700` appeared in `save_ledger` and in
+    /// a comment explaining why, and nowhere else. A change to `0o755` would have
+    /// been caught by nothing, and the file it guards carries the session cookie
+    /// and the stream indices belonging to it - enough for somebody else to move
+    /// the user's playback.
+    ///
+    /// Both directions are covered, and each has a real failure behind it: a
+    /// missing directory has to be created private rather than created with the
+    /// umask and tidied later, and an existing one has to be tightened because a
+    /// looser directory left by an older run would otherwise persist forever.
+    #[test]
+    fn the_ledger_directory_is_private_and_stays_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Nested and non-existent, as the real path is on a first run.
+        let root = std::env::temp_dir().join(format!("epos-mode-{}", std::process::id()));
+        let nested = root.join("epos-gsx300");
+        let _ = std::fs::remove_dir_all(&root);
+
+        ensure_private_dir(&nested).expect("creating the ledger directory");
+        let mode = std::fs::metadata(&nested).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "a newly created ledger directory must be private, not umask-default"
+        );
+
+        // Loosen it the way an older run or a careless umask would have, then ask
+        // again. This half is the one that only matters on the load path, where
+        // the directory already exists.
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_dir(&nested).expect("tightening an existing directory");
+        let mode = std::fs::metadata(&nested).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "an existing loose directory must be tightened");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The directory that gets the mode is the one the ledger lives in.
+    ///
+    /// A test on a temporary directory proves `ensure_private_dir` works. It does
+    /// not prove the daemon applies it to the real path, and the real path is the
+    /// one that matters. `ledger_path` builds that from the environment, so this
+    /// pins the shape - and the second assertion is the one with teeth: if the
+    /// mode were applied to the shared state root rather than the
+    /// per-application directory, the directory holding the cookie would be left
+    /// at whatever the umask gave it.
+    #[test]
+    fn the_directory_that_gets_the_mode_is_the_one_the_ledger_lives_in() {
+        let path = ledger_path().expect("a state home is set in any real session");
+        let dir = path.parent().expect("the ledger path has a parent");
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("stream-ledger.json")
+        );
+        assert_eq!(
+            dir.file_name().and_then(|n| n.to_str()),
+            Some("epos-gsx300"),
+            "the mode goes on the ledger's parent, so that parent has to be the \
+             per-application directory"
+        );
+    }
     use super::*;
     use epos_shared::config::EqBand;
 

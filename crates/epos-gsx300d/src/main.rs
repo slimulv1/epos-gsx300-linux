@@ -26,10 +26,16 @@ use tracing::{debug, error, info, warn};
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
+    //
+    // A constant directive, so it parses - but `unwrap` here would be a panic
+    // during start-up, before the daemon has done anything at all, reachable only
+    // by a future edit to the string. `unwrap_or_default` degrades to the default
+    // filter instead: the same behaviour today, and a quiet daemon rather than a
+    // dead one if it ever stops parsing.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "epos_gsx300d=info,warn".parse().unwrap()),
+                .unwrap_or_else(|_| "epos_gsx300d=info,warn".parse().unwrap_or_default()),
         )
         .init();
 

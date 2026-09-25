@@ -295,12 +295,54 @@ fn capped_dump(program: &str, budget: Duration) -> Option<String> {
     let program = program.to_string();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let captured = std::process::Command::new(&program)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+        // ETXTBSY, the same race `run_status` handles, on the blocking path. It
+        // is here too because this function does not go through `run_status`: it
+        // spawns its own worker thread, so a retry added only to the async spawner
+        // left this one failing - measured, not assumed. The two are the same
+        // fault and the same argument applies, so the wording is shared.
+        const ATTEMPTS: u32 = 8;
+        let mut last_reason = String::new();
+        let mut captured = None;
+        for attempt in 0..ATTEMPTS {
+            // The reason is carried out rather than dropped. This used `.ok()`
+            // and returned None, which made a failure indistinguishable from a
+            // timeout, from a non-zero exit and from a program that was never
+            // there - so a failing test gave nobody a reason, and the race
+            // behind it took a hundred runs to name.
+            let outcome = std::process::Command::new(&program)
+                .stdin(std::process::Stdio::null())
+                .output();
+            match outcome {
+                Ok(o) if o.status.success() => {
+                    captured = Some(String::from_utf8_lossy(&o.stdout).into_owned());
+                    break;
+                }
+                Ok(o) => {
+                    last_reason = format!(
+                        "exited {:?}: {}",
+                        o.status.code(),
+                        String::from_utf8_lossy(&o.stderr).trim()
+                    );
+                    // A program that ran and failed is not going to start working
+                    // on a second attempt.
+                    break;
+                }
+                Err(e) => {
+                    last_reason = e.to_string();
+                    let busy = last_reason.contains("Text file busy")
+                        || last_reason.contains("os error 26");
+                    if !busy || attempt + 1 == ATTEMPTS {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        20 * (attempt as u64 + 1),
+                    ));
+                }
+            }
+        }
+        if captured.is_none() {
+            warn!("{program} did not produce a dump: {last_reason}");
+        }
         // The receiver is gone when the budget expired; sending then fails,
         // which is the intended outcome, so the error is deliberately dropped.
         let _ = tx.send(captured);
