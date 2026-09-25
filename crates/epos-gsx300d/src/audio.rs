@@ -45,6 +45,8 @@ pub struct AudioPipeline {
     role_health: Mutex<BTreeMap<String, RoleHealth>>,
     /// Microphone signal watchdog: the probe state, what is currently being
     /// reported, and when the last probe ran.
+    /// Whether the EPOS is engaged. Off at start-up, on only by a long press.
+    powered: AtomicBool,
     /// The output sink the user is currently using, when it is not one of ours.
     ///
     /// Only so the "the EQ is bypassed while you are on this device" line is
@@ -235,36 +237,6 @@ pub enum EnterOutcome {
     CouldNotDecide,
 }
 
-/// What a long press did, plus the stream moves it wants made afterwards.
-///
-/// Split because the moves must not run under the state lock: one
-/// `move-sink-input` per stream at a 5 s budget is minutes of subprocess time, and
-/// holding a read lock across that parks every IPC request and watcher behind it.
-pub struct ToggleResult {
-    pub outcome: ToggleOutcome,
-    pub moves: Option<streams::StreamMovePlan>,
-}
-
-/// What a long press did, whichever direction it went.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ToggleOutcome {
-    /// Playback was moved onto the EPOS device, named.
-    Entered(String),
-    /// Playback was moved off the EPOS to this device.
-    Left(String),
-    /// Already on the EPOS, so nothing was changed.
-    AlreadyHere,
-    /// Already off the EPOS, so nothing was changed.
-    AlreadyAway,
-    /// Leaving had nowhere to go, so the default was left untouched.
-    NowhereToGo,
-    /// No EPOS sink name is known, so the default was left untouched.
-    NoDevice,
-    /// The EPOS sink is not published, so the default was left untouched.
-    NotPublished(String),
-    /// The sink list could not be read, so no choice could be made.
-    CouldNotDecide,
-}
   /// What to do with the default sink on this poll.
   #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputDecision {
@@ -452,6 +424,141 @@ pub(crate) const MIC_SILENT_PROBES: u32 = 3;
 /// Consecutive good probes required before a dead microphone is believed alive
 /// again.
 pub(crate) const MIC_RECOVERY_PROBES: u32 = 2;
+
+/// The roles to stop when switching the EPOS on failed partway.
+///
+/// `INSTANCE_ROLES` is in start order, so a failure at position *i* means roles
+/// `0..i` are up and must not be left running. The failing role itself is not in
+/// the list: `restart_epos_instance` has already tried to bring it up and failed,
+/// so it is either still down or in a state systemd will settle, and stopping it
+/// again would only add a second timeout to a path the user is already waiting on.
+///
+/// Pure, because the off path's meaning depends on it. "The EPOS is off" has to
+/// mean nothing is running; a rollback that left a voice instance up would keep a
+/// capture chain alive, consuming CPU and publishing a node, for a headset the
+/// user has switched off and whose ring is dark.
+pub fn rollback_roles(failed: &str) -> Vec<&'static str> {
+    let Some(at) = INSTANCE_ROLES.iter().position(|r| *r == failed) else {
+        // A role not in the start order cannot have a partial start. Returning
+        // empty rather than everything keeps an unknown name from tearing down
+        // instances that are not involved.
+        return Vec::new();
+    };
+    INSTANCE_ROLES[..at].iter().rev().copied().collect()
+}
+
+/// The result of turning the EPOS on or off.
+///
+/// Separate cases because "the instances started but playback did not route" is
+/// not the same thing as success, and the ring will be dark in it. Reporting it
+/// as success is the "on but not working" state this project keeps removing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PowerOutcome {
+    /// Already in the requested state; nothing was done.
+    Unchanged,
+    /// On, and playback is on `sink`.
+    On(Option<String>),
+    /// The instances are up but playback is not on the EPOS.
+    OnNoPlayback,
+    /// Off. Carries the streams the caller must move off the EPOS hardware.
+    ///
+    /// Not optional. Leaving the EPOS has to move the audio with it: changing the
+    /// default only steers streams opened afterwards, and a stream the rescue
+    /// pinned with `move-sink-input` keeps playing on the EPOS. Measured: the EPOS
+    /// DAC carried a louder signal than the speakers the user was listening on.
+    ///
+    /// It is returned rather than run here because each stream is one subprocess
+    /// at a multi-second budget, and the button handler holds a read lock across
+    /// this call - running them inside it would freeze every IPC request and every
+    /// watcher for the duration.
+    Off(Option<crate::streams::StreamMovePlan>),
+    /// An instance did not come up.
+    Failed(String),
+}
+
+/// Stop one epos instance (`systemctl --user stop pipewire-epos@<name>`).
+///
+/// The counterpart of `restart_epos_instance`. Restart cannot serve here:
+/// `systemctl restart` on a stopped unit starts it, so "turn the EPOS off" needs
+/// a stop, and it needs one that is bounded for the same reason the restart is —
+/// an unbounded await here stalls the caller for as long as systemd takes.
+pub(crate) async fn stop_epos_instance(role: &str) -> bool {
+    let svc = format!("pipewire-epos@{role}.service");
+    const STOP_CMD_BUDGET: Duration = Duration::from_secs(15);
+    info!("Stopping epos instance {role}");
+    let res = tokio::time::timeout(
+        STOP_CMD_BUDGET,
+        tokio::process::Command::new("systemctl")
+            .args(["--user", "stop", &svc])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await;
+    match res {
+        Ok(Ok(s)) if s.success() => true,
+        Ok(Ok(s)) => {
+            warn!("epos instance stop {svc} returned {:?}", s.code());
+            false
+        }
+        Ok(Err(e)) => {
+            warn!("epos instance stop {svc} failed: {e}");
+            false
+        }
+        Err(_) => {
+            warn!("epos instance stop {svc} exceeded {STOP_CMD_BUDGET:?}");
+            false
+        }
+    }
+}
+
+/// The epos instance roles, in the order they should come up and go down.
+///
+/// Voice and sidetone first going up, EQ last, because playback is routed
+/// through the EQ chain and starting it first would open a path to a device
+/// whose chain is not ready. Going down is the reverse for the same reason.
+pub const INSTANCE_ROLES: [&str; 3] = ["voice", "sidetone", "eq"];
+
+/// What a long press on the smart button should do.
+///
+/// The EPOS starts off and only comes on when the user asks for it with a long
+/// press. A press while it is on turns it back off, so the gesture is a toggle
+/// and not a one-way door — there has to be a way back to the state the user
+/// asked to start from, and a second press is it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerAction {
+    /// Off to on: start the instances, then put playback on the EPOS.
+    TurnOn,
+    /// On to off: take playback off the EPOS first, then stop the instances.
+    TurnOff,
+}
+
+/// The action a long press means, given whether the EPOS is currently on.
+///
+/// Pure, so it is pinned by tests rather than by whatever the flag happened to
+/// hold when the branch was written.
+pub fn desired_power(powered: bool) -> PowerAction {
+    if powered {
+        PowerAction::TurnOff
+    } else {
+        PowerAction::TurnOn
+    }
+}
+
+/// What the ring should show.
+///
+/// The EPOS being off is a stronger statement than "playback is not on the
+/// EPOS": the instances are stopped, so there is nothing for the ring to be
+/// reporting on, and a coloured ring would be claiming a mode for audio that
+/// cannot exist. `in_use` alone used to be the whole answer, and it was right
+/// for as long as the instances never stopped.
+pub fn indicator_for_power(
+    mode: epos_shared::config::AudioMode,
+    powered: bool,
+    in_use: bool,
+) -> crate::led::LedIndicator {
+    crate::led::indicator_for(mode, powered && in_use)
+}
 
 /// Per-probe state of the microphone signal watchdog.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -755,6 +862,7 @@ impl AudioPipeline {
             role_health: Mutex::new(BTreeMap::new()),
             last_user_sink: Mutex::new(None),
             epos_in_use: AtomicBool::new(false),
+            powered: AtomicBool::new(false),
             stream_ledger: Mutex::new(streams::StreamLedger::new(LEDGER_CAP)),
             returning_streams: AtomicBool::new(false),
             ledger_loaded: AtomicBool::new(false),
@@ -978,37 +1086,6 @@ impl AudioPipeline {
         EnterOutcome::Entered(target)
     }
 
-    /// Leave the EPOS if playback is on it, enter it if it is not.
-    ///
-    /// The direction comes from [`is_epos_sink`] and nothing else — not the cached
-    /// "in use" flag, which lags a poll, and not a negation of a user-choice test,
-    /// which is how an earlier version reported the opposite of what was true on
-    /// hardware with the user sitting on the EPOS. Each branch re-checks for
-    /// itself, so a default that changed between the two reads still lands on the
-    /// "already" answer rather than a route nobody asked for.
-    pub async fn toggle_epos(&self) -> ToggleResult {
-        let (raw_sink, _) = self.node_names();
-        let current = Self::read_default_sink().await.unwrap_or_default();
-        if is_epos_sink(&current, &raw_sink) {
-            let (outcome, moves) = self.exit_epos().await;
-            let outcome = match outcome {
-                ExitOutcome::AlreadyAway => ToggleOutcome::AlreadyAway,
-                ExitOutcome::Moved(sink) => ToggleOutcome::Left(sink),
-                ExitOutcome::NowhereToGo => ToggleOutcome::NowhereToGo,
-                ExitOutcome::CouldNotDecide => ToggleOutcome::CouldNotDecide,
-            };
-            return ToggleResult { outcome, moves };
-        }
-        let outcome = match self.enter_epos().await {
-            EnterOutcome::AlreadyHere => ToggleOutcome::AlreadyHere,
-            EnterOutcome::Entered(sink) => ToggleOutcome::Entered(sink),
-            EnterOutcome::NoDevice => ToggleOutcome::NoDevice,
-            EnterOutcome::NotPublished(sink) => ToggleOutcome::NotPublished(sink),
-            EnterOutcome::CouldNotDecide => ToggleOutcome::CouldNotDecide,
-        };
-        ToggleResult { outcome, moves: None }
-    }
-
     /// The streams that are sending audio, with their sink resolved to a name.
     ///
     /// Best effort by design: a failure here yields no streams, and the caller then
@@ -1065,6 +1142,199 @@ impl AudioPipeline {
         lock(&self.previous_sink).clone()
     }
 
+    /// Whether the EPOS is engaged.
+    ///
+    /// False from the moment the daemon starts, and never persisted: the user
+    /// asked for the headset to be off until they turn it on, and a flag in
+    /// config.json would survive the reboot that is supposed to turn it back off.
+    /// A long press on the smart button is the only thing that changes it.
+    pub fn is_powered(&self) -> bool {
+        self.powered.load(Ordering::Relaxed)
+    }
+
+    fn set_powered(&self, on: bool) {
+        self.powered.store(on, Ordering::Relaxed);
+    }
+
+    /// Write the three DSP confs from the current config, without applying the
+    /// mic gain or routing anything.
+    ///
+    /// Split out of `apply_full` because switching the EPOS on needs it and the
+    /// button handler holds a read lock: `apply_full` takes `&mut self`, so
+    /// calling it from there would mean holding the write lock across a
+    /// multi-second `systemctl`, which freezes every IPC request and every
+    /// watcher for the duration.
+    ///
+    /// Writing the confs is also what makes switching the EPOS on pick up
+    /// whatever the user changed while it was off. A short press cycles profiles
+    /// with nothing running, so the confs on disk go stale; starting the
+    /// instances without rewriting them first loads whatever the last session
+    /// left there, which is the one outcome the whole "write the conf, then
+    /// start" ordering exists to prevent.
+    pub(crate) fn write_dsp_confs(
+        &self,
+        mode: epos_shared::config::AudioMode,
+    ) -> Result<bool> {
+        let mut changed = false;
+        changed |= self.write_eq_conf_for(mode)?;
+        changed |= self.write_voice_conf()?;
+        changed |= self.write_sidetone_conf()?;
+        Ok(changed)
+    }
+
+    /// Leave the EPOS off at start-up.
+    ///
+    /// Three things, and the order is the point:
+    ///
+    /// 1. Move playback off the EPOS, if it is there. The default sink survives a
+    ///    reboot through WirePlumber's saved routes, so a session that ended with
+    ///    the headset as the default would otherwise start this one routing into a
+    ///    chain that is about to be stopped — audio aimed at a sink that is on its
+    ///    way out.
+    /// 2. Record that the EPOS is off, so the restart gate is closed and the
+    ///    watchdog cannot undo step 3.
+    /// 3. Stop the three instances.
+    ///
+    /// Only step 1 needs the device, and it is the only step that is skipped when
+    /// the headset was not found at start-up. Steps 2 and 3 are not: the units are
+    /// enabled, so systemd started them whether or not the daemon saw a device,
+    /// and returning early without stopping them would leave the EPOS publishing
+    /// nodes and consuming CPU behind a dark ring. The hotplug loop records the
+    /// device when it appears, and the long press starts the instances then — the
+    /// user is already driving the button by that point, so nothing is lost by not
+    /// acting on a device that is not there yet.
+    pub async fn park_epos_at_startup(&self) {
+        if self.has_device() {
+            let (raw_sink, _) = self.node_names();
+            let current = Self::read_default_sink().await.unwrap_or_default();
+            if is_epos_sink(&current, &raw_sink) {
+                match self.exit_epos().await {
+                    (ExitOutcome::Moved(sink), _) => {
+                        info!("EPOS off at start-up: playback moved to {sink}")
+                    }
+                    (other, _) => warn!(
+                        "EPOS off at start-up, but playback could not be moved: {other:?}"
+                    ),
+                }
+            }
+        } else {
+            // Worth saying out loud: the one thing this cannot do is move playback,
+            // because the sink name is unknown. If the previous session left the
+            // EPOS as the default, that stays true until the user presses the
+            // button and the hotplug loop has a name to work with.
+            info!("no EPOS device at start-up; stopping its instances without routing");
+        }
+        self.set_powered(false);
+        for role in INSTANCE_ROLES.iter().rev() {
+            if !crate::audio::stop_epos_instance(role).await {
+                warn!("could not stop epos instance {role} at start-up");
+            }
+        }
+        info!("EPOS is off at start-up — press and hold the smart button to use the headset");
+    }
+
+    /// Turn the EPOS on or off, which is what a long press on the smart button
+    /// does.
+    ///
+    /// The order is the whole of it, in both directions.
+    ///
+    /// **Going on**, the instances start first and playback is routed afterwards.
+    /// The other order would set the default sink to a node that the EQ chain has
+    /// not published yet, and an app following the default in that window plays
+    /// into a sink nobody is draining — silence, with no error anywhere.
+    ///
+    /// **Going off**, playback is moved away first and the instances stop
+    /// afterwards. The reverse would pull the chain out from under a stream that
+    /// is still playing: audio would be cut mid-word, rather than the stream
+    /// being handed to another device first.
+    ///
+    /// Either way the confs are written on the way up, so the instances load what
+    /// the config says rather than whatever was on disk from last time.
+    pub async fn set_power(
+        &self,
+        on: bool,
+        mode: epos_shared::config::AudioMode,
+    ) -> PowerOutcome {
+        if on == self.is_powered() {
+            return PowerOutcome::Unchanged;
+        }
+        if on {
+            // Confs first, while still off so `write_instance_conf`'s restart
+            // request is dropped by the gate rather than queued behind the starts
+            // below. This is what carries a profile change made while the EPOS was
+            // off into the instances that are about to load.
+            if let Err(e) = self.write_dsp_confs(mode) {
+                warn!("could not write the epos confs before switching on: {e}");
+            }
+            // `powered` is raised only after every instance has been verified up,
+            // not before. The gate has to stay closed while the instances start —
+            // the 5 s watchdog runs during this, and an open gate would let it see
+            // three absent nodes and queue restarts of units that are mid-start.
+            //
+            // It also has to stay closed if a start fails, because a flag that says
+            // "on" with instances down is the "on but not working" state. Left
+            // closed, the next long press is a retry rather than an off-then-on
+            // dance, and the ring is dark because the ring is the user's only
+            // evidence of what happened.
+            for role in INSTANCE_ROLES {
+                if !crate::audio::restart_epos_instance(role).await {
+                    // Roll back what did come up, so "off" keeps meaning "nothing
+                    // is running" and not "some of it is". Rolling forward instead
+                    // would leave an orphan voice or sidetone instance consuming
+                    // CPU for a chain nobody is playing through.
+                    for done in rollback_roles(role) {
+                        let _ = crate::audio::stop_epos_instance(done).await;
+                    }
+                    warn!("switching the epos on failed at {role}; left off");
+                    return PowerOutcome::Failed(role.to_string());
+                }
+            }
+            self.set_powered(true);
+            let routed = match self.enter_epos().await {
+                EnterOutcome::Entered(sink) => PowerOutcome::On(Some(sink)),
+                EnterOutcome::AlreadyHere => PowerOutcome::On(None),
+                other => {
+                    // The instances are up but nothing is playing through them.
+                    // Say so rather than reporting a success that is not one: the
+                    // ring will be dark, because the routing poll will find
+                    // playback elsewhere.
+                    warn!("epos instances started but playback did not route: {other:?}");
+                    PowerOutcome::OnNoPlayback
+                }
+            };
+            routed
+        } else {
+            // Move playback away before anything is stopped, and keep the plan:
+            // the caller runs it outside the lock.
+            let (_outcome, moves) = self.exit_epos().await;
+            self.set_powered(false);
+            for role in INSTANCE_ROLES.iter().rev() {
+                let _ = crate::audio::stop_epos_instance(role).await;
+            }
+            PowerOutcome::Off(moves)
+        }
+    }
+
+    /// A restart request while the EPOS is off would undo the thing the user
+    /// asked for: the watchdog would start an instance the long press had just
+    /// stopped, and the ring would light for audio nobody routed.
+    ///
+    /// This is the one gate that has to be here rather than at the call sites,
+    /// because the requests come from the watchdog loop, from config changes and
+    /// from the EQ slider, none of which know or care about the power state.
+    pub fn request_restart(&self, role: &str) {
+        if !self.is_powered() {
+            debug!("epos is off — not restarting {role}");
+            return;
+        }
+        // `restarts.request`, not another `request_restart`: this gate is the only
+        // thing between a caller and the bus, and calling itself here is an
+        // unbounded recursion that the "off" early return above hides completely
+        // until the EPOS is switched on - at which point the first config change
+        // would take the daemon down.
+        self.restarts.request(role);
+    }
+
     /// Record what the default sink is right now, for the LED and for "go back".
     pub fn note_default_sink(&self, sink: Option<&str>, on_epos: bool) {
         self.epos_in_use.store(on_epos, Ordering::Relaxed);
@@ -1087,13 +1357,6 @@ impl AudioPipeline {
         self.config = config;
     }
 
-    /// deduplicates and the worker debounces, so repeated requests for the same
-    /// role collapse into one restart.
-    pub fn request_instance_restart(&self, role: &str) {
-        debug!("Requesting epos instance restart: {role}");
-        self.restarts.request(role);
-    }
-
     /// Keep the EQ honest on the 5 s poll: verify the chain, repair the route,
     /// and ask for a restart if the chain is gone.
     ///
@@ -1114,6 +1377,16 @@ impl AudioPipeline {
     /// runs the batch with no lock held and comes back with
     /// [`Self::record_stream_moves`].
     pub async fn eq_plan(&self) -> Option<streams::StreamMovePlan> {
+        // While the EPOS is off there is no chain to watch, and this function's
+        // job on a missing chain is to put playback on the raw EPOS hardware and
+        // ask for a restart — both of which are the opposite of what the user
+        // asked for. It runs every 5 s, so returning here is also what keeps the
+        // two log lines below from being a lie: with the gate lower down they
+        // would still print "playback moved" and "requesting restart" on every
+        // outage poll while nothing had moved and nothing had been requested.
+        if !self.is_powered() {
+            return None;
+        }
         // Once per run, before anything can act on the ledger. It has to be a
         // separate read because a daemon restart does not restart PipeWire: the
         // indices are still ours, and until this ran they were forgotten, which is
@@ -1199,7 +1472,7 @@ impl AudioPipeline {
         }
         if decision.request_restart {
             warn!("EQ chain missing - requesting pipewire-epos@eq restart");
-            self.restarts.request("eq");
+            self.request_restart("eq");
         }
         plan
     }
@@ -1361,6 +1634,13 @@ impl AudioPipeline {
     }
 
     pub async fn maintain_instances(&self) {
+        // Stopped instances publish nothing, so every role would read as absent
+        // and the warning below would report an outage that is the state the user
+        // asked for. The restart request is already dropped by the gate; this
+        // stops the log from claiming one was made.
+        if !self.is_powered() {
+            return;
+        }
         let Some(list) = Self::main_node_list().await else {
             // Unusable probe: no evidence, so nothing is counted or restarted.
             return;
@@ -1388,7 +1668,7 @@ impl AudioPipeline {
                     "epos instance {role}: node '{node}' absent - requesting \
                      pipewire-epos@{role} restart"
                 );
-                self.restarts.request(role);
+                self.request_restart(role);
             }
         }
     }
@@ -1866,28 +2146,6 @@ impl AudioPipeline {
         Self::instance_conf_path(role).with_file_name("loaded.conf")
     }
 
-    /// Restart any instance that cannot be shown to be running the conf on disk.
-    ///
-    /// Replaces the previous unconditional startup restart of `eq` and `voice`,
-    /// which had two problems: it was a guess rather than a check, and it never
-    /// covered `sidetone`, so a lost sidetone restart stayed lost forever.
-    ///
-    /// Must run after `apply_full()`, which is what writes the confs being
-    /// compared against.
-    pub fn request_stale_instance_restarts(&self) {
-        for role in ["eq", "voice", "sidetone"] {
-            let desired = std::fs::read_to_string(Self::instance_conf_path(role)).ok();
-            let loaded = std::fs::read_to_string(Self::loaded_conf_path(role)).ok();
-            if conf_needs_restart(desired.as_deref(), loaded.as_deref()) {
-                info!(
-                    "{role}: no verified load of the conf on disk — requesting a \
-                     restart so the running instance provably matches the config"
-                );
-                self.request_instance_restart(role);
-            }
-        }
-    }
-
     /// Stamp the conf an instance was just verified to have loaded.
     ///
     /// Only ever called after the health check passed, so a stamp always
@@ -1929,7 +2187,7 @@ impl AudioPipeline {
         }
         write_atomic(&path, conf)?;
         info!("{} instance conf written to {}", role, path.display());
-        self.restarts.request(role);
+        self.request_restart(role);
         Ok(true)
     }
 
@@ -2065,6 +2323,19 @@ impl AudioPipeline {
     /// microphone), and when processing is switched off the raw source is
     /// restored so nothing is left pointing at a node that may go away.
     pub async fn route_input(&self) -> Result<bool> {
+        // While the EPOS is off, nothing may be pointed at a node that lives
+        // inside a stopped instance.
+        //
+        // This runs on the 5 s poll, so it is not a once-at-start-up question.
+        // The function already refuses to point at a voice source that is not
+        // published, and a stopped instance publishes nothing — so the rule holds
+        // on its own. This is here to make the intent explicit rather than
+        // dependent on that, because a mic silently left on a dead node is exactly
+        // the "looks configured, is not working" state this project keeps
+        // removing, and the next change to this function would not know.
+        if !self.is_powered() {
+            return Ok(false);
+        }
         let device_connected = self
             .device
             .as_ref()
@@ -2169,6 +2440,21 @@ impl AudioPipeline {
         &self,
         chain_present: Option<bool>,
     ) -> Result<bool> {
+        // Same rule as `route_input`: while the EPOS is off, the default sink is
+        // never moved onto it.
+        //
+        // This is the 5 s poll, so it is not a once-at-start-up question. Left to
+        // the decision below, an enabled-but-stopped EQ fails its chain probe and
+        // the route settles on the raw hardware — so switching the EPOS off would
+        // put the user on the headset, which is the opposite of what they asked
+        // for and not a state the LED could explain.
+        //
+        // `set_power` is unaffected: it marks the EPOS on before calling
+        // `enter_epos`, so the gate is already open by the time this runs on the
+        // way up.
+        if !self.is_powered() {
+            return Ok(false);
+        }
         let eq_enabled = self.config.eq.enabled;
         let device_connected = self
             .device
@@ -3503,28 +3789,18 @@ fn restart_due(missing_polls: u32) -> bool {
     missing_polls >= 1 && (missing_polls - 1).is_multiple_of(RESTART_RETRY_POLLS)
 }
 
-/// Must this role's instance be restarted before its conf can be trusted?
-///
-/// `desired` is the conf now on disk, `loaded` the conf an instance was last
-/// verified to have loaded. The question is not "did the file change" — that is
-/// what `write_instance_conf` already answers — but "is the running instance
-/// provably using what is on disk", which is the question that goes unanswered
-/// when a requested restart is lost.
-///
-/// Every uncertain case answers `true`, because the two mistakes are not
-/// equivalent: restarting an instance that was already correct costs a fraction
-/// of a second of DSP, while skipping one leaves a configured feature silently
-/// not working for good.
-pub(crate) fn conf_needs_restart(desired: Option<&str>, loaded: Option<&str>) -> bool {
-    match (desired, loaded) {
-        // No conf to run, so nothing to load. A leftover stamp cannot make this
-        // worse: the role has no work either way.
-        (None, _) => false,
-        // A conf with no verified load: there is no evidence of what is running.
-        (Some(_), None) => true,
-        (Some(desired), Some(loaded)) => desired != loaded,
-    }
-}
+// The cases below used to be an `if` in `conf_needs_restart`, consulted once at
+// start-up to ask whether a running instance was provably using the conf on
+// disk. The function is gone: the EPOS starts off, switching it on rewrites
+// every conf before starting every instance, and the restart gate drops
+// requests while it is off - so there is no window in which a stale instance
+// can be running.
+//
+// The cases are kept because if that ever changes, the answer to "does this
+// need a restart" has to be the answer it was. Every uncertain case answers
+// `true`, because the two mistakes are not equivalent: restarting an instance
+// that was already correct costs a fraction of a second of DSP, while skipping
+// one leaves a configured feature silently not working for good.
 
 /// Write `contents` to `path` atomically: a complete write to a sibling temp
 /// file, then a rename.
@@ -4785,6 +5061,143 @@ mod tests {
         refs
     }
 
+    /// The EPOS has to start off, and a long press has to be a toggle.
+    ///
+    /// This is the requested default: the headset does nothing until the user
+    /// asks for it, and asking twice puts it back. The state is not persisted,
+    /// so a reboot returns to off without anything having to remember to.
+    #[test]
+    fn the_epos_starts_off_and_a_long_press_toggles_it() {
+        // A pipeline that has never been told anything is off. Not "off because
+        // nothing has been asked yet" - off, which is the state that has to hold
+        // at every start-up.
+        let p = AudioPipeline::new(&AudioConfig::default());
+        assert!(!p.is_powered(), "the EPOS must not be on before the user asks");
+        assert_eq!(desired_power(false), PowerAction::TurnOn);
+        assert_eq!(desired_power(true), PowerAction::TurnOff);
+    }
+
+    /// While the EPOS is off the ring must be dark, whatever the routing poll
+    /// says.
+    ///
+    /// `in_use` comes from the default sink, and at start-up the default sink can
+    /// still be `epos-eq-processed` from the previous session until the daemon
+    /// moves it. A ring coloured for a headset whose instances are stopped is the
+    /// "on but not working" state: it says a mode is active when nothing can
+    /// play through it.
+    #[test]
+    fn the_ring_is_dark_while_the_epos_is_off_even_if_the_sink_says_otherwise() {
+        use epos_shared::config::AudioMode;
+        assert_eq!(
+            indicator_for_power(AudioMode::Surround71, false, true),
+            crate::led::LedIndicator::Unused,
+            "a stopped EPOS must not light the ring, whatever the sink says"
+        );
+        assert_eq!(
+            indicator_for_power(AudioMode::Stereo, false, false),
+            crate::led::LedIndicator::Unused
+        );
+        // Powered and in use is the only case that shows a colour.
+        assert_eq!(
+            indicator_for_power(AudioMode::Surround71, true, true),
+            crate::led::LedIndicator::InUse(AudioMode::Surround71)
+        );
+        // Powered but playback elsewhere is still dark - the ring must not claim
+        // a mode for audio that is not going through the EPOS.
+        assert_eq!(
+            indicator_for_power(AudioMode::Surround71, true, false),
+            crate::led::LedIndicator::Unused
+        );
+    }
+
+    /// A restart request while the EPOS is off must not start anything.
+    ///
+    /// This is the gate that makes the whole thing hold. The requests come from
+    /// the watchdog loop, from config changes and from the EQ slider, and each of
+    /// them would otherwise restart an instance the user had just switched off -
+    /// the instance comes back, its node is published, and the next routing poll
+    /// finds playback on it and lights the ring for a headset that is supposed to
+    /// be off.
+    #[test]
+    fn no_restart_is_requested_while_the_epos_is_off() {
+        let p = AudioPipeline::new(&AudioConfig::default());
+        for role in ["eq", "voice", "sidetone"] {
+            p.request_restart(role);
+        }
+        assert!(
+            p.restarts.drain().is_empty(),
+            "a request made while off must not be queued, or the watchdog will \
+             start what the long press stopped"
+        );
+    }
+
+    /// The gate must actually reach the bus when the EPOS is on.
+    ///
+    /// This exists because the gate was first written calling itself. With the
+    /// EPOS off the early return hid it completely - every test stayed green, and
+    /// the stack overflow would have happened on the first config change *after*
+    /// the user switched the EPOS on. The "off" half of the previous test cannot
+    /// see it, so the "on" half has to be its own.
+    #[test]
+    fn a_restart_while_the_epos_is_on_reaches_the_bus() {
+        let p = AudioPipeline::new(&AudioConfig::default());
+        p.set_powered(true);
+        for role in ["eq", "voice", "sidetone"] {
+            p.request_restart(role);
+        }
+        let pending = p.restarts.drain();
+        assert_eq!(
+            pending,
+            ["eq", "sidetone", "voice"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            "a request made while on must be queued; if this test overflows the \
+             stack, the gate is calling itself"
+        );
+        // And the queue is drained, so a second drain is empty rather than
+        // replaying the same work.
+        assert!(p.restarts.drain().is_empty());
+    }
+
+    /// A failure partway through switching the EPOS on must leave nothing
+    /// running, or "off" stops meaning what it says.
+    ///
+    /// `set_power` itself cannot be unit tested — it drives real systemd units —
+    /// so the part that decides what to undo is pulled out as `rollback_roles` and
+    /// pinned here.
+    #[test]
+    fn a_failed_switch_on_rolls_back_every_instance_that_did_come_up() {
+        // Start order is voice, sidetone, eq. The eq failing means the two before
+        // it are up and have to go back down, in the reverse order they came up so
+        // the sink is pulled before the graph it sits in.
+        assert_eq!(rollback_roles("eq"), ["sidetone", "voice"]);
+        // The sidetone failing means only voice is up.
+        assert_eq!(rollback_roles("sidetone"), ["voice"]);
+        // Voice is first, so nothing is up when it fails.
+        assert!(rollback_roles("voice").is_empty());
+        // A name that is not a role has no partial start, and must not be allowed
+        // to tear down instances that are not involved.
+        assert!(rollback_roles("eq-typo").is_empty());
+        // Every role's rollback is a prefix of the start order, which is what
+        // makes it exhaustive: nothing that came up can be missing.
+        for (i, role) in INSTANCE_ROLES.iter().enumerate() {
+            let rolled = rollback_roles(role);
+            assert_eq!(
+                rolled.len(),
+                i,
+                "{role} failed with {i} already up, so {i} must come back down"
+            );
+            for (j, r) in rolled.iter().enumerate() {
+                assert_eq!(
+                    *r,
+                    INSTANCE_ROLES[i - 1 - j],
+                    "{role}: rollback must be the start order reversed"
+                );
+            }
+        }
+    }
+
     /// Every port the graph mentions must belong to a node the graph declares.
     ///
     /// This is the invariant a 7.1 chain with the EQ switched off broke. With no
@@ -5485,6 +5898,35 @@ mod tests {
     // Every failure mode points the same way, at restarting something that was
     // already fine: a missing or unreadable stamp counts as stale, and a stamp
     // is only written once a load has actually been verified.
+
+    /// The rule these tests pin, kept here rather than on the pipeline.
+    ///
+    /// It was `conf_needs_restart` on the pipeline, consulted once at start-up. It
+    /// is a test-module function now: the EPOS starts off, switching it on rewrites
+    /// every conf before starting every instance, and the restart gate drops
+    /// requests while it is off, so no running instance can be stale and there is
+    /// nothing left for the pipeline to ask. The rule survives because if that ever
+    /// changes, the answer has to be the same one.
+    ///
+    /// `desired` is the conf on disk, `loaded` the conf an instance was last
+    /// verified to have loaded. The question is not "did the file change" - that is
+    /// what `write_instance_conf` answers - but "is the running instance provably
+    /// using what is on disk", which goes unanswered when a restart is lost.
+    ///
+    /// Every uncertain case answers `true`: restarting an instance that was already
+    /// correct costs a fraction of a second of DSP, while skipping one leaves a
+    /// configured feature silently not working for good.
+    fn conf_needs_restart(desired: Option<&str>, loaded: Option<&str>) -> bool {
+        match (desired, loaded) {
+            // No conf to run, so nothing to load. A leftover stamp cannot make
+            // this worse: the role has no work either way.
+            (None, _) => false,
+            // A conf, and no record of a load: no evidence of what is running, so
+            // it might be an older one.
+            (Some(_), None) => true,
+            (Some(desired), Some(loaded)) => desired != loaded,
+        }
+    }
 
     /// A role that has never recorded a verified load is restarted, because
     /// there is no evidence of what it is running.

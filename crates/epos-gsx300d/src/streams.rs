@@ -114,7 +114,10 @@ pub fn capped(indices: Vec<u32>, cap: usize) -> (Vec<u32>, usize) {
 /// Why it is split: one command per stream at a 5 s budget is minutes of waiting,
 /// and holding the state lock across that freezes IPC, the config watcher and the
 /// volume watcher. Deciding is cheap and quick; running the commands is not.
-#[derive(Debug)]
+// Clone and PartialEq because a plan now travels out of the power toggle in the
+// result type, which tests compare. It is plain data - a name, a list of indices
+// and a cookie - so there is nothing in it to be careful with.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamMovePlan {
     /// Where they are going: the raw device for a rescue, the EQ anchor for a
     /// return. A name, never an index, because sink indices are recycled.

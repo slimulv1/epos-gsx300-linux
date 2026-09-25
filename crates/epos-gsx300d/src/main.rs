@@ -95,24 +95,24 @@ async fn main() -> Result<()> {
     let mut audio = AudioPipeline::new(&config.audio);
     if let Some(ref d) = device {
         audio.set_device(d);
-        if let Err(e) = audio.apply_full(config.mode).await {
-            warn!("Failed to apply initial audio config: {}", e);
-        }
-        // Make the running instances a function of the config, deterministically.
-        //
-        // `write_instance_conf` only requests a restart when the file bytes
-        // changed, which cannot detect an instance running an OLDER conf whose
-        // file already matches — the state a lost restart leaves behind, and the
-        // one the watchdog cannot see either, since the node is published either
-        // way. Each instance records the conf it was last verified to have
-        // loaded, and anything that does not match what is on disk is restarted
-        // now.
-        //
-        // This replaces an unconditional restart of `eq` and `voice`, which was
-        // a guess rather than a check and never covered `sidetone` at all, so a
-        // lost sidetone restart stayed lost for good.
-        audio.request_stale_instance_restarts();
     }
+    // The EPOS starts OFF, and stays off until a long press on the smart button.
+    // So the startup path does the opposite of what it used to: no `apply_full`,
+    // no stale-conf restarts, and the instances are stopped.
+    //
+    // Called outside the device check above, deliberately. The units are
+    // `WantedBy=graphical-session.target` and enabled, so systemd has already
+    // started them by the time this runs, and it does that whether or not the
+    // headset was detected. Leaving them up because "no device was found" would
+    // give exactly the state this change exists to remove: three DSP instances
+    // publishing nodes, a dark ring, and no audio anywhere — off as it looks,
+    // running as it is.
+    //
+    // They are stopped rather than disabled. Disabling would be a persistent
+    // change to the installation, and if the daemon then failed to start, the
+    // headset could never be brought up at all. Stopping is a statement this
+    // daemon can always take back.
+    audio.park_epos_at_startup().await;
 
     // HID event channel: reader thread → async handler task
     let (hid_tx, mut hid_rx) = mpsc::unbounded_channel::<HidEvent>();
@@ -191,86 +191,86 @@ async fn main() -> Result<()> {
                 // and do exactly what a click does, which made the two
                 // indistinguishable and left nothing to act on.
                 //
-                // It leaves the EPOS: put playback back on a device that is not
-                // ours, which by the route rule takes the EQ out of the path and
-                // darkens the ring.
+                // A long press - the device's own 0x04 report, measured at ~2 s on
+                // hardware - is the power switch. A short press runs whichever
+                // action is configured (cycle preset, toggle mode, and so on);
+                // the two are separate gestures and never both fire for one press.
+                //
+                // It used to be a routing-only toggle: it moved the default sink
+                // but left the three instances running. That was a different
+                // gesture answering a different question, and it could not express
+                // the one the user has now - the EPOS being off, with nothing
+                // running behind it.
                 HidEvent::LongPress => {
-                    // A toggle, not an exit. Asking to leave while already away was
-                    // the state this button was in for its whole life: five presses
-                    // in a row logged "playback is already off the EPOS" and the
-                    // ring stayed dark, because the only way onto the EPOS was the
-                    // GUI. The direction is decided by `toggle_epos` from
-                    // `is_epos_sink`, never from the cached in-use flag, which lags
-                    // a poll.
-                    //
-                    // Read lock, not write. This branch runs pactl with a 5s budget
-                    // per command while holding it, and a write lock here freezes
-                    // every IPC request, the config watcher and the volume watcher
-                    // for the duration. Nothing here writes the state: the sequence
-                    // counter is an atomic and the LED sync reads the pipeline.
-                    let result = {
+                    // Read lock, not write: this branch runs systemctl and pactl
+                    // with multi-second budgets, and a write lock held across that
+                    // freezes every IPC request, the config watcher and the volume
+                    // watcher. Nothing here writes the state - the sequence counter
+                    // is an atomic and the pipeline owns `powered`.
+                    let outcome = {
                         let st = s.read().await;
                         st.smart_button_seq
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        st.audio.toggle_epos().await
+                        let want = audio::desired_power(st.audio.is_powered());
+                        // The mode comes in with the request: the confs are
+                        // rewritten as the EPOS comes on, so a 7.1 profile chosen
+                        // while it was off builds the 7.1 graph, not a stereo one.
+                        let mode = st.config.mode;
+                        st.audio
+                            .set_power(want == audio::PowerAction::TurnOn, mode)
+                            .await
                     };
-                    let audio::ToggleResult { outcome, moves } = result;
-                    // Leaving the EPOS has to move the audio with it: changing the
-                    // default only steers streams opened afterwards, and a stream
-                    // the rescue pinned with `move-sink-input` keeps playing on the
-                    // EPOS hardware. Measured: the EPOS DAC carried a louder signal
-                    // than the speakers the user was listening on.
+                    // The plan comes back with the outcome rather than being run
+                    // inside `set_power`, which is called under a read lock.
                     //
-                    // The moves run here with no lock held, for the same reason the
-                    // EQ rescue's do: one subprocess per stream at a 5s budget, and a
-                    // read lock held across that freezes IPC and every watcher. The
-                    // scope above has closed, so taking a lock again cannot nest.
+                    // It has to be the one `set_power` produced. Calling
+                    // `toggle_epos` again here to fetch a second plan was the
+                    // first version, and it is wrong twice over: `set_power` has
+                    // already moved the default by the time this runs, so the
+                    // second exit finds nothing left to do and returns no plan at
+                    // all - and the streams stay on the EPOS hardware, which is
+                    // the exact failure the plan exists to prevent.
+                    let moves = match &outcome {
+                        audio::PowerOutcome::Off(plan) => plan.clone(),
+                        _ => None,
+                    };
+                    // The moves run here with no lock held: one subprocess per
+                    // stream at a 5 s budget, and a read lock held across that
+                    // freezes IPC and every watcher.
                     if let Some(plan) = moves {
                         let moved = AudioPipeline::run_stream_moves(&plan).await;
                         let st = s.read().await;
                         st.audio.record_stream_moves(&plan, moved);
                     }
                     // The ring is the answer to "am I on the EPOS", so it is
-                    // corrected here rather than up to a poll later. That needs the
-                    // write lock, so it is a second short scope after the first has
-                    // closed - the two must not nest, or the queued writer deadlocks
-                    // against the read this task is still holding.
-                    if matches!(
-                        outcome,
-                        audio::ToggleOutcome::Entered(_) | audio::ToggleOutcome::Left(_)
-                    ) {
+                    // corrected here rather than up to a poll later. A second
+                    // short scope, after the first has closed - the two must not
+                    // nest or the queued writer deadlocks.
+                    {
                         let mut st = s.write().await;
                         st.sync_led();
                     }
                     match outcome {
-                        audio::ToggleOutcome::Entered(sink) => {
-                            info!("Smart button long press: entered the EPOS via {sink}");
+                        audio::PowerOutcome::On(Some(sink)) => {
+                            info!("Smart button long press: EPOS on, playback via {sink}")
                         }
-                        audio::ToggleOutcome::Left(sink) => {
-                            info!("Smart button long press: left the EPOS for {sink}");
+                        audio::PowerOutcome::On(None) => {
+                            info!("Smart button long press: EPOS on, playback was already on it")
                         }
-                        audio::ToggleOutcome::AlreadyHere => {
-                            info!("Smart button long press: playback is already on the EPOS")
+                        audio::PowerOutcome::OnNoPlayback => warn!(
+                            "Smart button long press: the EPOS instances started but playback \
+                             did not route to them; the ring stays dark"
+                        ),
+                        audio::PowerOutcome::Off(plan) => info!(
+                            "Smart button long press: EPOS off, instances stopped{}",
+                            if plan.is_some() { ", playback moving away" } else { "" }
+                        ),
+                        audio::PowerOutcome::Unchanged => {
+                            info!("Smart button long press: EPOS was already in that state")
                         }
-                        audio::ToggleOutcome::AlreadyAway => {
-                            info!("Smart button long press: playback is already off the EPOS")
+                        audio::PowerOutcome::Failed(role) => {
+                            warn!("Smart button long press: epos instance {role} did not come up")
                         }
-                        audio::ToggleOutcome::NoDevice => warn!(
-                            "Smart button long press: no EPOS sink name is known, so the \
-                             default was left alone"
-                        ),
-                        audio::ToggleOutcome::NotPublished(sink) => warn!(
-                            "Smart button long press: the EPOS sink {sink} is not published, \
-                             so the default was left alone"
-                        ),
-                        audio::ToggleOutcome::NowhereToGo => warn!(
-                            "Smart button long press: no other published sink to go to, \
-                             so the default was left alone"
-                        ),
-                        audio::ToggleOutcome::CouldNotDecide => warn!(
-                            "Smart button long press: the sink list could not be read, \
-                             so the default was left alone"
-                        ),
                     }
                 }
                 HidEvent::ModeChanged(_) => {
@@ -961,25 +961,46 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
                         st.audio.update_config(&audio_cfg);
                         // Read the mode before the mutable borrow of `st.audio`.
                         let mode = st.config.mode;
-                        match st.audio.apply_full(mode).await {
-                            Ok(true) => debug!("audio conf changed - instance restart enqueued"),
-                            Ok(false) => debug!("audio conf unchanged - no instance restart"),
-                            Err(e) => warn!("Failed to apply config on first connect: {}", e),
+                        // Only when the EPOS is on. The confs are written
+                        // unconditionally - they are just text on disk, and the
+                        // long press writes them again anyway - but asking for a
+                        // restart while off would start an instance the user has
+                        // not asked for. The gate inside the pipeline drops it,
+                        // and this makes that visible rather than relying on it.
+                        if st.audio.is_powered() {
+                            match st.audio.apply_full(mode).await {
+                                Ok(true) => debug!("audio conf changed - instance restart enqueued"),
+                                Ok(false) => debug!("audio conf unchanged - no instance restart"),
+                                Err(e) => warn!("Failed to apply config on first connect: {}", e),
+                            }
                         }
                     }
                     st.device = device;
-                    // Boot with the device already plugged: the steady-state
-                    // branch never calls apply_full, so the output route has to
-                    // be asserted here or a persisted EQ=on would be ignored
-                    // until the next toggle.
-                    if let Err(e) = st.audio.route_output().await {
-                        warn!("Failed to route output on boot: {}", e);
-                    }
-                    // And the capture route, for the same reason: a persisted
-                    // voice mode must be live from the first poll, not only
-                    // after the user toggles something.
-                    if let Err(e) = st.audio.route_input().await {
-                        warn!("Failed to route input on boot: {}", e);
+                    // Both routes, and the config, are skipped while the EPOS is
+                    // off — which at this point in the process it always is.
+                    //
+                    // These used to run unconditionally, and they are what made a
+                    // headset appearing after boot switch itself on. The EPOS is
+                    // off because the user has not asked for it, and connecting a
+                    // device is not asking. Everything the long press needs is
+                    // still done there: the device is recorded, so `set_power` can
+                    // start the instances when it comes.
+                    if st.audio.is_powered() {
+                        // Boot with the device already plugged: the steady-state
+                        // branch never calls apply_full, so the output route has
+                        // to be asserted here or a persisted EQ=on would be
+                        // ignored until the next toggle.
+                        if let Err(e) = st.audio.route_output().await {
+                            warn!("Failed to route output on boot: {}", e);
+                        }
+                        // And the capture route, for the same reason: a persisted
+                        // voice mode must be live from the first poll, not only
+                        // after the user toggles something.
+                        if let Err(e) = st.audio.route_input().await {
+                            warn!("Failed to route input on boot: {}", e);
+                        }
+                    } else {
+                        debug!("epos is off — leaving routing alone until it is switched on");
                     }
                     continue;
                 }

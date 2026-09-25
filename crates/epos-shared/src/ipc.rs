@@ -127,6 +127,16 @@ pub enum Response {
         active_profile: String,
         mode: AudioMode,
         smart_button_action: String,
+        /// Whether the EPOS is engaged at all.
+        ///
+        /// False from daemon start until a long press on the smart button, and
+        /// never persisted, so a reboot returns to off. Distinct from
+        /// `eq_in_path`, which asks whether audio is going through the chain
+        /// *right now*: with the EPOS off the instances are stopped, so the
+        /// chain does not exist and `eq_in_path` is trivially false. A GUI that
+        /// showed the equaliser as available and adjustable while the headset was
+        /// switched off would be describing a control that does nothing.
+        epos_powered: bool,
         sidetone_enabled: bool,
         noise_gate_enabled: bool,
         voice_enhancer_enabled: bool,

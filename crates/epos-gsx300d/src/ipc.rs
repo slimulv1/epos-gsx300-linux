@@ -204,7 +204,11 @@ impl IpcState {
     /// the routing poll's answer, read once and shared, so this cannot disagree
     /// with the audio.
     pub fn sync_led(&mut self) {
-        let indicator = crate::led::indicator_for(self.config.mode, self.audio.epos_in_use());
+        let indicator = crate::audio::indicator_for_power(
+            self.config.mode,
+            self.audio.is_powered(),
+            self.audio.epos_in_use(),
+        );
         let Some(ref mut led) = self.led else { return };
         if let Err(e) = led.set_indicator(indicator) {
             warn!("Failed to set LED indicator: {}", e);
@@ -475,6 +479,7 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
                 eq_in_path: state.audio.eq_in_path_now().await,
                 active_profile: state.config.active_profile.clone(),
                 mode: state.config.mode,
+                epos_powered: state.audio.is_powered(),
                 smart_button_action: serde_json::to_string(&state.config.smart_button.action)
                     .unwrap_or_else(|_| "\"toggle_mode\"".into())
                     .trim_matches('"')
