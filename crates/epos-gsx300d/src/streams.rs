@@ -88,12 +88,78 @@ pub fn streams_to_rescue(streams: &[RescueStream], anchor_index: u32) -> Vec<u32
 
 // ─── Back: the return ────────────────────────────────────────────
 
+/// The most `move-sink-input` commands one plan may carry.
+///
+/// Each command gets the full probe budget, so an unbounded batch could hold the
+/// watchdog for minutes. The graph has tens of streams, not thousands, so the cap
+/// is not expected to bite; when it does, the streams that did not fit stay put
+/// and are named in the log rather than silently left behind.
+pub const MAX_STREAM_MOVES: usize = 32;
+
+/// Apply [`MAX_STREAM_MOVES`], reporting how many did not fit.
+///
+/// A separate function so the number left behind is something the caller can log.
+/// Silently truncating would turn a bounded batch into a quiet data-loss bug.
+pub fn capped(indices: Vec<u32>, cap: usize) -> (Vec<u32>, usize) {
+    if indices.len() <= cap {
+        return (indices, 0);
+    }
+    let dropped = indices.len() - cap;
+    (indices.into_iter().take(cap).collect(), dropped)
+}
+
+/// A batch of `move-sink-input` commands, decided under the state lock and run
+/// outside it.
+///
+/// Why it is split: one command per stream at a 5 s budget is minutes of waiting,
+/// and holding the state lock across that freezes IPC, the config watcher and the
+/// volume watcher. Deciding is cheap and quick; running the commands is not.
+#[derive(Debug)]
+pub struct StreamMovePlan {
+    /// Where they are going: the raw device for a rescue, the EQ anchor for a
+    /// return. A name, never an index, because sink indices are recycled.
+    pub destination: String,
+    pub indices: Vec<u32>,
+    /// The PipeWire session the indices were read in. `None` means the cookie
+    /// could not be read, in which case nothing may be recorded.
+    pub cookie: Option<String>,
+    /// True for a return, false for a rescue.
+    pub returning: bool,
+}
+
+/// What running a plan actually achieved.
+#[derive(Debug, Default)]
+pub struct StreamMoveResult {
+    pub moved: Vec<u32>,
+    pub failed: Vec<u32>,
+    /// The session afterwards. A change from the plan's means PipeWire restarted
+    /// mid-plan, so the indices no longer mean what they meant.
+    pub cookie: Option<String>,
+}
+
 /// One stream's sink, as resolved by the caller from a listing.
-#[allow(dead_code)] // The return path is the next commit; nothing calls this yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamOnSink {
     pub index: u32,
     pub sink_index: u32,
+}
+
+/// Parse `pactl list short sink-inputs` into (index, sink) pairs.
+///
+/// Column 2 is the sink, not the client. Measured on this machine, a stream
+/// sitting on sink 33 lists as `11958  33  -  PipeWire  float32le 2ch 48000Hz`,
+/// and an earlier version of this compared the second column to a sink *name*,
+/// matched nothing, and reported a rescue that had moved nothing.
+pub fn parse_stream_sinks(listing: &str) -> Vec<StreamOnSink> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let mut f = line.split_whitespace();
+            let index = f.next()?.parse::<u32>().ok()?;
+            let sink_index = f.next()?.parse::<u32>().ok()?;
+            Some(StreamOnSink { index, sink_index })
+        })
+        .collect()
 }
 
 /// The streams to bring back onto the anchor, from those still parked on
@@ -109,7 +175,6 @@ pub struct StreamOnSink {
 ///
 /// The caller keeps ownership of the set; this only reads it, so a caller that
 /// fails to move some streams can retry them without losing the ones that worked.
-#[allow(dead_code)] // The return path is the next commit; nothing calls this yet.
 pub fn streams_to_return(
     rescued: &BTreeSet<u32>,
     present: &[StreamOnSink],
@@ -126,7 +191,6 @@ pub fn streams_to_return(
 ///
 /// Parsed rather than grepped by the caller, so "there is no cookie" is a value
 /// the type can express and the decision to discard indices can be made on it.
-#[allow(dead_code)] // The return path is the next commit; nothing calls this yet.
 pub fn session_cookie(pactl_info: &str) -> Option<&str> {
     pactl_info.lines().find_map(|line| {
         let rest = line.trim().strip_prefix("Cookie:")?;
@@ -135,9 +199,67 @@ pub fn session_cookie(pactl_info: &str) -> Option<&str> {
     })
 }
 
+/// Why a finished plan's indices must not be remembered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscardReason {
+    /// No command succeeded, so there is nothing to remember.
+    NothingMoved,
+    /// The session changed while the commands ran.
+    SessionChanged,
+    /// No session cookie was available, so the indices cannot be tied to one.
+    NoCookie,
+}
+
+/// What a finished plan means for the ledger.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RecordAction {
+    /// Do not remember these indices, for this reason.
+    Discard(DiscardReason),
+    /// Remember these as rescued, waiting to go back.
+    Rescue(Vec<u32>),
+    /// Forget these as rescued: they are home.
+    Return(Vec<u32>),
+}
+
+/// Decide what a finished plan means for the ledger.
+///
+/// Three ways a move must not be remembered, and they are different failures:
+///
+/// * the session changed while the commands ran, so the numbers now belong to
+///   whatever took their place — and the moves themselves may have hit the wrong
+///   streams, which no check here can undo;
+/// * no cookie was available at all, so the indices cannot be tied to a session
+///   and the return path would refuse them anyway;
+/// * nothing moved.
+///
+/// The first two are the difference between an outage the user can see and
+/// somebody else's audio being moved on a later poll, so each is named instead of
+/// being folded into a bool. Order matters: a changed session is reported as
+/// that, not as a missing cookie.
+pub fn record_action(
+    plan_cookie: Option<&str>,
+    after_cookie: Option<&str>,
+    moved: &[u32],
+    returning: bool,
+) -> RecordAction {
+    if moved.is_empty() {
+        return RecordAction::Discard(DiscardReason::NothingMoved);
+    }
+    if plan_cookie != after_cookie {
+        return RecordAction::Discard(DiscardReason::SessionChanged);
+    }
+    if plan_cookie.is_none() {
+        return RecordAction::Discard(DiscardReason::NoCookie);
+    }
+    if returning {
+        RecordAction::Return(moved.to_vec())
+    } else {
+        RecordAction::Rescue(moved.to_vec())
+    }
+}
+
 /// What the daemon remembers about streams it moved, and whether it may still act.
 #[derive(Debug, Default)]
-#[allow(dead_code)] // The return path is the next commit; nothing calls this yet.
 pub struct StreamLedger {
     rescued: BTreeSet<u32>,
     /// The PipeWire session those indices belong to.
@@ -147,7 +269,6 @@ pub struct StreamLedger {
     cap: usize,
 }
 
-#[allow(dead_code)] // The return path is the next commit; nothing calls this yet.
 impl StreamLedger {
     pub fn new(cap: usize) -> Self {
         Self {
@@ -169,6 +290,16 @@ impl StreamLedger {
         }
         self.cookie = cookie.map(str::to_string);
         changed
+    }
+
+    /// Is this the session the recorded indices belong to?
+    ///
+    /// False when we never got a cookie. Indices recorded without one cannot be
+    /// shown to belong to the current session, so the return path refuses to act
+    /// on them: leaving audio on the bypassed device is recoverable, moving
+    /// somebody else's stream is not.
+    pub fn same_session(&self, cookie: Option<&str>) -> bool {
+        self.cookie.is_some() && self.cookie.as_deref() == cookie
     }
 
     /// Record streams the daemon has just moved, for this session.
@@ -285,6 +416,62 @@ mod tests {
         assert!(!is_own_node("Firefox"));
     }
 
+    // ─── The command cap ────────────────────────────────────────────
+
+    /// Under the cap, nothing is dropped and nothing is reported.
+    #[test]
+    fn a_batch_within_the_cap_is_untouched() {
+        assert_eq!(capped(vec![1, 2, 3], 4), (vec![1, 2, 3], 0));
+    }
+
+    /// Over the cap, the overflow is counted rather than vanishing. A silent
+    /// truncation would turn a bounded batch into quiet data loss.
+    #[test]
+    fn an_oversized_batch_says_how_many_were_left_behind() {
+        let (kept, dropped) = capped(vec![1, 2, 3, 4, 5], 3);
+        assert_eq!(kept, vec![1, 2, 3]);
+        assert_eq!(dropped, 2, "the two that did not fit must be reported");
+    }
+
+    /// The cap the daemon ships with is a number, not an aspiration: it is the
+    /// difference between one poll and a watchdog that cannot keep up.
+    #[test]
+    fn the_shipped_cap_is_bounded() {
+        assert!(MAX_STREAM_MOVES > 0 && MAX_STREAM_MOVES <= 64);
+    }
+
+    // ─── Reading the short listing ──────────────────────────────────
+
+    /// Column 2 is the sink. This is the shape that made an earlier rescue match
+    /// nothing: it compared the second column against a sink name.
+    #[test]
+    fn the_short_listing_gives_index_and_sink() {
+        // Measured from `pactl list short sink-inputs` on this machine.
+        let listing = "37\t1374\t-\tPipeWire\tfloat32le 2ch 48000Hz\n\
+                       8602\t4786\t-\tPipeWire\tfloat32le 2ch 48000Hz\n\
+                       11958\t33\t-\tPipeWire\tfloat32le 2ch 48000Hz\n";
+        assert_eq!(
+            parse_stream_sinks(listing),
+            vec![
+                StreamOnSink { index: 37, sink_index: 1374 },
+                StreamOnSink { index: 8602, sink_index: 4786 },
+                StreamOnSink { index: 11958, sink_index: 33 },
+            ]
+        );
+    }
+
+    /// A truncated or error line must not become a stream with index 0, which is
+    /// a real index and would be moved like any other.
+    #[test]
+    fn an_unparsable_line_is_skipped_not_zeroed() {
+        let listing = "garbage\n7\t33\t-\tPipeWire\tfloat32le 2ch 48000Hz\n";
+        assert_eq!(
+            parse_stream_sinks(listing),
+            vec![StreamOnSink { index: 7, sink_index: 33 }]
+        );
+        assert!(parse_stream_sinks("").is_empty());
+    }
+
     // ─── The return decision ────────────────────────────────────────
 
     /// The normal case: what we parked on raw comes back.
@@ -338,6 +525,68 @@ mod tests {
         assert_eq!(session_cookie("Cookie:\n"), None);
     }
 
+    // ─── Recording a finished plan ─────────────────────────────────
+
+    /// A rescue that moved streams records them.
+    #[test]
+    fn a_rescue_is_recorded() {
+        assert_eq!(
+            record_action(Some("c1"), Some("c1"), &[38, 71], false),
+            RecordAction::Rescue(vec![38, 71])
+        );
+    }
+
+    /// A return that moved streams forgets them.
+    #[test]
+    fn a_return_is_forgotten() {
+        assert_eq!(
+            record_action(Some("c1"), Some("c1"), &[38], true),
+            RecordAction::Return(vec![38])
+        );
+    }
+
+    /// A session that changed while the commands ran invalidates the indices.
+    /// They now name whatever took their place, and a later return would move
+    /// that.
+    #[test]
+    fn a_session_change_during_the_move_discards_the_indices() {
+        assert_eq!(
+            record_action(Some("c1"), Some("c2"), &[38], false),
+            RecordAction::Discard(DiscardReason::SessionChanged)
+        );
+    }
+
+    /// No cookie at all means the indices cannot be tied to a session. Failing
+    /// closed here leaves audio on the bypassed device, which the user can see.
+    #[test]
+    fn no_cookie_discards_rather_than_guesses() {
+        assert_eq!(
+            record_action(None, None, &[38], false),
+            RecordAction::Discard(DiscardReason::NoCookie)
+        );
+    }
+
+    /// A session change is reported as that, not as the missing cookie it also
+    /// is. The reason is what the log says, and the actionable one is the
+    /// restart.
+    #[test]
+    fn a_changed_session_is_not_reported_as_a_missing_cookie() {
+        assert_eq!(
+            record_action(None, Some("c2"), &[38], false),
+            RecordAction::Discard(DiscardReason::SessionChanged)
+        );
+    }
+
+    /// Nothing moved, nothing to remember — and notably this is not a safety
+    /// discard, so the ledger keeps what it already held.
+    #[test]
+    fn an_empty_move_is_not_a_safety_discard() {
+        assert_eq!(
+            record_action(Some("c1"), Some("c1"), &[], false),
+            RecordAction::Discard(DiscardReason::NothingMoved)
+        );
+    }
+
     // ─── The ledger ─────────────────────────────────────────────────
 
     /// A new PipeWire session invalidates every index held. Acting on them would
@@ -358,6 +607,16 @@ mod tests {
         ledger.note_rescued(&[2628], Some("first"));
         assert!(!ledger.session_changed(Some("first")));
         assert_eq!(ledger.len(), 1);
+    }
+
+    /// A ledger that never got a cookie cannot prove its indices belong to the
+    /// current session, so the return path must refuse to act on it.
+    #[test]
+    fn a_ledger_without_a_cookie_matches_no_session() {
+        let mut ledger = StreamLedger::new(64);
+        ledger.note_rescued(&[38], None);
+        assert!(!ledger.same_session(None));
+        assert!(!ledger.same_session(Some("anything")));
     }
 
     /// Recording under a different cookie than we hold starts from empty rather

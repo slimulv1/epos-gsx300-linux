@@ -923,7 +923,7 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
             //
             // A read lock lets the 3s status poll run alongside.
             drop(st);
-            {
+            let plan = {
                 let st = state.read().await;
             // Re-assert the capture route on every poll. The processed mic
             // node only exists once the voice instance has restarted and
@@ -937,9 +937,11 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
             // Watchdog for the EQ. route_output() only ran on connect and on
             // boot, so a chain that died in between left the default sink on
             // `epos-eq-input` — a null-sink that still accepts streams, i.e.
-            // silence with no diagnostic. maintain_eq() verifies the chain,
+            // silence with no diagnostic. eq_plan() verifies the chain,
             // falls back to raw hardware if it is gone, and asks for a restart.
-            st.audio.maintain_eq().await;
+            // back, falls back to raw hardware if it is gone, asks for a restart,
+            // and hands back the stream moves it wants made.
+            let plan = st.audio.eq_plan().await;
             // Watchdog for the roles the EQ watcher does not cover. A MAIN
             // `pipewire.service` restart drops every cross-daemon instance's
             // link, and `voice`/`sidetone` previously stayed silent-but-apparently
@@ -953,6 +955,22 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
             // not to the DSP instances, so the honest thing to do is stop
             // claiming that a microphone which is not delivering audio is a
             // healthy one.
+            plan
+            };
+            // The moves run here, with no lock held. Each one is a `pactl
+            // move-sink-input` at a 5 s budget and there is one per stream
+            // playing, so this can be minutes of subprocess time. Under the read
+            // lock above, tokio's write-preferring FIFO would park every IPC
+            // request, the config watcher and the volume watcher for the whole
+            // of it - the same freeze the microphone capture used to cause.
+            //
+            // Like the capture below, this scope must not nest with the one
+            // above: a queued writer cannot be granted while this task holds a
+            // read, so a second read taken while the first is alive deadlocks.
+            if let Some(plan) = plan {
+                let result = AudioPipeline::run_stream_moves(&plan).await;
+                let st = state.read().await;
+                st.audio.record_stream_moves(&plan, result);
             }
             // The microphone probe captures audio for about 2.7 seconds, and it
             // runs here with no state lock held at all.

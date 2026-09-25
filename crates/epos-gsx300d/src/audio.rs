@@ -66,6 +66,16 @@ pub struct AudioPipeline {
     /// left, "go back to where I was" has no answer and the long press could only
     /// guess.
     previous_sink: Mutex<Option<String>>,
+    /// Streams this daemon moved off the EQ anchor, with the PipeWire session
+    /// their indices belong to. Empty in the steady state.
+    ///
+    /// An index is the only handle a sink input has, and it is only valid for one
+    /// session, so the cookie is kept beside it: without that, a restart would
+    /// leave the ledger holding numbers that now belong to other streams.
+    stream_ledger: Mutex<streams::StreamLedger>,
+    /// Whether a return is under way, so the log says it once per outage rather
+    /// than once per poll.
+    returning_streams: AtomicBool,
 }
 
 /// Microphone signal watchdog bookkeeping.
@@ -666,6 +676,8 @@ impl AudioPipeline {
             role_health: Mutex::new(BTreeMap::new()),
             last_user_sink: Mutex::new(None),
             epos_in_use: AtomicBool::new(false),
+            stream_ledger: Mutex::new(streams::StreamLedger::new(LEDGER_CAP)),
+            returning_streams: AtomicBool::new(false),
             previous_sink: Mutex::new(None),
         };
         // Same funnel as update_config, so a hand-edited config.json is bounded
@@ -851,7 +863,13 @@ impl AudioPipeline {
     /// Costs one `pw-cli ls Node` (about 4 ms) per poll, and only when the EQ
     /// is enabled. Falls back to unprocessed audio rather than silence, and
     /// retries the instance on a slow cadence instead of every poll.
-    pub async fn maintain_eq(&self) {
+    ///
+    /// Returns the stream moves it decided on but did not perform. That split is
+    /// not tidiness: a move is a subprocess with a 5 s budget, times as many
+    /// streams as are playing, and this runs under a state read lock. The caller
+    /// runs the batch with no lock held and comes back with
+    /// [`Self::record_stream_moves`].
+    pub async fn eq_plan(&self) -> Option<streams::StreamMovePlan> {
         if !self.config.eq.enabled {
             self.eq_chain_missing_polls.store(0, Ordering::Relaxed);
             // EQ off: make sure the default sink is the raw device, not a
@@ -859,7 +877,7 @@ impl AudioPipeline {
             if let Err(e) = self.route_output_with_chain(Some(false)).await {
                 warn!("Failed to route output with EQ off: {}", e);
             }
-            return;
+            return None;
         }
 
         let outcome = self.eq_chain_probe().await;
@@ -887,18 +905,24 @@ impl AudioPipeline {
         };
         // Whether anything is parked on raw right now is the difference between
         // asserting a route and moving running audio, so the decision needs to
-        // know. Nothing is tracked yet, so this is always false today; the
-        // ledger that makes it true arrives with the return path.
-        let decision = eq_route_decision(outcome, missing, recovered, false);
+        // know. The ledger is the only thing that can answer it, and it is empty
+        // until a rescue has actually run.
+        let streams_waiting = !lock(&self.stream_ledger).is_empty();
+        let decision = eq_route_decision(outcome, missing, recovered, streams_waiting);
 
         // The decision is the instruction. Routing used to be handed the raw
         // probe result instead, so the grace period below only delayed the log
         // line while the route had already moved.
+        let mut plan = None;
         match decision.action {
             EqRouteAction::AssertAnchor => {
                 if let Err(e) = self.route_output_with_chain(Some(true)).await {
                     warn!("Failed to assert EQ output route: {}", e);
                 }
+                // Reaching here with streams parked means the chain has been
+                // healthy for RECOVERY_POLLS, which is what the decision above
+                // checked. This is the only path that brings them home.
+                plan = self.plan_return().await;
             }
             EqRouteAction::Hold => {
                 debug!("EQ chain missing on one poll - holding the current route");
@@ -917,21 +941,16 @@ impl AudioPipeline {
                     warn!("Failed to fall back to the raw EPOS sink: {}", e);
                 }
                 // Changing the default sink only affects NEW streams, so any
-                // stream already playing into the anchor stays silent. Move it.
-                match self.rescue_anchor_streams().await {
-                    Ok(moved) if moved.is_empty() => {}
-                    Ok(moved) => warn!(
-                        "Moved {} in-flight stream(s) off the EQ anchor to raw audio",
-                        moved.len()
-                    ),
-                    Err(e) => warn!("Could not move in-flight streams off the EQ anchor: {e}"),
-                }
+                // stream already playing into the anchor stays silent. They are
+                // planned here and moved by the caller, without a lock held.
+                plan = self.plan_rescue().await;
             }
         }
         if decision.request_restart {
             warn!("EQ chain missing - requesting pipewire-epos@eq restart");
             self.restarts.request("eq");
         }
+        plan
     }
 
     /// Keep the remaining DSP instances honest on the same 5 s poll that watches
@@ -942,7 +961,7 @@ impl AudioPipeline {
     /// `pipewire.service` — something the user does by changing an audio
     /// setting, and something systemd and the session do on their own — drops
     /// every cross-daemon instance's link to the main graph. The EQ chain came
-    /// straight back because [`Self::maintain_eq`] watches it. The other two
+    /// straight back because [`Self::eq_plan`] watches it. The other two
     /// did not: their nodes stayed absent indefinitely, both units kept
     /// reporting `active`, and nothing was logged. With a voice mode and
     /// sidetone enabled that is a microphone and a sidetone that are silently
@@ -955,7 +974,7 @@ impl AudioPipeline {
     /// counter and triggers no restart — the same rule the EQ already follows.
     ///
     /// The EQ is deliberately not in this list: it is watched by
-    /// [`Self::maintain_eq`], which additionally repairs the output route and
+    /// [`Self::eq_plan`], which additionally repairs the output route and
     /// rescues in-flight streams, and watching it here too would give it two
     /// independent opinions about the same instance.
     /// What the daemon currently reports about the microphone's signal.
@@ -1146,29 +1165,31 @@ impl AudioPipeline {
         lock(&self.role_health).insert(role.to_string(), state);
     }
 
-    /// Move every stream currently attached to the EQ anchor onto the raw EPOS    /// sink.
+    /// Decide which streams to pull off the EQ anchor onto the raw EPOS sink.
+    ///
+    /// Decides; does not move. One `pactl move-sink-input` per stream at a 5 s
+    /// budget is minutes of subprocess time, and the caller runs the batch with
+    /// no state lock held — see [`Self::run_stream_moves`].
     ///
     /// `pactl set-default-sink` only steers streams created afterwards, so
-    /// without this a long-running stream stays pinned to the dead anchor and
-    /// the fallback would not actually restore any audio.
-    async fn rescue_anchor_streams(&self) -> Result<Vec<u32>> {
-        let Some(raw_sink) = self
+    /// without this a long-running stream stays pinned to the dead anchor and the
+    /// fallback would not actually restore any audio.
+    async fn plan_rescue(&self) -> Option<streams::StreamMovePlan> {
+        let raw_sink = self
             .device
             .as_ref()
             .map(|d| d.pipewire_sink.as_str())
-            .filter(|s| !s.is_empty())
-        else {
-            return Ok(Vec::new());
-        };
+            .filter(|s| !s.is_empty())?
+            .to_string();
         let sinks = match run_probe("pactl", &["list", "short", "sinks"], PROBE_BUDGET).await {
             Probe::Ran(out) => out,
             other => {
                 warn!("Could not list sinks for anchor rescue: {other:?}");
-                return Ok(Vec::new());
+                return None;
             }
         };
         let Some(anchor_index) = sink_index_of(&sinks, EQ_SINK_NAME) else {
-            return Ok(Vec::new());
+            return None;
         };
         // The JSON listing, not the short one: the short listing carries no node
         // name, and the node name is the only thing that tells the daemon's own
@@ -1183,32 +1204,233 @@ impl AudioPipeline {
             Probe::Ran(out) => out,
             other => {
                 warn!("Could not list sink inputs for anchor rescue: {other:?}");
-                return Ok(Vec::new());
+                return None;
             }
         };
-        let streams: Vec<streams::RescueStream> = match serde_json::from_str(&listing) {
+        let entries: Vec<streams::RescueStream> = match serde_json::from_str(&listing) {
             Ok(parsed) => parsed,
             Err(e) => {
                 warn!("sink-input JSON did not parse for the anchor rescue: {e}");
-                return Ok(Vec::new());
+                return None;
             }
         };
-        let mut moved = Vec::new();
-        for index in streams::streams_to_rescue(&streams, anchor_index) {
+        let (indices, dropped) = streams::capped(
+            streams::streams_to_rescue(&entries, anchor_index),
+            streams::MAX_STREAM_MOVES,
+        );
+        if dropped > 0 {
+            warn!(
+                "{dropped} stream(s) on the EQ anchor were left where they were: a \
+                 rescue is capped at {} moves per pass",
+                streams::MAX_STREAM_MOVES
+            );
+        }
+        if indices.is_empty() {
+            return None;
+        }
+        Some(streams::StreamMovePlan {
+            destination: raw_sink,
+            indices,
+            cookie: Self::session_cookie().await,
+            returning: false,
+        })
+    }
+
+    /// Decide which rescued streams can go back onto the EQ anchor.
+    ///
+    /// Only while the EPOS is where playback is meant to be. Pulling audio onto
+    /// the anchor after the user has moved to their own speakers would yank it
+    /// across the room, which is a worse surprise than leaving it where the
+    /// rescue put it.
+    async fn plan_return(&self) -> Option<streams::StreamMovePlan> {
+        if !self.epos_in_use() {
+            return None;
+        }
+        let raw_sink = self
+            .device
+            .as_ref()
+            .map(|d| d.pipewire_sink.as_str())
+            .filter(|s| !s.is_empty())?
+            .to_string();
+        // The cookie first. Without it the recorded indices cannot be shown to
+        // belong to this session, and an unplaceable ledger is dropped rather
+        // than acted on.
+        let cookie = Self::session_cookie().await;
+        let sinks = match run_probe("pactl", &["list", "short", "sinks"], PROBE_BUDGET).await {
+            Probe::Ran(out) => out,
+            other => {
+                warn!("Could not list sinks for the EQ return: {other:?}");
+                return None;
+            }
+        };
+        let Some(raw_index) = sink_index_of(&sinks, &raw_sink) else {
+            return None;
+        };
+        let inputs = match run_probe("pactl", &["list", "short", "sink-inputs"], PROBE_BUDGET).await
+        {
+            Probe::Ran(out) => out,
+            other => {
+                warn!("Could not list sink inputs for the EQ return: {other:?}");
+                return None;
+            }
+        };
+        let present = streams::parse_stream_sinks(&inputs);
+        let (indices, dropped) = {
+            let mut ledger = lock(&self.stream_ledger);
+            if !ledger.same_session(cookie.as_deref()) {
+                if ledger.session_changed(cookie.as_deref()) {
+                    warn!(
+                        "PipeWire restarted while streams were parked on raw audio - \
+                         they stay there rather than be moved on a guess"
+                    );
+                }
+                return None;
+            }
+            // Fresh listing, so this is also where dead indices are dropped.
+            ledger.prune(&present);
+            streams::capped(
+                ledger.plan_return(&present, raw_index),
+                streams::MAX_STREAM_MOVES,
+            )
+        };
+        if dropped > 0 {
+            warn!(
+                "{dropped} rescued stream(s) stay on raw audio for now: a return \
+                 is capped at {} moves per pass",
+                streams::MAX_STREAM_MOVES
+            );
+        }
+        if indices.is_empty() {
+            return None;
+        }
+        if !self.returning_streams.swap(true, Ordering::Relaxed) {
+            info!(
+                "EQ chain is healthy again - bringing {} rescued stream(s) back \
+                 onto the EQ anchor",
+                indices.len()
+            );
+        }
+        Some(streams::StreamMovePlan {
+            destination: EQ_SINK_NAME.to_string(),
+            indices,
+            cookie,
+            returning: true,
+        })
+    }
+
+    /// Run a plan's `move-sink-input` commands.
+    ///
+    /// An associated function with no `&self`, on purpose: the caller holds no
+    /// state lock while this runs, because the whole point is that it may take
+    /// minutes of subprocess time. Holding one froze IPC, the config watcher and
+    /// the volume watcher for the duration.
+    pub async fn run_stream_moves(
+        plan: &streams::StreamMovePlan,
+    ) -> streams::StreamMoveResult {
+        let mut result = streams::StreamMoveResult::default();
+        for index in &plan.indices {
             match run_probe(
                 "pactl",
-                &["move-sink-input", &index.to_string(), raw_sink],
+                &["move-sink-input", &index.to_string(), &plan.destination],
                 PROBE_BUDGET,
             )
             .await
             {
-                Probe::Ran(_) => moved.push(index),
+                Probe::Ran(_) => result.moved.push(*index),
                 other => {
-                    warn!("Could not move sink input {index} to {raw_sink}: {other:?}");
+                    warn!(
+                        "Could not move stream {index} to {}: {other:?}",
+                        plan.destination
+                    );
+                    result.failed.push(*index);
                 }
             }
         }
-        Ok(moved)
+        result.cookie = Self::session_cookie().await;
+        result
+    }
+
+    /// Fold the result of a plan back into the ledger.
+    ///
+    /// A session that changed while the commands ran invalidates the indices: the
+    /// numbers now belong to whatever took their place. Recording them would turn
+    /// a recoverable outage into somebody else's stream being moved later.
+    pub fn record_stream_moves(
+        &self,
+        plan: &streams::StreamMovePlan,
+        result: streams::StreamMoveResult,
+    ) {
+        if !result.failed.is_empty() {
+            warn!(
+                "{} stream(s) did not reach {}: {:?}",
+                result.failed.len(),
+                plan.destination,
+                result.failed
+            );
+        }
+        match streams::record_action(
+            plan.cookie.as_deref(),
+            result.cookie.as_deref(),
+            &result.moved,
+            plan.returning,
+        ) {
+            streams::RecordAction::Discard(streams::DiscardReason::NothingMoved) => return,
+            streams::RecordAction::Discard(why) => {
+                // Fail closed. An index that cannot be tied to this session is one
+                // that may name a stranger's stream by the time anyone acts on it.
+                // Audio left on the bypassed device is visible and changeable; a
+                // stranger's stream being moved is neither.
+                warn!(
+                    "Not recording {} moved stream(s) ({why:?}) - they are not \
+                     remembered for a later return",
+                    result.moved.len()
+                );
+                lock(&self.stream_ledger).session_changed(result.cookie.as_deref());
+                self.returning_streams.store(false, Ordering::Relaxed);
+                return;
+            }
+            streams::RecordAction::Rescue(moved) => {
+                let mut ledger = lock(&self.stream_ledger);
+                let was_empty = ledger.is_empty();
+                ledger.note_rescued(&moved, result.cookie.as_deref());
+                // A fresh outage while a return was under way: the next return
+                // has its own log line to emit.
+                self.returning_streams.store(false, Ordering::Relaxed);
+                if was_empty {
+                    info!(
+                        "EQ outage: moved {} stream(s) to raw audio; they come back \
+                         when the chain returns",
+                        moved.len()
+                    );
+                } else {
+                    debug!(
+                        "EQ outage: moved {} more stream(s) to raw audio, {} tracked \
+                         in total",
+                        moved.len(),
+                        ledger.len()
+                    );
+                }
+            }
+            streams::RecordAction::Return(moved) => {
+                let mut ledger = lock(&self.stream_ledger);
+                ledger.note_returned(&moved);
+                if ledger.is_empty() {
+                    self.returning_streams.store(false, Ordering::Relaxed);
+                    info!("{} stream(s) are back on the EQ anchor", moved.len());
+                }
+            }
+        }
+    }
+
+    /// The PipeWire session cookie, or `None` when it could not be read.
+    async fn session_cookie() -> Option<String> {
+        match run_probe("pactl", &["info"], PROBE_BUDGET).await {
+            Probe::Ran(out) => streams::session_cookie(&out).map(str::to_string),
+            other => {
+                warn!("Could not read the PipeWire session cookie: {other:?}");
+                None
+            }
+        }
     }
 
     /// Apply the full audio config (EQ, mic gain, sidetone, noise gate, voice).
@@ -2624,6 +2846,13 @@ const EQ_OUTPUT_NAME: &str = "epos-eq-output";
 /// counter and defeats the retry cadence.
 const RECOVERY_POLLS: u32 = 2;
 
+/// The most rescued streams the ledger will remember.
+///
+/// A set that only grows is a leak. The graph carries tens of streams, so this
+/// is not a limit anyone should notice; it exists so a daemon left running for
+/// months cannot accumulate indices.
+const LEDGER_CAP: usize = 64;
+
 /// Consecutive absent polls before the chain is believed.
 ///
 /// This used to be 1, and the reason it is not is measured rather than argued. A
@@ -2673,7 +2902,7 @@ fn probe_outcome(result: &Probe, node: &str) -> ChainProbe {
 /// What the EQ watchdog should do on this poll.
 ///
 /// An enum rather than a set of booleans on purpose: the previous shape let
-/// `maintain_eq` compute a grace period and then ignore it, because the
+/// `eq_plan` compute a grace period and then ignore it, because the
 /// routing call was handed the raw probe result instead of the decision.
 /// Making the decision *be* the instruction removes that failure mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4162,7 +4391,7 @@ mod tests {
     //
     // Measured on this machine: restarting the MAIN `pipewire.service` drops
     // every cross-daemon instance's link to it. The EQ chain came back on its
-    // own because `maintain_eq` watches it. `voice` and `sidetone` did NOT:
+    // own because `eq_plan` watches it. `voice` and `sidetone` did NOT:
     // their nodes stayed absent for as long as they were left alone, with no log
     // line and no restart — so with a voice mode and sidetone enabled the
     // microphone processing and the sidetone were silently dead after any MAIN
