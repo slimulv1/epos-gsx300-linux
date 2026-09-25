@@ -193,6 +193,25 @@ fn apply_eq_to_audio(audio: &mut AudioConfig, eq: epos_shared::config::EqConfig)
     }
 }
 
+impl IpcState {
+    /// Put the ring where it belongs: dark unless playback is on the EPOS, in
+    /// which case the active profile's mode.
+    ///
+    /// Every caller goes through here rather than picking a colour. The ring used
+    /// to be driven by whoever happened to change the mode, which meant it showed
+    /// a mode colour while playback was somewhere else entirely — the device lit
+    /// up for a headset nothing was going through. Whether the EPOS is in use is
+    /// the routing poll's answer, read once and shared, so this cannot disagree
+    /// with the audio.
+    pub fn sync_led(&mut self) {
+        let indicator = crate::led::indicator_for(self.config.mode, self.audio.epos_in_use());
+        let Some(ref mut led) = self.led else { return };
+        if let Err(e) = led.set_indicator(indicator) {
+            warn!("Failed to set LED indicator: {}", e);
+        }
+    }
+}
+
 pub struct IpcState {
     pub config: Config,
     pub audio: AudioPipeline,
@@ -664,12 +683,7 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
         Request::SetMode { mode } => {
             let mut state = state.write().await;
             state.config.mode = mode;
-            // Update LED color
-            if let Some(ref mut led) = state.led {
-                if let Err(e) = led.set_mode(mode) {
-                    warn!("Failed to set LED mode: {}", e);
-                }
-            }
+            state.sync_led();
             info!(
                 "Audio mode changed to {} (LED: {})",
                 mode.display_name(),
@@ -688,11 +702,7 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
             };
             state.config.mode = new_mode;
             // Update LED color
-            if let Some(ref mut led) = state.led {
-                if let Err(e) = led.set_mode(new_mode) {
-                    warn!("Failed to toggle LED mode: {}", e);
-                }
-            }
+              state.sync_led();
             info!(
                 "Audio mode toggled to {} (LED: {})",
                 new_mode.display_name(),
@@ -731,11 +741,7 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
                 // applies it; the GUI path did not, so switching profile from
                 // the GUI left the previous mode (and its LED) in place.
                 state.config.mode = profile_mode;
-                if let Some(ref mut led) = state.led {
-                    if let Err(e) = led.set_mode(profile_mode) {
-                        warn!("Failed to set LED mode on profile switch: {}", e);
-                    }
-                }
+                      state.sync_led();
                 // Sync the selected profile into the pipeline's own config copy
                 // BEFORE applying — apply_full() reads self.config, so without
                 // this the OLD pipeline config would be applied and the switch
@@ -830,11 +836,7 @@ async fn handle_request(request: Request, state: Arc<RwLock<IpcState>>) -> Respo
                     state.config.active_profile = profile.name.clone();
                     let audio_cfg = state.config.audio.clone();
                     state.audio.update_config(&audio_cfg);
-                    if let Some(ref mut led) = state.led {
-                        if let Err(e) = led.set_mode(profile.mode) {
-                            warn!("Failed to set LED on profile delete: {}", e);
-                        }
-                    }
+                      state.sync_led();
                     match state.audio.apply_full().await {
                         // apply_full() already enqueues any required instance restart on the
                         // RestartBus; `changed` only reports whether a conf actually differed.

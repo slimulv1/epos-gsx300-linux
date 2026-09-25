@@ -1,5 +1,11 @@
 use serde::{Deserialize, Serialize};
 
+/// The ring's off byte. Measured on hardware, and the only value that means
+/// "nothing lit" on a two-bit register.
+pub fn default_vendor_off() -> u8 {
+    0x00
+}
+
 /// LED color bytes — configurable via config.json for hardware testing.
 /// Protocol is undocumented; adjust these values after running led-probe.py.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,6 +22,19 @@ pub struct LedProbeConfig {
     /// Vendor Report ID 0x02 output byte for Red (7.1) — `0x01`, see
     /// [`LedProbeConfig::vendor_blue`].
     pub vendor_red: u8,
+    /// Vendor Report ID 0x02 output byte for "the device is not in use".
+    ///
+    /// The ring is a 2-bit shift register (`$1388`/`$1389`, firmware
+    /// `FREEMAN_V03.01.00.00`), so the whole palette is four states: off, red,
+    /// blue, both. There is no green to ask for — the hardware has no third
+    /// channel. `0x00` is the measured off value and is what "not listening on
+    /// the EPOS" shows.
+    ///
+    /// Optional on disk: a config written before this field existed loads with
+    /// the default, which is the same `0x00` the daemon was already writing when
+    /// it had nothing to show.
+    #[serde(default = "default_vendor_off")]
+    pub vendor_off: u8,
     /// Alternative: Primary Report ID 0x04 payload for Blue (38 bytes).
     ///
     /// Never exercised: the shipped default config sets this to `null`, and
@@ -42,6 +61,7 @@ impl Default for LedProbeConfig {
         Self {
             vendor_blue: 0x02,
             vendor_red: 0x01,
+            vendor_off: default_vendor_off(),
             primary_blue: Some({
                 let mut buf = vec![0u8; 38];
                 buf[0] = 0x01;

@@ -46,6 +46,133 @@ use tracing::{debug, info, warn};
 use epos_shared::config::AudioMode;
 use epos_shared::led::{LedProbeConfig, LedReportPath};
 
+use crate::audio::sink_is_managed;
+
+/// What the ring should be showing right now.
+///
+/// The ring answers one question — is playback on the EPOS, and if so which mode
+/// — and the two answers are visually distinct. Showing a mode colour while
+/// playback is somewhere else would be a lie the user cannot see through: the
+/// device would look engaged while nothing is going through it, which is the same
+/// "on but not working" failure this project keeps removing elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedIndicator {
+    /// Playback is not on the EPOS. The ring goes dark.
+    Unused,
+    /// Playback is on the EPOS, showing the active profile's mode.
+    InUse(AudioMode),
+}
+
+impl LedIndicator {
+    /// A word for the log and the IPC status, never a guess about intent.
+    pub fn describe(self) -> &'static str {
+        match self {
+            LedIndicator::Unused => "dark (playback is not on the EPOS)",
+            LedIndicator::InUse(AudioMode::Stereo) => "blue (2.0)",
+            LedIndicator::InUse(AudioMode::Surround71) => "red (7.1)",
+        }
+    }
+}
+
+/// The vendor byte for an indicator, or `None` on the unconfigured primary path.
+///
+/// Pure, so the mapping is pinned by tests rather than by whatever the ring
+/// happened to show when a change was made.
+pub fn vendor_byte(indicator: LedIndicator, cfg: &LedProbeConfig) -> u8 {
+    match indicator {
+        LedIndicator::Unused => cfg.vendor_off,
+        LedIndicator::InUse(AudioMode::Stereo) => cfg.vendor_blue,
+        LedIndicator::InUse(AudioMode::Surround71) => cfg.vendor_red,
+    }
+}
+
+/// The mode indicator is the "in use" indicator with a mode attached: the ring is
+/// only ever asked to show a mode when playback is on the EPOS.
+pub fn indicator_for(mode: AudioMode, in_use: bool) -> LedIndicator {
+    if in_use {
+        LedIndicator::InUse(mode)
+    } else {
+        LedIndicator::Unused
+    }
+}
+
+/// The daemon's own playback nodes, which sit on the EPOS permanently.
+///
+/// Measured node names, not guesses. They are `Corked: no` at all times because
+/// the EQ drains its monitor and the sidetone loopback runs, so counting them as
+/// "something is playing on the EPOS" would make the EPOS look like the busiest
+/// device on the machine — which is how the first version of this ended up
+/// refusing to leave.
+pub const OWN_STREAM_NODES: [&str; 2] = ["epos-eq-output", "epos-sidetone-output"];
+
+/// A playback stream, reduced to what choosing a destination needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayingStream {
+    pub sink_name: String,
+    /// `Corked: yes` means the application is not sending data.
+    pub corked: bool,
+    pub node_name: String,
+}
+
+/// Where to send playback when leaving the EPOS, in the order the user means it.
+///
+/// The place they were *listening* comes first, not the place the default sink
+/// was pointing. Those are different things and the difference is not academic:
+/// measured, audio was playing on the speakers while the default still pointed at
+/// a virtual sink with nothing on it, so a long press that went by the default
+/// sent the user somewhere silent.
+pub fn exit_destination(
+    streams: &[PlayingStream],
+    remembered: Option<&str>,
+    raw_sink: &str,
+    anchor: &str,
+    published: &[String],
+) -> Option<String> {
+    let is_ours = |s: &str| sink_is_managed(s, raw_sink) || s == anchor;
+    // A stream counts when it is not corked, not one of ours, and on a sink that
+    // is really there. First match wins, which is the order the server reported
+    // them in and is therefore stable between runs.
+    let playing = streams.iter().find(|s| {
+        !s.corked
+            && !OWN_STREAM_NODES.contains(&s.node_name.as_str())
+            && !is_ours(s.sink_name.as_str())
+            && published.iter().any(|p| p == &s.sink_name)
+    });
+    if let Some(chosen) = playing {
+        return Some(chosen.sink_name.clone());
+    }
+    // Nothing is playing, so the best available answer is where the default was.
+    exit_target(remembered, raw_sink, anchor, published)
+}
+
+/// Which sink to return to when the user asks to leave the EPOS.
+///
+/// Pure, because the whole decision is a preference question and preferences are
+/// exactly what should not be discovered by trying things on live audio.
+///
+/// The remembered device wins if it is still published and still not ours — that
+/// is "the device you were on a moment ago". Otherwise the first published sink
+/// that is not ours, so leaving the EPOS always lands somewhere real. `None`
+/// means there is nowhere to go, and the caller must leave the default alone
+/// rather than point it at a sink that does not exist.
+pub fn exit_target(
+    remembered: Option<&str>,
+    raw_sink: &str,
+    anchor: &str,
+    published: &[String],
+) -> Option<String> {
+    let is_ours = |s: &str| sink_is_managed(s, raw_sink) || s == anchor;
+    if let Some(previous) = remembered.filter(|p| !is_ours(p)) {
+        if published.iter().any(|s| s == previous) {
+            return Some(previous.to_string());
+        }
+    }
+    published
+        .iter()
+        .find(|s| !is_ours(s))
+        .map(|s| (*s).to_string())
+}
+
 /// HID Output payload size for Report ID 0x02 (the LED ring).
 ///
 /// Derived from the 120-byte report descriptor shipped by this device:
@@ -93,7 +220,7 @@ pub struct LedController {
     _hidraw_path: PathBuf,
     file: Option<File>,
     probe_config: LedProbeConfig,
-    current_mode: Option<AudioMode>,
+    current_indicator: Option<LedIndicator>,
     /// Set once the first write fails, so the failure is reported exactly once
     /// instead of on every 2s heartbeat. Reset on a successful write or reopen.
     last_write_failed: bool,
@@ -140,7 +267,7 @@ impl LedController {
             _hidraw_path: hidraw_path,
             file,
             probe_config,
-            current_mode: None,
+            current_indicator: None,
             last_write_failed: false,
             reopen_attempts: 0,
         })
@@ -193,7 +320,7 @@ impl LedController {
             .open(&self._hidraw_path)
             .context("Failed to reopen hidraw device")?;
         self.file = Some(file);
-        self.current_mode = None;
+        self.current_indicator = None;
         self.last_write_failed = false;
         Ok(())
     }
@@ -205,42 +332,40 @@ impl LedController {
     /// button toggles the LED on-device while a HID readback event is lost),
     /// so skipping identical writes can leave the physical LED out of sync
     /// with the daemon/web UI.
-    pub fn set_mode(&mut self, mode: AudioMode) -> Result<()> {
+    pub fn set_indicator(&mut self, indicator: LedIndicator) -> Result<()> {
         let probe_config = self.probe_config.clone();
         let file = self.file.as_mut().context("LED device not open")?;
 
         let result = match probe_config.use_report {
             LedReportPath::Vendor => {
-                let byte = match mode {
-                    AudioMode::Stereo => probe_config.vendor_blue,
-                    AudioMode::Surround71 => probe_config.vendor_red,
-                };
+                let byte = vendor_byte(indicator, &probe_config);
                 write_vendor_report(file, byte).map(|()| {
                     debug!(
                         "LED: Report ID 0x{:02X} → 0x{:02X} ({})",
                         REPORT_ID_VENDOR_LED,
                         byte & 0x03,
-                        mode.display_name()
+                        indicator.describe()
                     );
                 })
             }
             LedReportPath::Primary => {
-                let payload = match mode {
-                    AudioMode::Stereo => probe_config
-                        .primary_blue
-                        .as_deref()
-                        .context("No primary_blue payload configured")?,
-                    AudioMode::Surround71 => probe_config
-                        .primary_red
-                        .as_deref()
-                        .context("No primary_red payload configured")?,
+                let payload = match indicator {
+                    LedIndicator::Unused => None,
+                    LedIndicator::InUse(AudioMode::Stereo) => probe_config.primary_blue.as_deref(),
+                    LedIndicator::InUse(AudioMode::Surround71) => {
+                        probe_config.primary_red.as_deref()
+                    }
                 };
+                let payload = payload.context(
+                    "the primary LED path has no payload for this indicator; \
+                     it has never been decoded, use the vendor path",
+                )?;
                 write_primary_report(file, payload).map(|()| {
                     debug!(
                         "LED: Report ID 0x{:02X} → {} bytes ({})",
                         REPORT_ID_PRIMARY_CMD,
                         payload.len(),
-                        mode.display_name()
+                        indicator.describe()
                     );
                 })
             }
@@ -277,17 +402,10 @@ impl LedController {
 
         result?;
 
-        self.current_mode = Some(mode);
+        self.current_indicator = Some(indicator);
         // Heartbeat re-asserts this every 2s — keep at debug level to avoid
         // ~1400 journald lines/hour of identical noise.
-        debug!(
-            "LED ring set to {} for {}",
-            match mode {
-                AudioMode::Stereo => "blue",
-                AudioMode::Surround71 => "red",
-            },
-            mode.display_name()
-        );
+        debug!("LED ring set: {}", indicator.describe());
         Ok(())
     }
 
@@ -324,8 +442,8 @@ impl LedController {
     }
 
     #[allow(dead_code)]
-    pub fn current_mode(&self) -> Option<AudioMode> {
-        self.current_mode
+    pub fn current_indicator(&self) -> Option<LedIndicator> {
+        self.current_indicator
     }
 }
 
@@ -414,6 +532,236 @@ impl Drop for LedController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::EQ_SINK_NAME;
+
+    // ─── What the ring shows ───────────────────────────────────────
+    //
+    // The ring is a two-bit register, so the palette is four states and there is
+    // no green to ask for. "Not in use" therefore has to be the dark state,
+    // because every lit state means a mode and the device is not on a mode while
+    // playback is somewhere else.
+
+    /// Playback away from the EPOS must be dark, not a mode colour.
+    #[test]
+    fn the_ring_is_dark_when_the_device_is_not_in_use() {
+        assert_eq!(
+            vendor_byte(LedIndicator::Unused, &LedProbeConfig::default()),
+            0x00
+        );
+        assert_eq!(indicator_for(AudioMode::Stereo, false), LedIndicator::Unused);
+        assert_eq!(
+            indicator_for(AudioMode::Surround71, false),
+            LedIndicator::Unused
+        );
+    }
+
+    /// On the EPOS the ring shows the profile's mode, using the measured bytes.
+    #[test]
+    fn the_ring_shows_the_mode_while_the_device_is_in_use() {
+        let cfg = LedProbeConfig::default();
+        assert_eq!(
+            vendor_byte(indicator_for(AudioMode::Stereo, true), &cfg),
+            cfg.vendor_blue
+        );
+        assert_eq!(
+            vendor_byte(indicator_for(AudioMode::Surround71, true), &cfg),
+            cfg.vendor_red
+        );
+    }
+
+    /// The three states must be three different bytes, or "not in use" is
+    /// indistinguishable from a mode.
+    #[test]
+    fn in_use_and_not_in_use_are_visibly_different() {
+        let cfg = LedProbeConfig::default();
+        let dark = vendor_byte(LedIndicator::Unused, &cfg);
+        assert_ne!(dark, cfg.vendor_blue);
+        assert_ne!(dark, cfg.vendor_red);
+    }
+
+    /// An old config file with no `vendor_off` must still load, and with the
+    /// byte that means "dark".
+    #[test]
+    fn a_config_written_before_vendor_off_still_loads() {
+        let old = r#"{"vendor_blue":2,"vendor_red":1,"primary_blue":null,
+                      "primary_red":null,"use_report":"vendor"}"#;
+        let parsed: LedProbeConfig = serde_json::from_str(old).expect("an old config loads");
+        assert_eq!(parsed.vendor_off, 0x00);
+    }
+
+    // ─── Leaving the EPOS ──────────────────────────────────────────
+
+    /// The measured case, verbatim from this machine: audio on the speakers while
+    /// the default still pointed at a virtual sink with nothing on it. Going by
+    /// the default would have sent the user somewhere silent.
+    #[test]
+    fn leaving_goes_where_audio_is_playing_not_where_the_default_was() {
+        let speakers = "alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink";
+        let games_sink = "games_sink";
+        let raw = "alsa_output.usb-EPOS-00.analog-stereo";
+        let published = vec![
+            games_sink.to_string(),
+            raw.to_string(),
+            speakers.to_string(),
+        ];
+        let streams = [
+            PlayingStream { sink_name: speakers.to_string(), corked: false, node_name: "miniaudio:0".to_string() },
+            PlayingStream { sink_name: speakers.to_string(), corked: true, node_name: "AudioStream".to_string() },
+        ];
+        assert_eq!(
+            exit_destination(&streams, Some(games_sink), raw, EQ_SINK_NAME, &published),
+            Some(speakers.to_string()),
+            "where the audio is beats where the default was"
+        );
+    }
+
+    /// The daemon's own streams are on the EPOS and never stop. Counting them
+    /// would make the EPOS the busiest device on the machine.
+    #[test]
+    fn the_daemons_own_streams_do_not_count_as_playing() {
+        let raw = "alsa_output.usb-EPOS-00.analog-stereo";
+        let bluetooth = "bluez_sink.00_00_00_00_00_00.a2dp_sink";
+        let published = vec![raw.to_string(), bluetooth.to_string()];
+        let streams = [
+            PlayingStream { sink_name: raw.to_string(), corked: false, node_name: OWN_STREAM_NODES[0].to_string() },
+            PlayingStream { sink_name: raw.to_string(), corked: false, node_name: OWN_STREAM_NODES[1].to_string() },
+        ];
+        assert_eq!(
+            exit_destination(&streams, Some(bluetooth), raw, EQ_SINK_NAME, &published),
+            Some(bluetooth.to_string()),
+            "the EQ monitor and the sidetone are not somebody listening"
+        );
+    }
+
+    /// A corked stream is an application with nothing to say.
+    #[test]
+    fn a_corked_stream_is_not_where_the_user_is_listening() {
+        let speakers = "alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink";
+        let bluetooth = "bluez_sink.00_00_00_00_00_00.a2dp_sink";
+        let raw = "alsa_output.usb-EPOS-00.analog-stereo";
+        let published = vec![speakers.to_string(), bluetooth.to_string(), raw.to_string()];
+        let streams = [PlayingStream {
+            sink_name: speakers.to_string(),
+            corked: true,
+            node_name: "Firefox".to_string(),
+        }];
+        assert_eq!(
+            exit_destination(&streams, Some(bluetooth), raw, EQ_SINK_NAME, &published),
+            Some(bluetooth.to_string())
+        );
+    }
+
+    /// Nothing playing: the remembered default, as before.
+    #[test]
+    fn leaving_with_nothing_playing_falls_back_to_the_remembered_default() {
+        let speakers = "alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink";
+        let raw = "alsa_output.usb-EPOS-00.analog-stereo";
+        let published = vec![raw.to_string(), speakers.to_string()];
+        assert_eq!(
+            exit_destination(&[], Some(speakers), raw, EQ_SINK_NAME, &published),
+            Some(speakers.to_string())
+        );
+    }
+
+    /// A stream on a sink that is not in the listing is a leftover, not a place.
+    #[test]
+    fn a_stream_on_a_sink_that_is_gone_is_not_a_destination() {
+        let bluetooth = "bluez_sink.00_00_00_00_00_00.a2dp_sink";
+        let raw = "alsa_output.usb-EPOS-00.analog-stereo";
+        let published = vec![raw.to_string(), bluetooth.to_string()];
+        let streams = [PlayingStream {
+            sink_name: "a_sink_that_unplugged".to_string(),
+            corked: false,
+            node_name: "Firefox".to_string(),
+        }];
+        assert_eq!(
+            exit_destination(&streams, Some(bluetooth), raw, EQ_SINK_NAME, &published),
+            Some(bluetooth.to_string())
+        );
+    }
+
+    /// The normal case: the device you were on a moment ago is still there.
+    #[test]
+    fn leaving_the_device_goes_back_to_where_it_was() {
+        let speakers = "alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink";
+        let raw = "alsa_output.usb-EPOS-00.analog-stereo";
+        let published = vec![
+            raw.to_string(),
+            EQ_SINK_NAME.to_string(),
+            speakers.to_string(),
+        ];
+        assert_eq!(
+            exit_target(Some(speakers), raw, EQ_SINK_NAME, &published),
+            Some(speakers.to_string())
+        );
+    }
+
+    /// The device you were on has gone. Leaving must still land somewhere real.
+    #[test]
+    fn leaving_falls_back_to_another_published_device() {
+        let raw = "alsa_output.usb-EPOS-00.analog-stereo";
+        let bluetooth = "bluez_sink.00_00_00_00_00_00.a2dp_sink";
+        let published = vec![
+            raw.to_string(),
+            EQ_SINK_NAME.to_string(),
+            bluetooth.to_string(),
+        ];
+        assert_eq!(
+            exit_target(
+                Some("a_device_that_unplugged"),
+                raw,
+                EQ_SINK_NAME,
+                &published
+            ),
+            Some(bluetooth.to_string()),
+            "the remembered device is gone, so some other real device must be used"
+        );
+    }
+
+    /// Nothing to go to. The caller has to be told, not handed a sink that does
+    /// not exist — pointing the default at a missing device is silence.
+    #[test]
+    fn leaving_with_nowhere_to_go_returns_nothing() {
+        let raw = "alsa_output.usb-EPOS-00.analog-stereo";
+        let published = vec![raw.to_string(), EQ_SINK_NAME.to_string()];
+        assert_eq!(
+            exit_target(Some("gone"), raw, EQ_SINK_NAME, &published),
+            None
+        );
+        assert_eq!(exit_target(None, raw, EQ_SINK_NAME, &published), None);
+    }
+
+    /// A remembered device that happens to be one of ours is not a destination.
+    /// That is the case where the daemon already took the route, and sending the
+    /// user straight back would be leaving without leaving.
+    #[test]
+    fn a_remembered_device_that_is_ours_is_not_a_destination() {
+        let raw = "alsa_output.usb-EPOS-00.analog-stereo";
+        let bluetooth = "bluez_sink.00_00_00_00_00_00.a2dp_sink";
+        let published = vec![raw.to_string(), bluetooth.to_string()];
+        assert_eq!(
+            exit_target(Some(raw), raw, EQ_SINK_NAME, &published),
+            Some(bluetooth.to_string())
+        );
+        assert_eq!(
+            exit_target(Some(EQ_SINK_NAME), raw, EQ_SINK_NAME, &published),
+            Some(bluetooth.to_string())
+        );
+    }
+
+    /// The EPOS is never a destination even when it is the only thing published,
+    /// because then there is genuinely nowhere to go.
+    #[test]
+    fn the_epos_is_never_the_destination() {
+        let raw = "alsa_output.usb-EPOS-00.analog-stereo";
+        let published = vec![raw.to_string(), EQ_SINK_NAME.to_string()];
+        for remembered in [None, Some(raw), Some(EQ_SINK_NAME)] {
+            assert_eq!(
+                exit_target(remembered, raw, EQ_SINK_NAME, &published),
+                None
+            );
+        }
+    }
 
     /// The panic this exists to prevent. `primary_blue: []` in config.json is
     /// reachable: `Some([])` satisfies `as_deref()` so the "not configured"

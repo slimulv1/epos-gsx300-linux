@@ -134,9 +134,13 @@ async fn main() -> Result<()> {
     };
 
     // Apply initial LED state from config
+    // Dark until the first routing poll says playback is on the EPOS. Lighting
+    // it at boot would claim a mode for a headset nothing is going through,
+    // which is the same "on but not working" this ring was just stopped from
+    // doing.
     if let Some(ref mut led_ctrl) = led {
-        if let Err(e) = led_ctrl.set_mode(config.mode) {
-            warn!("Failed to set initial LED mode: {}", e);
+        if let Err(e) = led_ctrl.set_indicator(led::LedIndicator::Unused) {
+            warn!("Failed to set initial LED state: {}", e);
         }
         // Say plainly whether the ring is actually being driven, so the state
         // is never assumed to match the requested mode. EPROTO here means the
@@ -180,9 +184,39 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         while let Some(evt) = hid_rx.recv().await {
             match evt {
-                HidEvent::ModeChanged(_) | HidEvent::LongPress => {
+                // The device reports a long press as its own value (0x04, measured
+                // as >2s on hardware), so it is a separate gesture rather than a
+                // longer version of the click. It used to fall into the arm below
+                // and do exactly what a click does, which made the two
+                // indistinguishable and left nothing to act on.
+                //
+                // It leaves the EPOS: put playback back on a device that is not
+                // ours, which by the route rule takes the EQ out of the path and
+                // darkens the ring.
+                HidEvent::LongPress => {
                     let mut st = s.write().await;
-                    // LongPress carries no mode — derive from current config.
+                    st.smart_button_seq
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    match st.audio.exit_epos().await {
+                        audio::ExitOutcome::AlreadyAway => {
+                            info!("Smart button long press: playback is already off the EPOS")
+                        }
+                        audio::ExitOutcome::Moved(sink) => {
+                            info!("Smart button long press: left the EPOS for {sink}");
+                            st.sync_led();
+                        }
+                        audio::ExitOutcome::NowhereToGo => warn!(
+                            "Smart button long press: no other published sink to go to, \
+                             so the default was left alone"
+                        ),
+                        audio::ExitOutcome::CouldNotDecide => warn!(
+                            "Smart button long press: the sink list could not be read, \
+                             so the default was left alone"
+                        ),
+                    }
+                }
+                HidEvent::ModeChanged(_) => {
+                    let mut st = s.write().await;
                     let pressed_mode = match evt {
                         HidEvent::ModeChanged(m) => Some(m),
                         _ => None,
@@ -211,11 +245,7 @@ async fn main() -> Result<()> {
                             if let Err(e) = save_config(&st) {
                                 warn!("Failed to save config: {}", e);
                             }
-                            if let Some(ref mut led) = st.led {
-                                if let Err(e) = led.set_mode(new_mode) {
-                                    warn!("Failed to set LED after smart button: {}", e);
-                                }
-                            }
+                            st.sync_led();
                             info!("Smart button: mode → {:?} (LED sync)", new_mode);
                             emit_smart_notify(&st);
                         }
@@ -280,11 +310,7 @@ async fn main() -> Result<()> {
                                     st.config.audio = profile_audio;
                                     st.config.active_profile = name.clone();
                                     st.config.mode = profile_mode;
-                                    if let Some(ref mut led) = st.led {
-                                        if let Err(e) = led.set_mode(profile_mode) {
-                                            warn!("Failed to set LED after smart button: {}", e);
-                                        }
-                                    }
+                                    st.sync_led();
                                     let audio_cfg = st.config.audio.clone();
                                     st.audio.update_config(&audio_cfg);
                                     match st.audio.apply_full().await {
@@ -484,9 +510,7 @@ async fn main() -> Result<()> {
                 info!("Received signal {} — shutting down", sig);
                 let mut st = s.write().await;
                 if let Some(ref mut led) = st.led {
-                    // Reset to blue (stereo default) so the ring isn't left red
-                    // after the daemon stops.
-                    let _ = led.set_mode(AudioMode::Stereo);
+                    let _ = led.set_indicator(led::LedIndicator::Unused);
                 }
                 // Nothing to reap here: the sidetone lives inside the
                 // `pipewire-epos@sidetone` systemd instance, not a
@@ -807,16 +831,13 @@ async fn device_hotplug_loop(state: Arc<RwLock<IpcState>>) {
             {
                 let mut st = state.write().await;
                 // Re-open LED hidraw (device may have re-enumerated) and sync mode
-                let desired_mode = st.config.mode;
                 if let Some(ref mut led) = st.led {
                     if let Err(e) = led.reopen() {
                         warn!("Failed to reopen LED device: {}", e);
                     }
-                    if let Err(e) = led.set_mode(desired_mode) {
-                        warn!("Failed to sync LED on connect: {}", e);
-                    }
-                    info!("LED re-synced to {:?} after reconnect", desired_mode);
                 }
+                st.sync_led();
+                info!("LED re-synced after reconnect");
             }
         } else if !is_connected && was_connected {
             info!("EPOS GSX 300 disconnected");
@@ -1296,11 +1317,7 @@ async fn config_watch_loop(state: Arc<RwLock<IpcState>>) {
         }
         if mode_changed {
             let desired_mode = st.config.mode;
-            if let Some(ref mut led) = st.led {
-                if let Err(e) = led.set_mode(desired_mode) {
-                    warn!("Failed to sync LED after config reload: {}", e);
-                }
-            }
+            st.sync_led();
             info!("Config hot-reload: LED synced to {:?}", desired_mode);
         }
         if !audio_changed && !mode_changed {
@@ -1339,20 +1356,15 @@ async fn led_heartbeat_loop(state: Arc<RwLock<IpcState>>) {
     loop {
         tokio::time::sleep(interval).await;
         let mut st = state.write().await;
-        let desired = st.config.mode;
-        if let Some(ref mut led) = st.led {
-            // LedController already rate-limits its own warning to the
-            // failure TRANSITION, so repeating it here produced a second
-            // warning every 2s (~1400/hour) on top of the one it emitted
-            // itself. Keep this at debug so a wedged LED path costs a single
-            // visible line instead of flooding the journal.
-            if led.set_mode(desired).is_err() {
-                debug!("LED heartbeat: could not re-assert {:?}", desired);
-                // The hotplug loop only calls reopen() when the device drops
-                // off the bus entirely. This is the other case: still
-                // enumerated, still refusing writes. Reopen the hidraw fd a
-                // bounded number of times — a plain close/open, never USB
-                // power/reset, which is what wedged the endpoint originally.
+        st.sync_led();
+        if st.led.as_ref().is_some_and(|led| led.write_failing()) {
+            debug!("LED heartbeat: the indicator could not be re-asserted");
+            // The hotplug loop only calls reopen() when the device drops off the
+            // bus entirely. This is the other case: still enumerated, still
+            // refusing writes. Reopen the hidraw fd a bounded number of times — a
+            // plain close/open, never USB power/reset, which is what wedged the
+            // endpoint originally.
+            if let Some(ref mut led) = st.led {
                 led.recover_if_needed();
             }
         }
@@ -1561,4 +1573,3 @@ mod tests {
         assert!(!first_connect_owes_pipeline(true));
     }
 }
-

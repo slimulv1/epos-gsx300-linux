@@ -3,8 +3,8 @@ use epos_shared::config::{AudioConfig, EqConfig, VoiceMode};
 use epos_shared::ipc::MicInputState;
 use epos_shared::device::DeviceInfo;
 use crate::sync::lock;
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -49,6 +49,22 @@ pub struct AudioPipeline {
     /// Only so the "the EQ is bypassed while you are on this device" line is
     /// emitted once per change rather than on every 5 s poll.
     last_user_sink: Mutex<Option<String>>,
+    /// Whether the default sink is currently one of ours, as of the last poll.
+    ///
+    /// The LED follows this rather than asking again: a ring that is supposed to
+    /// say "not in use" must be right, and the poll is what decides. The cost is
+    /// that a device change made elsewhere is noticed on the next poll, not
+    /// instantly — the 2s heartbeat then keeps the ring in step with it.
+    epos_in_use: AtomicBool,
+    /// A device of the user's that playback was on, kept even after the daemon
+    /// takes the route to the EPOS.
+    ///
+    /// This is deliberately not `last_user_sink`: that one is cleared the moment
+    /// the daemon normalises a route, because its only job is to say a switch
+    /// happened once. Clearing it is right there and fatal here — with nothing
+    /// left, "go back to where I was" has no answer and the long press could only
+    /// guess.
+    previous_sink: Mutex<Option<String>>,
 }
 
 /// Microphone signal watchdog bookkeeping.
@@ -130,8 +146,37 @@ pub enum OutputRoute {
 /// audio away from whatever device the user is actually using.
 ///
 /// Pure policy, deliberately free of I/O so it can be tested directly.
-/// What to do with the default sink on this poll.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+
+/// One entry of `pactl -f json list sink-inputs`.
+///
+/// Only the fields the routing decision needs. Every one is `#[serde(default)]`
+/// so a pactl that grows a field, or an older one that lacks it, still parses
+/// rather than turning a routing choice into a parse error.
+#[derive(Debug, serde::Deserialize)]
+struct SinkInput {
+    /// Index in *pactl's* ID space, which is not `pw-cli`'s.
+    sink: u32,
+    /// The application is not sending data.
+    #[serde(default)]
+    corked: bool,
+    #[serde(default)]
+    properties: HashMap<String, String>,
+}
+
+/// What a request to leave the EPOS actually did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExitOutcome {
+    /// Playback was not on the EPOS, so there was nothing to leave.
+    AlreadyAway,
+    /// Moved to this device, which is not one of ours.
+    Moved(String),
+    /// There was nowhere to go. The default was left untouched.
+    NowhereToGo,
+    /// The sinks could not be listed, so no choice could be made.
+    CouldNotDecide,
+}
+  /// What to do with the default sink on this poll.
+  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputDecision {
     /// Point the default sink at the given route.
     Set(OutputRoute),
@@ -210,6 +255,17 @@ fn is_user_choice(current: &str, raw: &str, anchor: &str, published: &[String]) 
 /// project has been removing one at a time.
 pub fn eq_in_path(eq_enabled: bool, current_default_sink: &str) -> bool {
     eq_enabled && current_default_sink == EQ_SINK_NAME
+}
+
+/// Is `sink` the EPOS, as opposed to some other device?
+///
+/// One name for the question, because it has now been answered two different ways
+/// in two places and both were wrong: the LED lit while the user was on the
+/// speakers, and the long press reported "already off the EPOS" while they were on
+/// the EPOS. Both came from reading `is_user_choice`, whose `true` means *not*
+/// ours. Anything that needs "are we on the EPOS" asks here.
+pub fn is_epos_sink(sink: &str, raw_sink: &str) -> bool {
+    sink_is_managed(sink, raw_sink)
 }
 
 /// Is `sink` one this daemon sets itself?
@@ -608,6 +664,8 @@ impl AudioPipeline {
             eq_chain_recovered_polls: AtomicU32::new(0),
             role_health: Mutex::new(BTreeMap::new()),
             last_user_sink: Mutex::new(None),
+            epos_in_use: AtomicBool::new(false),
+            previous_sink: Mutex::new(None),
         };
         // Same funnel as update_config, so a hand-edited config.json is bounded
         // at startup too and not only on later IPC updates.
@@ -624,6 +682,138 @@ impl AudioPipeline {
     /// first-connect branch has to cover.
     pub fn has_device(&self) -> bool {
         self.device.is_some()
+    }
+
+    /// Leave the EPOS: put playback back on a device that is not ours.
+    ///
+    /// The user asks for this with a long press on the smart button, which the
+    /// device reports as its own `0x04` code, so nothing here measures time.
+    ///
+    /// Going back to where they were is a preference, and preferences are what
+    /// should not be discovered by trying things on live audio: the remembered
+    /// device wins when it is still there, and failing that a published device
+    /// that is not ours. With neither, the default is left alone — pointing it at
+    /// a sink that does not exist would be silence, and staying on the EPOS with
+    /// a log line saying why is at least honest.
+    pub async fn exit_epos(&self) -> ExitOutcome {
+        let (raw_sink, _) = self.node_names();
+        let current = Self::read_default_sink().await.unwrap_or_default();
+        // Playback is somewhere else already: there is nothing to leave. Asking
+        // this through `is_epos_sink` rather than negating `is_user_choice` is the
+        // point — the first version negated it and reported the opposite of what
+        // was true, on hardware, with the user sitting on the EPOS.
+        if !is_epos_sink(&current, &raw_sink) {
+            return ExitOutcome::AlreadyAway;
+        }
+        let sink_listing =
+            match run_probe("pactl", &["list", "short", "sinks"], PROBE_BUDGET).await {
+                Probe::Ran(listing) => listing,
+                other => {
+                    // Not "nowhere to go" — we could not look. Saying otherwise
+                    // would blame the user's hardware for a probe that failed.
+                    warn!("Could not list sinks to leave the EPOS: {other:?}");
+                    return ExitOutcome::CouldNotDecide;
+                }
+            };
+        let sinks = sink_names_from_listing(&sink_listing);
+        let by_index = sink_index_to_name(&sink_listing);
+        // Which sink is actually carrying audio, which is not the same question as
+        // which sink the default points at. `pactl -f json list sink-inputs` gives
+        // both the sink and whether the application is sending data; the two ID
+        // spaces are not the same, so the names are resolved through the sink
+        // listing rather than assumed.
+        let streams = self.playing_streams(&by_index).await;
+        let remembered = self.previous_sink();
+        let Some(target) = crate::led::exit_destination(
+            &streams,
+            remembered.as_deref(),
+            &raw_sink,
+            EQ_SINK_NAME,
+            &sinks,
+        ) else {
+            // Say what was on offer, so "nowhere to go" is a fact about the system
+            // rather than a shrug.
+            warn!(
+                "No published sink to leave the EPOS for ({} sink(s) published, \
+                 last on {:?})",
+                sinks.len(),
+                remembered
+            );
+            return ExitOutcome::NowhereToGo;
+        };
+        if let Err(e) = Self::set_default_sink(&target).await {
+            warn!("Could not leave the EPOS for {target}: {e}");
+            return ExitOutcome::NowhereToGo;
+        }
+        // The routing poll has not run yet, so the cached "in use" would leave the
+        // ring lit and the EQ reported as in the path for up to one poll. Correct it
+        // from what just happened, which is an observation and not a guess.
+        self.note_default_sink(Some(&target), false);
+        ExitOutcome::Moved(target)
+    }
+
+    /// The streams that are sending audio, with their sink resolved to a name.
+    ///
+    /// Best effort by design: a failure here yields no streams, and the caller then
+    /// falls back to the remembered default. That is the right way to fail — a
+    /// listing that could not be read is not evidence that nothing is playing.
+    async fn playing_streams(
+        &self,
+        by_index: &HashMap<u32, String>,
+    ) -> Vec<crate::led::PlayingStream> {
+        let listing = match run_probe(
+            "pactl",
+            &["-f", "json", "list", "sink-inputs"],
+            PROBE_BUDGET,
+        )
+        .await
+        {
+            Probe::Ran(out) => out,
+            other => {
+                debug!("Could not list sink inputs: {other:?}");
+                return Vec::new();
+            }
+        };
+        let inputs: Vec<SinkInput> = match serde_json::from_str(&listing) {
+            Ok(v) => v,
+            Err(e) => {
+                debug!("sink-input JSON did not parse: {e}");
+                return Vec::new();
+            }
+        };
+        inputs
+            .iter()
+            .filter_map(|i| {
+                by_index.get(&i.sink).map(|sink| crate::led::PlayingStream {
+                    sink_name: sink.clone(),
+                    corked: i.corked,
+                    node_name: i
+                        .properties
+                        .get("node.name")
+                        .cloned()
+                        .unwrap_or_default(),
+                })
+            })
+            .collect()
+    }
+
+    /// Is playback on the EPOS, as of the last routing poll?
+    pub fn epos_in_use(&self) -> bool {
+        self.epos_in_use.load(Ordering::Relaxed)
+    }
+
+    /// The user's own device playback was on before the daemon routed to the
+    /// EPOS, if there was one.
+    pub fn previous_sink(&self) -> Option<String> {
+        lock(&self.previous_sink).clone()
+    }
+
+    /// Record what the default sink is right now, for the LED and for "go back".
+    pub fn note_default_sink(&self, sink: Option<&str>, on_epos: bool) {
+        self.epos_in_use.store(on_epos, Ordering::Relaxed);
+        if let Some(name) = sink.filter(|s| !on_epos && !s.is_empty()) {
+            *lock(&self.previous_sink) = Some(name.to_string());
+        }
     }
 
     /// Store device reference for future operations
@@ -1426,11 +1616,25 @@ impl AudioPipeline {
             })
             .unwrap_or_default();
 
+        // What the LED should show, and where "go back" would land, both come from
+        // this one read of the default sink.
+        //
+        // "In use" means the default is one of ours, which is exactly what
+        // `sink_is_managed` answers. It is deliberately not `!is_user_choice(..)`:
+        // that is also true for a blank or vanished default, and a ring lit for a
+        // headset nothing is on is the failure this is meant to remove. Measured —
+        // the first version used the negation and the ring stayed blue while the
+        // user was on the speakers.
+        let current_default = previous.as_deref().unwrap_or_default();
+        self.note_default_sink(
+            previous.as_deref(),
+            device_connected && is_epos_sink(current_default, &raw_sink),
+        );
         let route = desired_output_route(
             eq_enabled,
             device_connected,
             chain_present,
-            previous.as_deref().unwrap_or_default(),
+            current_default,
             &raw_sink,
             &published,
         );
@@ -2618,6 +2822,41 @@ pub(crate) fn role_health_action(
 ///
 /// `pactl list short sink-inputs` identifies the sink by index, never by name,
 /// so the name has to be resolved first or the rescue silently matches nothing.
+/// The names in a `pactl list short sinks` listing.
+///
+/// Deliberately the *sink* listing and not `pw-cli ls Node`. The node listing is
+/// every node in the graph — drivers, bridges, stream nodes — and choosing a
+/// playback destination from it picks `Dummy-Driver`, which is not an output at
+/// all. Measured: a long press tried to set the default to `Dummy-Driver` and
+/// `pactl` refused.
+/// The index -> name pairs in a `pactl list short sinks` listing.
+///
+/// The names alone are not enough. `pactl list sink-inputs` identifies its sink by
+/// *pactl's* index, and looking that up in a list of names finds nothing — which
+/// is how the first version of "go where the audio is" silently found no streams
+/// and fell back to the remembered default, every time.
+pub(crate) fn sink_index_to_name(listing: &str) -> HashMap<u32, String> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let mut f = line.split_whitespace();
+            let index = f.next()?.parse::<u32>().ok()?;
+            Some((index, f.next()?.to_string()))
+        })
+        .collect()
+}
+
+pub(crate) fn sink_names_from_listing(listing: &str) -> Vec<String> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let mut f = line.split_whitespace();
+            f.next()?; // index
+            Some(f.next()?.to_string())
+        })
+        .collect()
+}
+
 fn sink_index_of(listing: &str, sink_name: &str) -> Option<u32> {
     listing.lines().find_map(|line| {
         let mut f = line.split_whitespace();
@@ -4951,6 +5190,56 @@ mod tests {
                 &[speakers.to_string(), raw.to_string()],),
             OutputDecision::Untouched
         );
+    }
+
+    // ─── Choosing where to go when leaving the EPOS ────────────────
+
+    /// The listing a long press reads is the *sink* listing, so every name in it
+    /// is somewhere audio can actually go.
+    ///
+    /// This is the bug the format is the fix for: the previous version picked a
+    /// destination from `pw-cli ls Node`, which lists every node in the graph, and
+    /// chose `Dummy-Driver` — an internal node, not an output. `pactl` refused it
+    /// and the feature reported "no other published device" while a working pair
+    /// of speakers sat two lines further down.
+    #[test]
+    fn the_sink_listing_yields_only_sinks() {
+        // Verbatim shape from `pactl list short sinks` on this machine.
+        let listing = "33\tepos-eq-input\tPipeWire\tfloat32le 2ch 48000Hz\tIDLE\n\
+                       38\tgames_sink\tPipeWire\tfloat32le 2ch 48000Hz\tIDLE\n\
+                       70\talsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink\tPipeWire\ts32le 8ch 48000Hz\tRUNNING\n\
+                       74\talsa_output.usb-Sennheiser_EPOS_GSX_300-00.analog-stereo\tPipeWire\ts24le 2ch 48000Hz\tRUNNING";
+        let names = sink_names_from_listing(listing);
+        assert_eq!(
+            names,
+            vec![
+                "epos-eq-input".to_string(),
+                "games_sink".to_string(),
+                "alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink".to_string(),
+                "alsa_output.usb-Sennheiser_EPOS_GSX_300-00.analog-stereo".to_string(),
+            ]
+        );
+        assert!(!names.iter().any(|n| n.contains("Driver")));
+    }
+
+    /// The other half of the same listing: the indices, which is what a stream
+    /// refers to. Without this the stream lookup silently matches nothing.
+    #[test]
+    fn the_sink_listing_resolves_indices_to_names() {
+        let listing = "33\tepos-eq-input\tPipeWire\tfloat32le 2ch 48000Hz\tIDLE\n\
+                       74\talsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink\tPipeWire\ts32le 8ch 48000Hz\tRUNNING";
+        let by_index = sink_index_to_name(listing);
+        assert_eq!(by_index.get(&74).map(String::as_str),
+                   Some("alsa_output.usb-Generic_USB_Audio-00.HiFi_7_1__Speaker__sink"));
+        assert_eq!(by_index.get(&33).map(String::as_str), Some("epos-eq-input"));
+        assert!(by_index.get(&999).is_none());
+    }
+
+    /// An empty or malformed listing yields no destinations rather than a guess.
+    #[test]
+    fn an_empty_sink_listing_yields_nothing() {
+        assert!(sink_names_from_listing("").is_empty());
+        assert!(sink_names_from_listing("nonsense\n").is_empty());
     }
 
     /// The EQ must only claim to be in the audio path when playback is actually
